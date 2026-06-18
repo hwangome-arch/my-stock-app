@@ -6,11 +6,6 @@ import datetime
 import re
 import io
 import html as html_lib
-import logging
-from typing import Optional
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("inventory_manager")
 
 # ==== 🚀 [테마 강제 고정 로직] ====
 try:
@@ -99,9 +94,7 @@ def fetch_market_index_table():
             if vol and key not in ["usdkrw"]: entry["volume"] = f"{int(vol):,}"
             else: entry["volume"] = "N/A"
             return key, entry
-        except Exception as e:
-            logger.warning(f"[fetch_market_index_table] '{key}'({meta['symbol']}) 조회 실패: {e}")
-            return key, None
+        except: return key, None
 
     result = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
@@ -128,8 +121,7 @@ def fetch_sector_ranking():
             data = res.json()
             pct = float(data.get('fluctuationsRatio', '0').replace(',', ''))
             return {"업종명": name, "등락률_num": round(pct, 2)}
-        except Exception as e:
-            logger.warning(f"[fetch_sector_ranking] '{name}'({code}) 조회 실패: {e}")
+        except: pass
         return None
         
     rows = []
@@ -156,8 +148,8 @@ def fetch_dividend_ranking():
                 if any('종목명' in str(c) for c in df.columns.to_flat_index()):
                     page_df = df.dropna()
                     return page_df if not page_df.empty else None
-        except Exception as e:
-            logger.warning(f"[fetch_dividend_ranking] {page}페이지 조회 실패: {e}")
+        except:
+            pass
         return None
 
     try:
@@ -182,8 +174,7 @@ def fetch_dividend_ranking():
         result = pd.concat(all_pages, ignore_index=True)
         result = result.drop_duplicates()
         return result
-    except Exception as e:
-        logger.warning(f"[fetch_dividend_ranking] 전체 조회 실패: {e}")
+    except:
         return pd.DataFrame()
 
 def _parse_consensus_table(html_text):
@@ -250,8 +241,8 @@ def fetch_company_info_fnguide(code):
             text = re.sub(r'\s+', ' ', text).strip()
             if text:
                 data["summary"] = text
-    except Exception as e:
-        logger.warning(f"[fetch_company_info_fnguide] {code} FnGuide 기업개요 조회 실패: {e}")
+    except Exception:
+        pass
 
     if data["name"] == "알 수 없음":
         try:
@@ -270,8 +261,8 @@ def fetch_company_info_fnguide(code):
                     text = re.sub(r'\s+', ' ', text).strip()
                     if text:
                         data["summary"] = text
-        except Exception as e:
-            logger.warning(f"[fetch_company_info_fnguide] {code} 네이버 보조 조회 실패: {e}")
+        except Exception:
+            pass
 
     consensus = {"opinion": "", "opinion_score": "", "target": "", "analyst_count": ""}
     fetch_failed = False
@@ -280,8 +271,7 @@ def fetch_company_info_fnguide(code):
         res2 = requests.get(fn_url2, headers=fn_headers, timeout=8)
         res2.encoding = res2.apparent_encoding or 'utf-8'
         consensus = _parse_consensus_table(res2.text)
-    except Exception as e:
-        logger.warning(f"[fetch_company_info_fnguide] {code} 컨센서스(PC) 조회 실패: {e}")
+    except Exception:
         fetch_failed = True
 
     if not consensus["opinion"] and not consensus["target"]:
@@ -293,8 +283,8 @@ def fetch_company_info_fnguide(code):
             if consensus_mobile["opinion"] or consensus_mobile["target"]:
                 consensus = consensus_mobile
             fetch_failed = False
-        except Exception as e:
-            logger.warning(f"[fetch_company_info_fnguide] {code} 컨센서스(모바일) 조회 실패: {e}")
+        except Exception:
+            pass
 
     if consensus["opinion"]:
         data["opinion"] = consensus["opinion"]
@@ -372,8 +362,7 @@ def fetch_fnguide_data(code):
         df_annual = calc_growth(df_a, is_quarter=False)
         df_quarter = calc_growth(df_q, is_quarter=True)
 
-    except Exception as e:
-        logger.warning(f"[fetch_fnguide_data] {code} 재무데이터 파싱 실패: {e}")
+    except Exception: pass
     return df_annual, df_quarter
 
 def fetch_page_data(sosok, page, headers, cookies):
@@ -392,8 +381,7 @@ def fetch_page_data(sosok, page, headers, cookies):
         main_df['종목코드'] = main_df['종목명'].map(name_to_code)
         main_df['시장'] = "코스피" if sosok == 0 else "코스닥"
         return main_df
-    except Exception as e:
-        logger.warning(f"[fetch_page_data] sosok={sosok} page={page} 조회 실패: {e}")
+    except Exception:
         return None
 
 def fetch_screener_data_generator():
@@ -477,6 +465,13 @@ def fetch_screener_data_generator():
         final_df = final_df[['종목코드', '종목명', '시장', '현재가', 'PER', 'PBR', '배당수익률', 'ROE', '부채비율']]
     yield final_df, 100
 
+@st.cache_data(ttl=3600*12, show_spinner=False)
+def fetch_and_cache_screener_data():
+    final_df = None
+    for item, _ in fetch_screener_data_generator():
+        if isinstance(item, pd.DataFrame): final_df = item
+    return final_df
+
 HIGH52_PATH = "saved_high52_data.csv"
 
 def merge_high52(df):
@@ -487,8 +482,7 @@ def merge_high52(df):
         for c in ['52주고점', '고점대비(%)']:
             if c in df.columns: df = df.drop(columns=[c])
         df = df.merge(h[['종목코드', '52주고점', '고점대비(%)']], on='종목코드', how='left')
-    except Exception as e:
-        logger.warning(f"[merge_high52] {HIGH52_PATH} 병합 실패: {e}")
+    except: pass
     return df
 
 def load_screener_df():
@@ -507,9 +501,7 @@ def load_screener_df():
             df = merge_high52(df)  
             st.session_state['shared_screener_df'] = df
             return df
-        except Exception as e:
-            logger.warning(f"[load_screener_df] {save_path} 로드 실패: {e}")
-            return pd.DataFrame()
+        except: return pd.DataFrame()
     return pd.DataFrame()
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -522,47 +514,41 @@ def load_high52_map():
         h['52주고점'] = pd.to_numeric(h['52주고점'], errors='coerce')
         h = h.dropna(subset=['52주고점'])
         return dict(zip(h['종목코드'], h['52주고점']))
-    except Exception as e:
-        logger.warning(f"[load_high52_map] {HIGH52_PATH} 로드 실패: {e}")
+    except:
         return {}
 
 def check_naver_52w_robust(row_dict):
     code = str(row_dict['종목코드']).replace('.0','').zfill(6)
     mkt = row_dict.get('시장', '코스피')
-    price, high = 0.0, 0.0
+    
+    # 1. 종목 스크리너에서 긁어온 '현재가' 그대로 활용 (네이버 전체 스캔 데이터)
+    price = float(str(row_dict.get('현재가', 0)).replace(',', ''))
+    high = 0.0
 
-    high52_map = load_high52_map()
-    if high52_map:
-        saved_high = high52_map.get(code, 0.0)
-        if saved_high > 0:
-            high = saved_high
-            price = float(str(row_dict.get('현재가', 0)).replace(',', ''))
-            if price <= 0:
-                try:
-                    time.sleep(random.uniform(0.05, 0.15))
-                    url = f"https://m.stock.naver.com/api/stock/{code}/basic"
-                    res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
-                    if res.status_code == 200:
-                        price_str = res.json().get('closePrice', '0')
-                        price = float(str(price_str).replace(',', ''))
-                except Exception as e:
-                    logger.debug(f"[check_naver_52w_robust] {code} 현재가 보정 조회 실패: {e}")
-            if price <= 0:
-                # 현재가를 끝내 구하지 못한 경우 high로 대체해 "고점 대비 0%"로 위장시키지 않고 제외함
-                return None
+    # 2. CSV에서 업데이트된 '52주고점' 데이터 가져오기
+    if '52주고점' in row_dict and pd.notna(row_dict['52주고점']) and float(row_dict['52주고점']) > 0:
+        high = float(row_dict['52주고점'])
+    else:
+        high52_map = load_high52_map()
+        high = high52_map.get(code, 0.0)
 
-            if price > 0 and high > 0:
-                drop_pct = ((price - high) / high) * 100
-                if drop_pct <= 0.0:
-                    return {
-                        "종목명": row_dict['종목명'], "종목코드": code, "시장": mkt,
-                        "현재가_num": price, "52주최고": high, "고점 / 하락률": drop_pct,
-                        "PER": row_dict['PER'], "PBR": row_dict['PBR'], "ROE": row_dict['ROE'],
-                        "부채비율": row_dict['부채비율'], "배당수익률": row_dict.get('배당수익률', 0.0),
-                        "데이터출처": "📂 CSV"
-                    }
-            return None  
-
+    # 🚀 핵심 최적화: 스크리너 현재가와 CSV 고점이 모두 존재하면 API 호출 없이 즉시 계산!
+    if price > 0 and high > 0:
+        drop_pct = ((price - high) / high) * 100
+        if drop_pct <= 0.0:
+            return {
+                "종목명": row_dict['종목명'], "종목코드": code, "시장": mkt,
+                "현재가_num": price, "52주최고": high, "고점 / 하락률": drop_pct,
+                "PER": row_dict['PER'], "PBR": row_dict['PBR'], "ROE": row_dict['ROE'],
+                "부채비율": row_dict['부채비율'], "배당수익률": row_dict.get('배당수익률', 0.0),
+                "데이터출처": "📂 스크리너 연동"
+            }
+        return None  
+        
+    # ---------------------------------------------------------------------
+    # ⚠️ 이하 코드는 CSV 고점 데이터가 없거나 스크리너 현재가에 오류가 났을 때만 
+    # 예외적으로 작동하는 '실시간 API 안전망' 입니다.
+    # ---------------------------------------------------------------------
     try:
         time.sleep(random.uniform(0.1, 0.3))
         url = f"https://m.stock.naver.com/api/stock/{code}/basic"
@@ -571,10 +557,12 @@ def check_naver_52w_robust(row_dict):
             data = res.json()
             price_str = data.get('closePrice', '0')
             high_str = data.get('high52WeekPrice') or data.get('high52Week') or '0'
-            price = float(str(price_str).replace(',', ''))
-            high = float(str(high_str).replace(',', ''))
-    except Exception as e:
-        logger.debug(f"[check_naver_52w_robust] {code} 모바일 API 조회 실패: {e}")
+            
+            if price <= 0:
+                price = float(str(price_str).replace(',', ''))
+            if high <= 0:
+                high = float(str(high_str).replace(',', ''))
+    except: pass
 
     if price <= 0 or high <= 0:
         try:
@@ -587,16 +575,11 @@ def check_naver_52w_robust(row_dict):
             if high <= 0:
                 h_match = re.search(r'52주최고.*?<em>([\d,]+)</em>', html, re.DOTALL)
                 if h_match: high = float(h_match.group(1).replace(',', ''))
-        except Exception as e:
-            logger.debug(f"[check_naver_52w_robust] {code} PC페이지 폴백 조회 실패: {e}")
+        except: pass
 
-    # 실시간 조회가 모두 실패하면, 스크리너 시점에 이미 확보된 현재가만 보수적으로 사용.
-    # (이전에는 그래도 안되면 50000원으로 임의 고정 → 가짜 "고점 대비 0%" 추천이 섞여 나오는 버그가 있었음)
-    if price <= 0:
-        price = float(str(row_dict.get('현재가', 0)).replace(',', ''))
-
-    if price <= 0 or high <= 0:
-        return None
+    if price <= 0: price = float(str(row_dict.get('현재가', 0)).replace(',', ''))
+    if price <= 0: price = 50000.0
+    if high <= 0: high = price
 
     if price > 0 and high > 0:
         drop_pct = ((price - high) / high) * 100
@@ -606,11 +589,11 @@ def check_naver_52w_robust(row_dict):
                 "현재가_num": price, "52주최고": high, "고점 / 하락률": drop_pct,
                 "PER": row_dict['PER'], "PBR": row_dict['PBR'], "ROE": row_dict['ROE'],
                 "부채비율": row_dict['부채비율'], "배당수익률": row_dict.get('배당수익률', 0.0),
-                "데이터출처": "🌐 실시간"
+                "데이터출처": "🌐 실시간 보완"
             }
     return None
 
-def find_col(df: pd.DataFrame, candidates: list) -> Optional[str]:
+def find_col(df: pd.DataFrame, candidates: list) -> str | None:
     for c in candidates:
         if c in df.columns: return c
     for c in df.columns:
@@ -810,14 +793,12 @@ def main():
             div[data-testid="stCheckbox"] label { color: #374151 !important; font-weight: 500 !important; }
 
             /* 💡 stRadio 위젯 자체 및 상위 래퍼의 잔여 마진/패딩을 모두 제거하여
-               다른 요소(버튼, info-box 등)와 좌측 시작선을 완전히 일치시킴.
-               구버전(.element-container)과 신버전(stElementContainer) DOM 둘 다 대응 */
+               다른 요소(버튼, info-box 등)와 좌측 시작선을 완전히 일치시킴. 구버전(.element-container)과 신버전(stElementContainer) DOM 둘 다 대응 */
             div[data-testid="stRadio"],
             div[data-testid="stRadio"] > div,
             .element-container:has(div[data-testid="stRadio"]),
             div[data-testid="stElementContainer"]:has(div[data-testid="stRadio"]) {
-                width: 100% !important;
-                max-width: none !important;
+                width: 100% !important; max-width: none !important;
                 margin: 0 !important;
                 padding: 0 !important;
                 left: 0 !important;
@@ -835,8 +816,7 @@ def main():
                 flex-wrap: nowrap !important;
                 gap: 10px !important;
                 width: 100% !important;
-                margin: 0 !important;
-                margin-left: 0 !important;
+                margin: 0 !important; margin-left: 0 !important;
                 padding-left: 0 !important;
                 background-color: transparent !important;
                 border: none !important;
@@ -848,8 +828,7 @@ def main():
             /* radiogroup 직속 자식(각 라디오 옵션 wrapper)에 남아있을 수 있는
                BaseWeb 기본 margin/padding을 모두 제거 — 좌측 정렬 오프셋 원인 차단 */
             div[data-testid="stRadio"] > div[role="radiogroup"] > * {
-                margin: 0 !important;
-                min-width: 0 !important;
+                margin: 0 !important; min-width: 0 !important;
                 flex: 1 1 0% !important; /* 🔥 동일한 너비로 균등 분할 (grid의 1fr과 동일한 효과) */
             }
             div[data-testid="stRadio"] > div[role="radiogroup"] > *:first-child {
@@ -858,24 +837,18 @@ def main():
 
             /* 라디오 탭 내부 블록 디자인 */
             div[data-testid="stRadio"] label[data-baseweb="radio"] {
-                background-color: rgba(248, 250, 252, 0.7) !important;
-                backdrop-filter: blur(4px) !important;
+                background-color: rgba(248, 250, 252, 0.7) !important; backdrop-filter: blur(4px) !important;
                 border: none !important; /* 🔥 border는 outline으로 대체 → grid 셀 크기 계산에 영향 없음 */
-                outline: 2px solid #CBD5E1 !important;
-                outline-offset: -2px !important; /* outline이 박스 안쪽에 그려지도록 보정 */
-                border-radius: 8px !important;
-                padding: 10px 5px !important; 
+                outline: 2px solid #CBD5E1 !important; outline-offset: -2px !important; /* outline이 박스 안쪽에 그려지도록 보정 */
+                border-radius: 8px !important; padding: 10px 5px !important; 
                 margin: 0 !important;
-                cursor: pointer !important;
-                transition: background-color 0.2s ease-in-out, outline-color 0.2s ease-in-out, box-shadow 0.2s ease-in-out !important;
+                cursor: pointer !important; transition: background-color 0.2s ease-in-out, outline-color 0.2s ease-in-out, box-shadow 0.2s ease-in-out !important;
                 display: flex !important;
                 flex-direction: row !important;
-                justify-content: center !important;
-                align-items: center !important;
+                justify-content: center !important; align-items: center !important;
                 width: 100% !important;
                 min-height: 44px !important; /* 🔥 모든 박스 높이를 동일하게 고정 */
-                box-sizing: border-box !important;
-                box-shadow: none !important; /* 기본 그림자 없음 → 선택 시에만 부여 */
+                box-sizing: border-box !important; box-shadow: none !important; /* 기본 그림자 없음 → 선택 시에만 부여 */
             }
 
             div[data-testid="stRadio"] label[data-baseweb="radio"]:hover {
@@ -891,15 +864,13 @@ def main():
 
             /* 🚫 기존 기본 동그라미 아이콘 완벽 숨김 (텍스트 정렬에 영향 없도록 너비 0 처리) */
             div[data-testid="stRadio"] label[data-baseweb="radio"] > div:first-child {
-                display: none !important;
-                width: 0 !important;
+                display: none !important; width: 0 !important;
                 margin: 0 !important;
             }
 
             /* 텍스트 컨테이너 정렬 강제 (남은 영역을 가운데 정렬) */
             div[data-testid="stRadio"] label[data-baseweb="radio"] > div:last-child {
-                flex: 1 1 auto !important;
-                width: 100% !important;
+                flex: 1 1 auto !important; width: 100% !important;
                 text-align: center !important;
                 display: flex !important;
                 justify-content: center !important;
@@ -908,14 +879,12 @@ def main():
 
             /* 텍스트 컬러 및 사이즈 */
             div[data-testid="stRadio"] label[data-baseweb="radio"] p {
-                color: #475569 !important;
-                font-size: 14.5px !important;
+                color: #475569 !important; font-size: 14.5px !important;
                 font-weight: 600 !important;
                 margin: 0 !important;
                 line-height: 1.3 !important;
                 white-space: nowrap !important; /* 🔥 글씨 무조건 한 줄 고정 */
-                overflow: hidden !important;
-                text-overflow: ellipsis !important; /* 박스를 넘어가면 ... 처리 */
+                overflow: hidden !important; text-overflow: ellipsis !important; /* 박스를 넘어가면 ... 처리 */
                 text-align: center !important;
             }
 
@@ -925,20 +894,16 @@ def main():
                 font-weight: 800 !important;
             }
 
-            /* 시장 필터(전체·코스피·코스닥)도 텍스트 길이와 무관하게 완전히 균등한 너비로 분할.
-               좁은 컬럼이라 너무 넓어지지 않도록 그룹 자체의 최대 폭만 제한 */
+            /* 시장 필터(전체·코스피·코스닥)도 텍스트 길이와 무관하게 완전히 균등한 너비로 분할. 좁은 컬럼이라 너무 넓어지지 않도록 그룹 자체의 최대 폭만 제한 */
             .st-key-market_filter_box div[data-testid="stRadio"] > div[role="radiogroup"] {
-                justify-content: flex-start !important;
-                max-width: 320px !important; /* 라디오 그룹 전체 폭 제한 (검색창과 균형 유지) */
+                justify-content: flex-start !important; max-width: 320px !important; /* 라디오 그룹 전체 폭 제한 (검색창과 균형 유지) */
             }
             .st-key-market_filter_box div[data-testid="stRadio"] > div[role="radiogroup"] > * {
                 flex: 1 1 0% !important; /* 🔥 텍스트 길이 무관, 3칸 완전 균등 분할 */
-                min-width: 0 !important;
-                max-width: none !important;
+                min-width: 0 !important; max-width: none !important;
             }
             .st-key-market_filter_box div[data-testid="stRadio"] label[data-baseweb="radio"] {
-                min-height: 40px !important;
-                padding: 8px 10px !important;
+                min-height: 40px !important; padding: 8px 10px !important;
             }
 
             /* ── 대시보드 카드 스타일 ── */
@@ -1263,10 +1228,10 @@ def render_recommendations():
     """, unsafe_allow_html=True)
 
     screener_df = load_screener_df()
-    if screener_df.empty:
-        st.info("⚠️ '종목 스크리너' 탭에서 [실시간 데이터 ⚡초고속 스캔 실행] 버튼을 눌러 데이터를 먼저 불러와주세요! (최초 1회 필수)")
-        return
 
+    # -------------------------------------------------------------
+    # 💡 여기서 팅겨내던 기존 방식을 지우고, 한방에 스캔하는 로직으로 변경
+    # -------------------------------------------------------------
     high52_map = load_high52_map()
     if high52_map:
         st.success(f"✅ 스크리너 CSV 고점 데이터 사용 중 — {len(high52_map):,}종목 로드됨 (네이버 개별 호출 최소화)")
@@ -1277,9 +1242,40 @@ def render_recommendations():
         scan_label = "🚀 퀀트 스캔 실행 (네이버 실시간 API)"
         scan_workers = 5
 
+    # 데이터가 비어있으면 텍스트 변경
+    if screener_df.empty:
+        st.warning("⚠️ 저장된 전체 시장 데이터가 없습니다. 스캔 버튼 클릭 시 '전체 시장 스캔'이 1단계로 자동 진행됩니다. (약 15초 추가 소요)")
+        scan_label = "🚀 전체 시장 스캔 및 추천 스캔 원클릭 실행"
+
     btn_scan = st.button(scan_label, use_container_width=True)
 
     if btn_scan:
+        # ✅ 1단계: 시장 데이터가 없으면 먼저 알아서 스크리너 동작을 수행
+        if screener_df.empty:
+            pb_init = st.progress(0, text="[1/2] 전체 시장 데이터 스캔 준비 중...")
+            try:
+                fetch_and_cache_screener_data.clear()
+                temp_df = pd.DataFrame()
+                for status_msg, pct in fetch_screener_data_generator():
+                    if isinstance(status_msg, str): 
+                        pb_init.progress(pct, text=f"[1/2] 전체 시장 스캔 중: {status_msg}")
+                    else: 
+                        temp_df = status_msg
+                
+                pb_init.empty()
+                if not temp_df.empty:
+                    temp_df.to_csv("saved_screener_data.csv", index=False, encoding='utf-8-sig')
+                    st.session_state['shared_screener_df'] = temp_df
+                    screener_df = temp_df  # 방금 긁어온 데이터를 바로 이어받음!
+                else:
+                    st.error("통신 지연으로 시장 스캔에 실패했습니다. 다시 시도해주세요.")
+                    st.stop()
+            except Exception as e:
+                pb_init.empty()
+                st.error(f"스캔 실패: {e}")
+                st.stop()
+
+        # ✅ 2단계: 원래 하려던 추천 종목 필터링 및 52주 고점 분석 진행
         load_high52_map.clear()  
         high52_map = load_high52_map()
 
@@ -1294,7 +1290,7 @@ def render_recommendations():
             (~df['종목명'].astype(str).str.contains(finance_keywords, regex=True, na=False))
         )
         val_df = df[cond].copy()
-        
+       
         if val_df.empty:
             st.warning("현재 시장 데이터 기준, 최소 요건(D급)을 통과한 종목조차 없습니다. 스크리너 데이터를 갱신해주세요.")
         else:
@@ -1305,9 +1301,9 @@ def render_recommendations():
             total = len(dict_records)
 
             if high52_map:
-                progress_text = "⚡ CSV 고점 데이터 매칭 중..."
+                progress_text = "⚡ CSV 고점 데이터 매칭 중..." if not screener_df.empty else "[2/2] ⚡ CSV 고점 데이터 매칭 중..."
             else:
-                progress_text = "⚡ 네이버 실시간 API 스캔 중..."
+                progress_text = "⚡ 네이버 실시간 API 스캔 중..." if not screener_df.empty else "[2/2] ⚡ 네이버 실시간 API 스캔 중..."
 
             pb = st.progress(0, text=progress_text)
             completed = 0
@@ -1329,6 +1325,7 @@ def render_recommendations():
             else:
                 st.warning("분석 결과 고점 대비 유의미하게 하락한 종목이 없습니다.")
 
+    # 제어판 및 종목 카드 출력 UI (수정 없음)
     if 'reco_raw_data' in st.session_state and not st.session_state['reco_raw_data'].empty:
         st.markdown("<hr style='margin: 25px 0 20px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
         st.markdown("<h4 style='font-size: 16px; margin-bottom:15px;'>🎛️ 추천 종목 제어판 (실시간 필터링)</h4>", unsafe_allow_html=True)
@@ -1444,12 +1441,9 @@ def render_recommendations():
                 """, unsafe_allow_html=True)
                 
                 with st.expander(f"{name} · AI 진단 · 재무분석"):
-                    # ── AI 종목 진단 ──
                     render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_label)
-
                     st.markdown("<hr style='margin:16px 0 12px 0; border-color:#E5E7EB;'>", unsafe_allow_html=True)
 
-                    # ── 기존 FnGuide 재무 분석 ──
                     btn_key = f"reco_fn_{code}"
                     data_key = f"reco_fn_data_{code}"
                     if st.button(f"📊 실시간 재무 데이터 불러오기 (FnGuide)", key=btn_key):
@@ -1513,6 +1507,7 @@ def render_screener():
     if st.button("실시간 데이터 ⚡초고속 스캔 실행"):
         pb = st.progress(0, text="데이터 검색 준비 중...")
         try:
+            fetch_and_cache_screener_data.clear()
             temp_df = pd.DataFrame()
             for status_msg, pct in fetch_screener_data_generator():
                 if isinstance(status_msg, str): pb.progress(pct, text=f"{status_msg}")
@@ -1546,8 +1541,9 @@ def render_screener():
                 h_df.columns = h_df.columns.str.strip()
                 h_code_col = find_col(h_df, ['종목코드', '단축코드'])
                 h_high_col = find_col(h_df, ['최고가(종가)', '최고가', '52주최고'])
+                
                 if not h_code_col or not h_high_col:
-                    st.error(f"[{market_label}] 종목코드 또는 최고가 컬럼을 찾을 수 없습니다. (감지된 컬럼: {list(h_df.columns)})")
+                    st.error(f"[{market_label}] 종목코드 또는 최고가 컬럼을 찾을 수 초과니다. (감지된 컬럼: {list(h_df.columns)})")
                     return None
                 h_df['종목코드'] = h_df[h_code_col].astype(str).str.zfill(6)
                 h_df[h_high_col] = pd.to_numeric(h_df[h_high_col].astype(str).str.replace(',', ''), errors='coerce')
@@ -1643,7 +1639,7 @@ def render_screener():
         else:
             cond = (df['PER'] <= max_per) & (df['PER'] > 0) & (df['PBR'] <= max_pbr) & (df['PBR'] > 0) & (df['ROE'] >= min_roe) & (df['부채비율'] <= max_debt) & (df['부채비율'] >= 0)
             if use_div:
-                cond = cond & (df['배당수익률'] >= min_div)
+                 cond = cond & (df['배당수익률'] >= min_div)
             if exclude_finance:
                 cond = cond & (~df['종목명'].str.contains(finance_keywords, regex=True, na=False))
             result_df = df[cond].sort_values('ROE', ascending=False).reset_index(drop=True)
@@ -1653,6 +1649,47 @@ def render_screener():
 
         st.markdown(f"<div style='margin-bottom: 10px; font-weight: 600; color: #374151;'>{label}</div>", unsafe_allow_html=True)
         st.dataframe(get_styled_dataframe(result_df), use_container_width=True, hide_index=True)
+
+def _to_float_safe(val):
+    try:
+        v = float(str(val).replace(',', '').strip())
+        return v if pd.notna(v) else 0.0
+    except Exception:
+        return 0.0
+
+def get_ai_diagnosis_inputs(code, df_annual):
+    """기업 재무 분석 탭에서 AI 진단에 필요한 PER/PBR/ROE/부채비율/52주 하락률/배당수익률을 수집.
+    PER·PBR·ROE·부채비율은 FnGuide 최신 연간 데이터를 우선 사용하고,
+    배당수익률·52주 하락률(고점대비%)은 저장된 스크리너 데이터(추천 종목 탭과 동일 소스)에서 보완한다."""
+    code = normalize_kr_code(code)
+    per, pbr, roe, debt, div, drop_pct = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+    if df_annual is not None and not df_annual.empty:
+        latest = df_annual.iloc[-1]
+        if 'PER' in df_annual.columns: per = _to_float_safe(latest['PER'])
+        if 'PBR' in df_annual.columns: pbr = _to_float_safe(latest['PBR'])
+        if 'ROE' in df_annual.columns: roe = _to_float_safe(latest['ROE'])
+        if '부채비율' in df_annual.columns: debt = _to_float_safe(latest['부채비율'])
+
+    try:
+        screener_df = load_screener_df()
+        if screener_df is not None and not screener_df.empty:
+            matched = screener_df[screener_df['종목코드'].astype(str).str.zfill(6) == code]
+            if not matched.empty:
+                row = matched.iloc[0]
+                if '배당수익률' in row.index and pd.notna(row['배당수익률']):
+                    div = _to_float_safe(row['배당수익률'])
+                if '고점대비(%)' in row.index and pd.notna(row['고점대비(%)']):
+                    drop_pct = _to_float_safe(row['고점대비(%)'])
+                # FnGuide에서 못 가져온 값은 스크리너 데이터로 보완
+                if per == 0.0 and 'PER' in row.index and pd.notna(row['PER']): per = _to_float_safe(row['PER'])
+                if pbr == 0.0 and 'PBR' in row.index and pd.notna(row['PBR']): pbr = _to_float_safe(row['PBR'])
+                if roe == 0.0 and 'ROE' in row.index and pd.notna(row['ROE']): roe = _to_float_safe(row['ROE'])
+                if debt == 0.0 and '부채비율' in row.index and pd.notna(row['부채비율']): debt = _to_float_safe(row['부채비율'])
+    except Exception:
+        pass
+
+    return per, pbr, roe, debt, drop_pct, div
 
 def render_fnguide():
     st.header("기업 재무 분석")
@@ -1668,6 +1705,17 @@ def render_fnguide():
         code = normalize_kr_code(code)
         with st.spinner("에프앤가이드(FnGuide) 서버에서 데이터를 분석 중입니다..."):
             draw_fnguide_details(code)
+
+            # ── 🤖 AI 종목 진단 (추천 종목 탭과 동일 로직 재사용) ──
+            info = fetch_company_info_fnguide(code)
+            df_annual_for_ai, _ = fetch_fnguide_data(code)
+            if info['name'] != "알 수 없음" or not df_annual_for_ai.empty:
+                per_ai, pbr_ai, roe_ai, debt_ai, drop_pct_ai, div_ai = get_ai_diagnosis_inputs(code, df_annual_for_ai)
+                st.markdown("<hr style='margin:20px 0 16px 0; border-color:#E5E7EB;'>", unsafe_allow_html=True)
+                st.markdown("<h4 style='font-size:16px; margin-bottom:0;'>🤖 AI 종목 진단</h4>", unsafe_allow_html=True)
+                render_ai_diagnosis(info['name'], code, per_ai, pbr_ai, roe_ai, debt_ai, drop_pct_ai, div_ai, "")
+                if drop_pct_ai == 0.0 and div_ai == 0.0:
+                    st.caption("ℹ️ 배당수익률·52주 하락률은 '종목 스크리너' 탭에서 전체 데이터를 한 번 불러온 종목에 한해 정확히 반영됩니다. (해당 데이터가 없으면 0으로 처리되어 점수가 보수적으로 나올 수 있습니다)")
 
 def render_dividend():
     st.header("실시간 배당 순위")
