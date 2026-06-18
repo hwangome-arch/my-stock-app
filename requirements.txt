@@ -1,9 +1,6 @@
-streamlit
-pandas
-numpy
-yfinance
-plotly
-requests
-beautifulsoup4
-lxml
-streamlit-option-menu
+streamlit>=1.32
+streamlit-option-menu>=0.3.12
+pandas>=2.0
+requests>=2.31
+yfinance>=0.2.40
+lxml>=5.0

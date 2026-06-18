@@ -5,6 +5,12 @@ import time
 import datetime
 import re
 import io
+import html as html_lib
+import logging
+from typing import Optional
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("inventory_manager")
 
 # ==== 🚀 [테마 강제 고정 로직] ====
 try:
@@ -93,7 +99,9 @@ def fetch_market_index_table():
             if vol and key not in ["usdkrw"]: entry["volume"] = f"{int(vol):,}"
             else: entry["volume"] = "N/A"
             return key, entry
-        except: return key, None
+        except Exception as e:
+            logger.warning(f"[fetch_market_index_table] '{key}'({meta['symbol']}) 조회 실패: {e}")
+            return key, None
 
     result = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
@@ -120,7 +128,8 @@ def fetch_sector_ranking():
             data = res.json()
             pct = float(data.get('fluctuationsRatio', '0').replace(',', ''))
             return {"업종명": name, "등락률_num": round(pct, 2)}
-        except: pass
+        except Exception as e:
+            logger.warning(f"[fetch_sector_ranking] '{name}'({code}) 조회 실패: {e}")
         return None
         
     rows = []
@@ -133,104 +142,175 @@ def fetch_sector_ranking():
     if not rows: return pd.DataFrame()
     return pd.DataFrame(rows).sort_values("등락률_num", ascending=False).reset_index(drop=True)
 
-@st.cache_data(ttl=180, show_spinner=False)
-def fetch_hot_stocks():
-    watchlist = [
-        ("삼성전자", "005930"), ("SK하이닉스", "000660"), ("현대차", "005380"), ("기아", "000270"),
-        ("KB금융", "105560"), ("신한지주", "055550"), ("하나금융지주", "086790"), ("메리츠금융지주", "138040"),
-        ("삼성바이오로직스","207940"), ("셀트리온", "068270"), ("NAVER", "035420"), ("카카오", "035720"),
-        ("LG에너지솔루션", "373220"), ("삼성SDI", "006400"), ("LG화학", "051910"), ("POSCO홀딩스", "005490"),
-        ("두산에너빌리티", "034020"), ("한미반도체", "042700"), ("한화에어로스페이스", "012450"), ("LIG넥스원", "079550"),
-        ("에코프로비엠", "247540"), ("에코프로", "086520"), ("알테오젠", "196170"), ("HLB", "028300"),
-        ("엔켐", "348370"), ("리가켐바이오", "141080"), ("휴젤", "145020"), ("클래시스", "214150"),
-        ("HPSP", "403870"), ("삼천당제약", "000250"), ("리노공업", "058470"), ("셀트리온제약", "068760"),
-        ("레인보우로보틱스", "277810"), ("실리콘투", "257720"), ("이오테크닉스", "039030"), ("펄어비스", "263750")
-    ]
-    def get_data(name, code):
-        try:
-            time.sleep(random.uniform(0.1, 0.3))
-            url = f"https://m.stock.naver.com/api/stock/{code}/basic"
-            res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
-            data = res.json()
-            
-            price = float(str(data.get('closePrice', '0')).replace(',', ''))
-            pct = float(str(data.get('fluctuationsRatio', '0')).replace(',', ''))
-            
-            high_val = data.get('high52WeekPrice') or data.get('high52Week') or '0'
-            high = float(str(high_val).replace(',', ''))
-            
-            mkt_info = data.get('stockExchangeType', {}).get('name', '코스피')
-            mkt = "코스닥" if "코스닥" in str(mkt_info) else "코스피"
-
-            if price > 0:
-                return {
-                    "종목명": name, "종목코드": code, "현재가_num": price, "등락률_num": pct,
-                    "52주최고": high if high > 0 else price, "시장": mkt
-                }
-        except: pass
-        return None
-        
-    rows = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [executor.submit(get_data, n, c) for n, c in watchlist]
-        for future in concurrent.futures.as_completed(futures):
-            res = future.result()
-            if res: rows.append(res)
-            
-    if not rows: return pd.DataFrame()
-    return pd.DataFrame(rows).sort_values("등락률_num", ascending=False).reset_index(drop=True)
-
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_dividend_ranking():
-    url = "https://finance.naver.com/sise/dividend_list.naver"
+    base_url = "https://finance.naver.com/sise/dividend_list.naver"
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+
+    def fetch_page(page):
+        try:
+            res = requests.get(f"{base_url}?page={page}", headers=headers, timeout=10)
+            res.encoding = 'euc-kr'
+            dfs = pd.read_html(io.StringIO(res.text))
+            for df in dfs:
+                if any('종목명' in str(c) for c in df.columns.to_flat_index()):
+                    page_df = df.dropna()
+                    return page_df if not page_df.empty else None
+        except Exception as e:
+            logger.warning(f"[fetch_dividend_ranking] {page}페이지 조회 실패: {e}")
+        return None
+
     try:
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
-        res.encoding = 'euc-kr'
-        dfs = pd.read_html(io.StringIO(res.text))
-        for df in dfs:
-            if any('종목명' in str(c) for c in df.columns): return df.dropna().head(30)
+        # 1페이지로 전체 페이지 수 파악
+        import re as _re
+        res0 = requests.get(base_url, headers=headers, timeout=10)
+        res0.encoding = 'euc-kr'
+        page_nums = [int(p) for p in _re.findall(r'[?&]page=(\d+)', res0.text)]
+        max_page = max(page_nums) if page_nums else 10
+        max_page = min(max_page, 15)  # 안전 상한선 15페이지(450개)
+
+        all_pages = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(fetch_page, p): p for p in range(1, max_page + 1)}
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    all_pages.append(result)
+
+        if not all_pages:
+            return pd.DataFrame()
+        result = pd.concat(all_pages, ignore_index=True)
+        result = result.drop_duplicates()
+        return result
+    except Exception as e:
+        logger.warning(f"[fetch_dividend_ranking] 전체 조회 실패: {e}")
         return pd.DataFrame()
-    except: return pd.DataFrame()
+
+def _parse_consensus_table(html_text):
+    result = {"opinion": "", "opinion_score": "", "target": "", "analyst_count": ""}
+    tbl_match = re.search(r'<th[^>]*>투자의견</th>.*?<tbody>(.*?)</tbody>', html_text, re.DOTALL)
+    if not tbl_match:
+        return result
+
+    tbody = tbl_match.group(1)
+    tds = re.findall(r'<td[^>]*>(.*?)</td>', tbody, re.DOTALL)
+    tds_clean = [re.sub(r'<[^>]+>', '', td).strip().replace(',', '') for td in tds]
+    if len(tds_clean) < 2:
+        return result
+
+    try:
+        op_val = float(tds_clean[0])
+        if op_val > 0:
+            result["opinion_score"] = f"{op_val:.1f} / 5.0"
+            if op_val >= 4.5:   result["opinion"] = "🔥 강력매수"
+            elif op_val >= 3.5: result["opinion"] = "👍 매수"
+            elif op_val >= 2.5: result["opinion"] = "✋ 중립"
+            elif op_val >= 1.5: result["opinion"] = "👎 매도"
+            else:               result["opinion"] = "💀 강력매도"
+    except ValueError:
+        pass
+
+    tg_raw = re.sub(r'[^\d]', '', tds_clean[1])
+    if tg_raw:
+        result["target"] = f"{int(tg_raw):,} 원"
+
+    if len(tds_clean) >= 5 and re.sub(r'[^\d]', '', tds_clean[4]):
+        result["analyst_count"] = f"추정기관 {tds_clean[4]}곳"
+
+    return result
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_company_info_fnguide(code):
-    url = f"https://comp.fnguide.com/SVO2/ASP/SVD_Main.asp?pGB=1&gicode=A{normalize_kr_code(code)}"
-    data = {"name": "알 수 없음", "summary": "제공된 기업개요가 없습니다.", "opinion": "평가 없음", "target": "- 원"}
+    code = normalize_kr_code(code)
+    data = {"name": "알 수 없음", "summary": "제공된 기업개요가 없습니다.", "opinion": "📭 분석의견 없음", "target": "데이터 없음", "opinion_score": "", "analyst_count": "", "consensus_note": ""}
+
+    fn_headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://comp.fnguide.com/',
+        'Accept-Language': 'ko-KR,ko;q=0.9',
+    }
+    naver_headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://finance.naver.com/',
+    }
+
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        res = requests.get(url, headers=headers, timeout=5)
+        fn_url = f"https://comp.fnguide.com/SVO2/ASP/SVD_Main.asp?pGB=1&gicode=A{code}"
+        res = requests.get(fn_url, headers=fn_headers, timeout=8)
+        res.encoding = res.apparent_encoding or 'utf-8'
         html = res.text
         name_match = re.search(r'id="giName"[^>]*>(.*?)</h1>', html)
-        if name_match: data["name"] = re.sub(r'<[^>]+>', '', name_match.group(1)).strip()
+        if name_match:
+            name_text = re.sub(r'<[^>]+>', '', name_match.group(1))
+            data["name"] = html_lib.unescape(name_text).strip()
         summary_match = re.search(r'id="bizSummaryContent"[^>]*>(.*?)</ul>', html, re.DOTALL)
         if summary_match:
             text = re.sub(r'<.*?>', ' ', summary_match.group(1))
+            text = html_lib.unescape(text)
             text = re.sub(r'\s+', ' ', text).strip()
-            if text: data["summary"] = text
-        consensus_match = re.search(r'투자의견\s*/\s*목표주가.*?<td>(.*?)</td>', html, re.DOTALL)
-        if consensus_match:
-            con_raw = re.sub(r'<[^>]+>', '', consensus_match.group(1)).strip()
-            con_text = re.sub(r'\s+', ' ', con_raw)
-            if '/' in con_text:
-                parts = con_text.split('/')
-                op = parts[0].strip().upper()
-                tg = parts[1].strip().replace(',', '').replace(' ', '')
-            else:
-                op = con_text.strip().upper()
-                tg = ''
-                tg_match = re.search(r'목표주가.*?<td[^>]*>(.*?)</td>', html, re.DOTALL)
-                if tg_match: tg = re.sub(r'<[^>]+>', '', tg_match.group(1)).strip().replace(',', '')
-            if op and op not in ('-', ''):
-                if 'STRONG BUY' in op: data["opinion"] = "🔥 강력매수"
-                elif 'BUY' in op: data["opinion"] = "👍 매수"
-                elif 'HOLD' in op or '중립' in op: data["opinion"] = "✋ 중립"
-                elif 'SELL' in op or '매도' in op: data["opinion"] = "👎 매도"
-                elif '매수' in op: data["opinion"] = "👍 매수"
-                else: data["opinion"] = op
-            if tg and tg not in ('-', ''):
-                tg_num = re.sub(r'[^\d]', '', tg)
-                if tg_num: data["target"] = f"{int(tg_num):,} 원"
-    except Exception: pass
+            if text:
+                data["summary"] = text
+    except Exception as e:
+        logger.warning(f"[fetch_company_info_fnguide] {code} FnGuide 기업개요 조회 실패: {e}")
+
+    if data["name"] == "알 수 없음":
+        try:
+            nv_url = f"https://finance.naver.com/item/main.naver?code={code}"
+            res = requests.get(nv_url, headers=naver_headers, timeout=6)
+            res.encoding = 'euc-kr'
+            html = res.text
+            name_match = re.search(r'<title>(.*?)\s*::', html)
+            if name_match:
+                data["name"] = html_lib.unescape(name_match.group(1)).strip()
+            if data["summary"] == "제공된 기업개요가 없습니다.":
+                summary_match = re.search(r'class="summary_info"[^>]*>(.*?)</p>', html, re.DOTALL)
+                if summary_match:
+                    text = re.sub(r'<[^>]+>', '', summary_match.group(1))
+                    text = html_lib.unescape(text)
+                    text = re.sub(r'\s+', ' ', text).strip()
+                    if text:
+                        data["summary"] = text
+        except Exception as e:
+            logger.warning(f"[fetch_company_info_fnguide] {code} 네이버 보조 조회 실패: {e}")
+
+    consensus = {"opinion": "", "opinion_score": "", "target": "", "analyst_count": ""}
+    fetch_failed = False
+    try:
+        fn_url2 = f"https://comp.fnguide.com/SVO2/ASP/SVD_Main.asp?pGB=1&gicode=A{code}"
+        res2 = requests.get(fn_url2, headers=fn_headers, timeout=8)
+        res2.encoding = res2.apparent_encoding or 'utf-8'
+        consensus = _parse_consensus_table(res2.text)
+    except Exception as e:
+        logger.warning(f"[fetch_company_info_fnguide] {code} 컨센서스(PC) 조회 실패: {e}")
+        fetch_failed = True
+
+    if not consensus["opinion"] and not consensus["target"]:
+        try:
+            fn_mobile_url = f"https://m.comp.fnguide.com/m2/company_03.asp?pGB=1&gicode=A{code}"
+            res3 = requests.get(fn_mobile_url, headers=fn_headers, timeout=8)
+            res3.encoding = res3.apparent_encoding or 'utf-8'
+            consensus_mobile = _parse_consensus_table(res3.text)
+            if consensus_mobile["opinion"] or consensus_mobile["target"]:
+                consensus = consensus_mobile
+            fetch_failed = False
+        except Exception as e:
+            logger.warning(f"[fetch_company_info_fnguide] {code} 컨센서스(모바일) 조회 실패: {e}")
+
+    if consensus["opinion"]:
+        data["opinion"] = consensus["opinion"]
+    if consensus["opinion_score"]:
+        data["opinion_score"] = consensus["opinion_score"]
+    if consensus["target"]:
+        data["target"] = consensus["target"]
+    if consensus["analyst_count"]:
+        data["analyst_count"] = consensus["analyst_count"]
+
+    if not consensus["opinion"] and not consensus["target"]:
+        if fetch_failed:
+            data["consensus_note"] = "⚠️ 컨센서스 데이터를 불러오는 중 통신 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
+        else:
+            data["consensus_note"] = "이 종목은 현재 분석을 진행하는 증권사가 없어 매수의견·목표주가 컨센서스가 제공되지 않습니다. 거래량이 적은 중·소형주에서 흔히 나타나는 정상적인 상황이며, 기업 자체 재무 데이터는 아래에서 계속 확인하실 수 있습니다."
+
     return data
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -292,7 +372,8 @@ def fetch_fnguide_data(code):
         df_annual = calc_growth(df_a, is_quarter=False)
         df_quarter = calc_growth(df_q, is_quarter=True)
 
-    except Exception: pass
+    except Exception as e:
+        logger.warning(f"[fetch_fnguide_data] {code} 재무데이터 파싱 실패: {e}")
     return df_annual, df_quarter
 
 def fetch_page_data(sosok, page, headers, cookies):
@@ -311,7 +392,8 @@ def fetch_page_data(sosok, page, headers, cookies):
         main_df['종목코드'] = main_df['종목명'].map(name_to_code)
         main_df['시장'] = "코스피" if sosok == 0 else "코스닥"
         return main_df
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[fetch_page_data] sosok={sosok} page={page} 조회 실패: {e}")
         return None
 
 def fetch_screener_data_generator():
@@ -325,7 +407,7 @@ def fetch_screener_data_generator():
     session.get("https://finance.naver.com/sise/sise_market_sum.naver", headers=headers)
     time.sleep(0.5)
     
-    field_url = "https://finance.naver.com/sise/field_submit.naver?menu=market_sum&returnUrl=https%3A%2F%2Ffinance.naver.com%2Fsise%2Fsise_market_sum.naver&fieldIds=per&fieldIds=pbr&fieldIds=roe&fieldIds=dividend&fieldIds=property_total&fieldIds=debt_total"
+    field_url = "https://finance.naver.com/sise/field_submit.naver?menu=market_sum&returnUrl=https%3A%2F%2Ffinance.naver.com%2Fsise%2Fsise_market_sum.naver&fieldIds=per&fieldIds=pbr&fieldIds=roe&fieldIds=dividend&fieldIds=property_total&fieldIds=debt_total&fieldIds=high52"
     session.get(field_url, headers=headers)
     cookies = session.cookies.get_dict()
     
@@ -356,25 +438,26 @@ def fetch_screener_data_generator():
                 if cand.lower() in c.lower(): return c
         return None
         
-    price_c = get_col(final_df, ['현재가'])
-    div_c   = get_col(final_df, ['주당배당금', '배당금'])
-    per_c   = get_col(final_df, ['PER', 'PER(배)'])
-    pbr_c   = get_col(final_df, ['PBR', 'PBR(배)'])
-    roe_c   = get_col(final_df, ['ROE', 'ROE(%)']) 
-    prop_c  = get_col(final_df, ['자산총계']) 
-    debt_c  = get_col(final_df, ['부채총계']) 
-    mkt_c   = get_col(final_df, ['시장'])
+    price_c  = get_col(final_df, ['현재가'])
+    div_c    = get_col(final_df, ['주당배당금', '배당금'])
+    per_c    = get_col(final_df, ['PER', 'PER(배)'])
+    pbr_c    = get_col(final_df, ['PBR', 'PBR(배)'])
+    roe_c    = get_col(final_df, ['ROE', 'ROE(%)'])
+    prop_c   = get_col(final_df, ['자산총계'])
+    debt_c   = get_col(final_df, ['부채총계'])
+    mkt_c    = get_col(final_df, ['시장'])
+    high52_c = get_col(final_df, ['52주최고', '최고가', 'high52', '52주 최고'])
     
     final_df['현재가'] = pd.to_numeric(final_df[price_c].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0) if price_c else 0.0
     final_df['주당배당금'] = pd.to_numeric(final_df[div_c].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0) if div_c else 0.0
     final_df['자산총계'] = pd.to_numeric(final_df[prop_c].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0) if prop_c else 0.0
+    final_df['부채비율'] = 0.0
     final_df['부채총계'] = pd.to_numeric(final_df[debt_c].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0) if debt_c else 0.0
     
     final_df['배당수익률'] = 0.0
     mask_div = (final_df['현재가'] > 0) & (final_df['주당배당금'] > 0)
     final_df.loc[mask_div, '배당수익률'] = (final_df.loc[mask_div, '주당배당금'] / final_df.loc[mask_div, '현재가']) * 100
     
-    final_df['부채비율'] = 0.0
     final_df['자본총계'] = final_df['자산총계'] - final_df['부채총계']
     mask_debt = (final_df['자본총계'] > 0) & (final_df['부채총계'] >= 0)
     final_df.loc[mask_debt, '부채비율'] = (final_df.loc[mask_debt, '부채총계'] / final_df.loc[mask_debt, '자본총계']) * 100
@@ -383,16 +466,30 @@ def fetch_screener_data_generator():
     final_df['PBR'] = pd.to_numeric(final_df[pbr_c].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0) if pbr_c else 0.0
     final_df['ROE'] = pd.to_numeric(final_df[roe_c].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0) if roe_c else 0.0
     final_df['시장'] = final_df[mkt_c] if mkt_c else "코스피"
-    
-    final_df = final_df[['종목코드', '종목명', '시장', '현재가', 'PER', 'PBR', '배당수익률', 'ROE', '부채비율']]
+
+    if high52_c:
+        final_df['52주고점'] = pd.to_numeric(final_df[high52_c].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0)
+        mask_high = (final_df['현재가'] > 0) & (final_df['52주고점'] > 0)
+        final_df['고점대비(%)'] = 0.0
+        final_df.loc[mask_high, '고점대비(%)'] = ((final_df.loc[mask_high, '현재가'] - final_df.loc[mask_high, '52주고점']) / final_df.loc[mask_high, '52주고점']) * 100
+        final_df = final_df[['종목코드', '종목명', '시장', '현재가', '52주고점', '고점대비(%)', 'PER', 'PBR', '배당수익률', 'ROE', '부채비율']]
+    else:
+        final_df = final_df[['종목코드', '종목명', '시장', '현재가', 'PER', 'PBR', '배당수익률', 'ROE', '부채비율']]
     yield final_df, 100
 
-@st.cache_data(ttl=3600*12, show_spinner=False)
-def fetch_and_cache_screener_data():
-    final_df = None
-    for item, _ in fetch_screener_data_generator():
-        if isinstance(item, pd.DataFrame): final_df = item
-    return final_df
+HIGH52_PATH = "saved_high52_data.csv"
+
+def merge_high52(df):
+    if not os.path.exists(HIGH52_PATH): return df
+    try:
+        h = pd.read_csv(HIGH52_PATH, dtype={'종목코드': str})
+        h['종목코드'] = h['종목코드'].str.replace('.0','', regex=False).str.zfill(6)
+        for c in ['52주고점', '고점대비(%)']:
+            if c in df.columns: df = df.drop(columns=[c])
+        df = df.merge(h[['종목코드', '52주고점', '고점대비(%)']], on='종목코드', how='left')
+    except Exception as e:
+        logger.warning(f"[merge_high52] {HIGH52_PATH} 병합 실패: {e}")
+    return df
 
 def load_screener_df():
     save_path = "saved_screener_data.csv"
@@ -407,16 +504,65 @@ def load_screener_df():
             df = df.dropna(subset=['종목코드'])
             df = df[~df['종목코드'].astype(str).str.lower().str.contains('nan')]
             df['종목코드'] = df['종목코드'].str.replace('.0','', regex=False).str.zfill(6)
+            df = merge_high52(df)  
             st.session_state['shared_screener_df'] = df
             return df
-        except: return pd.DataFrame()
+        except Exception as e:
+            logger.warning(f"[load_screener_df] {save_path} 로드 실패: {e}")
+            return pd.DataFrame()
     return pd.DataFrame()
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_high52_map():
+    if not os.path.exists(HIGH52_PATH):
+        return {}
+    try:
+        h = pd.read_csv(HIGH52_PATH, dtype={'종목코드': str})
+        h['종목코드'] = h['종목코드'].str.replace('.0', '', regex=False).str.zfill(6)
+        h['52주고점'] = pd.to_numeric(h['52주고점'], errors='coerce')
+        h = h.dropna(subset=['52주고점'])
+        return dict(zip(h['종목코드'], h['52주고점']))
+    except Exception as e:
+        logger.warning(f"[load_high52_map] {HIGH52_PATH} 로드 실패: {e}")
+        return {}
 
 def check_naver_52w_robust(row_dict):
     code = str(row_dict['종목코드']).replace('.0','').zfill(6)
     mkt = row_dict.get('시장', '코스피')
     price, high = 0.0, 0.0
-    
+
+    high52_map = load_high52_map()
+    if high52_map:
+        saved_high = high52_map.get(code, 0.0)
+        if saved_high > 0:
+            high = saved_high
+            price = float(str(row_dict.get('현재가', 0)).replace(',', ''))
+            if price <= 0:
+                try:
+                    time.sleep(random.uniform(0.05, 0.15))
+                    url = f"https://m.stock.naver.com/api/stock/{code}/basic"
+                    res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
+                    if res.status_code == 200:
+                        price_str = res.json().get('closePrice', '0')
+                        price = float(str(price_str).replace(',', ''))
+                except Exception as e:
+                    logger.debug(f"[check_naver_52w_robust] {code} 현재가 보정 조회 실패: {e}")
+            if price <= 0:
+                # 현재가를 끝내 구하지 못한 경우 high로 대체해 "고점 대비 0%"로 위장시키지 않고 제외함
+                return None
+
+            if price > 0 and high > 0:
+                drop_pct = ((price - high) / high) * 100
+                if drop_pct <= 0.0:
+                    return {
+                        "종목명": row_dict['종목명'], "종목코드": code, "시장": mkt,
+                        "현재가_num": price, "52주최고": high, "고점 / 하락률": drop_pct,
+                        "PER": row_dict['PER'], "PBR": row_dict['PBR'], "ROE": row_dict['ROE'],
+                        "부채비율": row_dict['부채비율'], "배당수익률": row_dict.get('배당수익률', 0.0),
+                        "데이터출처": "📂 CSV"
+                    }
+            return None  
+
     try:
         time.sleep(random.uniform(0.1, 0.3))
         url = f"https://m.stock.naver.com/api/stock/{code}/basic"
@@ -427,54 +573,115 @@ def check_naver_52w_robust(row_dict):
             high_str = data.get('high52WeekPrice') or data.get('high52Week') or '0'
             price = float(str(price_str).replace(',', ''))
             high = float(str(high_str).replace(',', ''))
-    except: pass
+    except Exception as e:
+        logger.debug(f"[check_naver_52w_robust] {code} 모바일 API 조회 실패: {e}")
 
     if price <= 0 or high <= 0:
         try:
-            import yfinance as yf
-            suffix = ".KS" if mkt == "코스피" else ".KQ"
-            info = yf.Ticker(f"{code}{suffix}").fast_info
-            price = info.last_price
-            high = getattr(info, "year_high", None)
-        except: pass
-        
-    if not price or price <= 0:
-        price = float(row_dict.get('현재가', 0))
-        if price <= 0: price = 50000.0 
-        
-    if not high or high <= 0:
-        high = price * 1.15  
-        
+            url_pc = f"https://finance.naver.com/item/main.naver?code={code}"
+            res_pc = requests.get(url_pc, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
+            html = res_pc.text
+            if price <= 0:
+                p_match = re.search(r'<p class="no_today".*?<span class="blind">([\d,]+)</span>', html, re.DOTALL)
+                if p_match: price = float(p_match.group(1).replace(',', ''))
+            if high <= 0:
+                h_match = re.search(r'52주최고.*?<em>([\d,]+)</em>', html, re.DOTALL)
+                if h_match: high = float(h_match.group(1).replace(',', ''))
+        except Exception as e:
+            logger.debug(f"[check_naver_52w_robust] {code} PC페이지 폴백 조회 실패: {e}")
+
+    # 실시간 조회가 모두 실패하면, 스크리너 시점에 이미 확보된 현재가만 보수적으로 사용.
+    # (이전에는 그래도 안되면 50000원으로 임의 고정 → 가짜 "고점 대비 0%" 추천이 섞여 나오는 버그가 있었음)
+    if price <= 0:
+        price = float(str(row_dict.get('현재가', 0)).replace(',', ''))
+
+    if price <= 0 or high <= 0:
+        return None
+
     if price > 0 and high > 0:
         drop_pct = ((price - high) / high) * 100
-        
         if drop_pct <= 0.0:
             return {
                 "종목명": row_dict['종목명'], "종목코드": code, "시장": mkt,
-                "현재가_num": price, "52주최고": high, "고점대비하락률": drop_pct,
-                "PER": row_dict['PER'], "PBR": row_dict['PBR'], "ROE": row_dict['ROE'], 
-                "부채비율": row_dict['부채비율'], "배당수익률": row_dict.get('배당수익률', 0.0)
+                "현재가_num": price, "52주최고": high, "고점 / 하락률": drop_pct,
+                "PER": row_dict['PER'], "PBR": row_dict['PBR'], "ROE": row_dict['ROE'],
+                "부채비율": row_dict['부채비율'], "배당수익률": row_dict.get('배당수익률', 0.0),
+                "데이터출처": "🌐 실시간"
             }
     return None
+
+def find_col(df: pd.DataFrame, candidates: list) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns: return c
+    for c in df.columns:
+        for cand in candidates:
+            if cand.replace(" ", "").lower() in c.replace(" ", "").lower(): return c
+    return None
+
+def get_styled_dataframe(df):
+    if "종목코드" in df.columns:
+        df = df.rename(columns={"종목코드": "📋종목코드"})
+        
+    numeric_cols = []
+    text_cols = []
+    format_dict = {}
+    
+    for col in df.columns:
+        if "기준월" in col:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            format_dict[col] = "{:.2f}"
+            numeric_cols.append(col)
+            continue
+
+        if any(kw in col for kw in ["현재가", "고점", "최고", "금액", "배당금", "PER", "PBR", "ROE", "수익률", "비율", "하락률", "등락률", "성향", "년전 배당", "표준편차", "Amihud"]):
+            df[col] = pd.to_numeric(df[col].astype(str).str.replace(r'[^\d.-]', '', regex=True), errors='coerce')
+        
+        if col in ["PER", "PBR"]:
+            format_dict[col] = "{:,.2f}배"
+            numeric_cols.append(col)
+        elif any(kw in col for kw in ["ROE", "수익률", "비율", "하락률", "등락률", "성향", "년전 배당", "고점대비"]):
+            format_dict[col] = "{:,.1f}%"
+            numeric_cols.append(col)
+        elif "배당금" in col or any(kw in col for kw in ["현재가", "고점", "최고", "금액"]):
+            format_dict[col] = "{:,.0f}" 
+            numeric_cols.append(col)
+        elif pd.api.types.is_numeric_dtype(df[col]):
+            format_dict[col] = "{:,.2f}" if df[col].dtype == float else "{:,.0f}"
+            numeric_cols.append(col)
+        else:
+            text_cols.append(col)
+
+    styled = df.style.format(format_dict, na_rep="-") \
+        .set_properties(subset=numeric_cols, **{'text-align': 'right'}) \
+        .set_properties(subset=text_cols, **{'text-align': 'left'}) \
+        .set_table_styles([
+            {'selector': 'th', 'props': [('text-align', 'center !important'), ('background-color', '#F8FAFC'), ('color', '#1E293B'), ('border-bottom', '1px solid #E2E8F0')]},
+            {'selector': 'td', 'props': [('vertical-align', 'middle')]}
+        ])
+    return styled
 
 def draw_fnguide_details(code):
     info = fetch_company_info_fnguide(code)
     df_annual, df_quarter = fetch_fnguide_data(code)
-    
+
     if info['name'] != "알 수 없음" or not df_annual.empty:
+        opinion_score_html = f'<span style="color: #94A3B8; font-size: 12px; margin-left: 8px;">({info["opinion_score"]})</span>' if info['opinion_score'] else ''
+        analyst_count_html = f'<span style="color: #94A3B8; font-size: 12px; margin-left: 8px;">({info["analyst_count"]})</span>' if info['analyst_count'] else ''
+        consensus_note_html = f'<div style="background-color:#FFFBEB; border:1px solid #FDE68A; border-radius:6px; padding:10px 14px; margin-bottom:20px; font-size:12.5px; color:#92400E; line-height:1.6;">ℹ️ {info["consensus_note"]}</div>' if info.get("consensus_note") else ''
+
         st.markdown(f"""
             <div style="background-color: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 8px; padding: 25px; margin-top: 10px; margin-bottom: 20px;">
                 <h3 style="margin-top: 0; color: #0F172A; font-size: 20px;">{info['name']} <span style="font-size: 14px; color: #64748B;">({code})</span></h3>
                 <div style="display: flex; gap: 20px; margin-bottom: 20px;">
                     <div style="background-color: #FFFFFF; padding: 12px 20px; border-radius: 6px; border: 1px solid #E2E8F0; font-weight: 600;">
                         <span style="color: #64748B; font-size: 12px; display: block; margin-bottom: 4px;">투자의견 (FnGuide)</span>
-                        <span style="color: #5A4EE5; font-size: 16px;">{info['opinion']}</span>
+                        <span style="color: #5A4EE5; font-size: 16px;">{info['opinion']}</span>{opinion_score_html}
                     </div>
                     <div style="background-color: #FFFFFF; padding: 12px 20px; border-radius: 6px; border: 1px solid #E2E8F0; font-weight: 600;">
                         <span style="color: #64748B; font-size: 12px; display: block; margin-bottom: 4px;">목표주가 컨센서스</span>
-                        <span style="color: #0F172A; font-size: 16px;">{info['target']}</span>
+                        <span style="color: #0F172A; font-size: 16px;">{info['target']}</span>{analyst_count_html}
                     </div>
-                </div>
+                </div>{consensus_note_html}
                 <p style="color: #334155; font-size: 13px; line-height: 1.7; margin-bottom: 0;">
                     <b>📖 기업개요:</b> {info['summary']}
                 </p>
@@ -500,7 +707,7 @@ def draw_fnguide_details(code):
                         formatted_num = f"{v_int:,}"
                         if cho > 0: return f"{formatted_num} ({'-' if is_minus else ''}{cho}조 {uk:,}억)" if uk > 0 else f"{formatted_num} ({'-' if is_minus else ''}{cho}조)"
                         return f"{formatted_num} ({'-' if is_minus else ''}{uk:,}억)"
-                    elif col_name in ['영업이익률', '순이익률', 'ROE', '부채비율']: return f"{f_val:.2f}%"
+                    elif col_name in ['영업이익률', '순이익률', 'ROE', '부채비율']: return f"{f_val:.1f}%"
                     elif col_name in ['PER', 'PBR']: return f"{f_val:.2f}배"
                     return f"{f_val:,}"
                 except: return str(val)
@@ -538,11 +745,11 @@ def draw_fnguide_details(code):
                 df_annual_display[year_col] = df_annual_display[year_col].astype(str).apply(
                     lambda y: f"{y} ⚠️잠정" if current_year in y else y
                 )
-                st.dataframe(format_and_style(df_annual_display), width='stretch', hide_index=True)
+                st.dataframe(format_and_style(df_annual_display), use_container_width=True, hide_index=True)
             with tab2:
                 if not df_quarter.empty:
                     df_quarter_display = df_quarter.iloc[::-1].reset_index(drop=True)
-                    st.dataframe(format_and_style(df_quarter_display), width='stretch', hide_index=True)
+                    st.dataframe(format_and_style(df_quarter_display), use_container_width=True, hide_index=True)
                 else:
                     st.info("해당 기업의 분기 실적 데이터가 제공되지 않습니다.")
 
@@ -587,6 +794,9 @@ def main():
             section[data-testid="stMain"] .stButton > button:hover { background-color: #4C41C3 !important; border-color: #4C41C3 !important; }
             
             .info-box-modern { background-color: #F0F9FF !important; border: 1px solid #E0F2FE !important; border-radius: 8px !important; padding: 20px 24px !important; margin-bottom: 25px !important; color: #374151 !important; font-size: 14px; line-height: 1.6; }
+            
+            .cond-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 14px 0; }
+            .cond-chip { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; color: #5A4EE5; background: #EEF2FF; border: 1px solid #C7D2FE; white-space: nowrap; }
             div[data-testid="stFileUploader"] section { background-color: #F9FAFB !important; border: 1px dashed #D1D5DB !important; color: #111827 !important;}
             div[data-testid="stFileUploader"] * { color: #111827 !important; }
             
@@ -597,28 +807,152 @@ def main():
             div[data-testid="stExpander"] { border: 1px solid #E5E7EB !important; border-radius: 8px !important; background-color: #F9FAFB !important; }
             div[data-testid="stExpander"] summary p { color: #374151 !important; font-weight: 600 !important; }
             
-            div[data-testid="stTabs"] button { font-weight: 600 !important; color: #64748B !important; font-size: 16px !important; padding-bottom: 15px !important;}
-            div[data-testid="stTabs"] button[aria-selected="true"] { color: #5A4EE5 !important; border-bottom-color: #5A4EE5 !important; }
-
-            .index-card { background: #F8FAFC !important; border: 1px solid #E2E8F0 !important; border-radius: 10px !important; padding: 20px 24px !important; }
-            .index-card-title { font-size: 13px; color: #64748B !important; font-weight: 600; margin-bottom: 6px; }
-            .index-card-value { font-size: 28px; font-weight: 700; color: #0F172A !important; }
-            .index-card-up   { font-size: 14px; color: #DC2626 !important; font-weight: 600; margin-top: 4px; }
-            .index-card-down { font-size: 14px; color: #16A34A !important; font-weight: 600; margin-top: 4px; }
-            .index-card-neutral { font-size: 14px; color: #64748B !important; font-weight: 600; margin-top: 4px; }
-            .index-card-sub  { font-size: 12px; color: #94A3B8 !important; margin-top: 2px; }
-            .section-divider { border: none; border-top: 1px solid #E5E7EB !important; margin: 28px 0 22px 0; }
-            .dash-section-title { font-size: 15px; font-weight: 700; color: #1E293B !important; margin-bottom: 14px; display: flex; align-items: center; gap: 6px; }
-
-            div[role="radiogroup"] { display: flex; background-color: #F3F4F6 !important; padding: 4px; border-radius: 8px; gap: 4px; width: max-content; }
-            div[role="radiogroup"] label { padding: 8px 16px !important; background-color: transparent !important; border-radius: 6px; cursor: pointer; transition: all 0.2s ease; border: none !important; }
-            div[role="radiogroup"] label:hover { background-color: #E5E7EB !important; }
-            div[role="radiogroup"] label[data-checked="true"] { background-color: #FFFFFF !important; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-            div[role="radiogroup"] label[data-checked="true"] p { color: #5A4EE5 !important; font-weight: 600 !important; }
-            div[role="radiogroup"] label div[data-testid="stMarkdownContainer"] { margin-left: 0 !important; }
-            div[role="radiogroup"] label span[data-baseweb="radio"] { display: none !important; }
-            
             div[data-testid="stCheckbox"] label { color: #374151 !important; font-weight: 500 !important; }
+
+            /* 💡 stRadio 위젯 자체 및 상위 래퍼의 잔여 마진/패딩을 모두 제거하여
+               다른 요소(버튼, info-box 등)와 좌측 시작선을 완전히 일치시킴.
+               구버전(.element-container)과 신버전(stElementContainer) DOM 둘 다 대응 */
+            div[data-testid="stRadio"],
+            div[data-testid="stRadio"] > div,
+            .element-container:has(div[data-testid="stRadio"]),
+            div[data-testid="stElementContainer"]:has(div[data-testid="stRadio"]) {
+                width: 100% !important;
+                max-width: none !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                left: 0 !important;
+                position: relative !important;
+            }
+            div[data-testid="stRadio"] > label[data-testid="stWidgetLabel"] {
+                display: none !important; /* collapsed label이 차지하는 잔여 공간 제거 */
+            }
+
+            /* 💡 [궁극의 UI 교정] 라디오 그룹을 flex로 변경하여 똑같은 비율로 균등 분할
+               (grid보다 BaseWeb 원본 레이아웃 방식과 호환성이 높아 잔여 오프셋 위험이 적음) */
+            div[data-testid="stRadio"] > div[role="radiogroup"] {
+                display: flex !important;
+                flex-direction: row !important;
+                flex-wrap: nowrap !important;
+                gap: 10px !important;
+                width: 100% !important;
+                margin: 0 !important;
+                margin-left: 0 !important;
+                padding-left: 0 !important;
+                background-color: transparent !important;
+                border: none !important;
+                padding: 0 !important;
+                align-items: stretch !important; /* 모든 박스 높이를 동일한 트랙 높이로 정렬 */
+                justify-content: flex-start !important;
+            }
+
+            /* radiogroup 직속 자식(각 라디오 옵션 wrapper)에 남아있을 수 있는
+               BaseWeb 기본 margin/padding을 모두 제거 — 좌측 정렬 오프셋 원인 차단 */
+            div[data-testid="stRadio"] > div[role="radiogroup"] > * {
+                margin: 0 !important;
+                min-width: 0 !important;
+                flex: 1 1 0% !important; /* 🔥 동일한 너비로 균등 분할 (grid의 1fr과 동일한 효과) */
+            }
+            div[data-testid="stRadio"] > div[role="radiogroup"] > *:first-child {
+                margin-left: 0 !important;
+            }
+
+            /* 라디오 탭 내부 블록 디자인 */
+            div[data-testid="stRadio"] label[data-baseweb="radio"] {
+                background-color: rgba(248, 250, 252, 0.7) !important;
+                backdrop-filter: blur(4px) !important;
+                border: none !important; /* 🔥 border는 outline으로 대체 → grid 셀 크기 계산에 영향 없음 */
+                outline: 2px solid #CBD5E1 !important;
+                outline-offset: -2px !important; /* outline이 박스 안쪽에 그려지도록 보정 */
+                border-radius: 8px !important;
+                padding: 10px 5px !important; 
+                margin: 0 !important;
+                cursor: pointer !important;
+                transition: background-color 0.2s ease-in-out, outline-color 0.2s ease-in-out, box-shadow 0.2s ease-in-out !important;
+                display: flex !important;
+                flex-direction: row !important;
+                justify-content: center !important;
+                align-items: center !important;
+                width: 100% !important;
+                min-height: 44px !important; /* 🔥 모든 박스 높이를 동일하게 고정 */
+                box-sizing: border-box !important;
+                box-shadow: none !important; /* 기본 그림자 없음 → 선택 시에만 부여 */
+            }
+
+            div[data-testid="stRadio"] label[data-baseweb="radio"]:hover {
+                background-color: rgba(226, 232, 240, 0.8) !important;
+            }
+
+            /* ✅ 클릭 시 (선택된 상태) 파란색 활성화 효과 — outline 두께는 그대로, 색상만 변경 */
+            div[data-testid="stRadio"] label[data-baseweb="radio"]:has(input[type="radio"]:checked) {
+                background-color: #EEF2FF !important; /* 연한 파란색 배경 */
+                outline-color: #6366F1 !important; /* 파란색 테두리 (두께 변화 없음) */
+                box-shadow: 0 4px 10px rgba(99, 102, 241, 0.15) !important; /* 입체적인 파란 그림자 */
+            }
+
+            /* 🚫 기존 기본 동그라미 아이콘 완벽 숨김 (텍스트 정렬에 영향 없도록 너비 0 처리) */
+            div[data-testid="stRadio"] label[data-baseweb="radio"] > div:first-child {
+                display: none !important;
+                width: 0 !important;
+                margin: 0 !important;
+            }
+
+            /* 텍스트 컨테이너 정렬 강제 (남은 영역을 가운데 정렬) */
+            div[data-testid="stRadio"] label[data-baseweb="radio"] > div:last-child {
+                flex: 1 1 auto !important;
+                width: 100% !important;
+                text-align: center !important;
+                display: flex !important;
+                justify-content: center !important;
+                align-items: center !important;
+            }
+
+            /* 텍스트 컬러 및 사이즈 */
+            div[data-testid="stRadio"] label[data-baseweb="radio"] p {
+                color: #475569 !important;
+                font-size: 14.5px !important;
+                font-weight: 600 !important;
+                margin: 0 !important;
+                line-height: 1.3 !important;
+                white-space: nowrap !important; /* 🔥 글씨 무조건 한 줄 고정 */
+                overflow: hidden !important;
+                text-overflow: ellipsis !important; /* 박스를 넘어가면 ... 처리 */
+                text-align: center !important;
+            }
+
+            /* 텍스트 컬러 (선택됨) */
+            div[data-testid="stRadio"] label[data-baseweb="radio"]:has(input[type="radio"]:checked) p {
+                color: #4338CA !important; /* 진한 파란색 텍스트 */
+                font-weight: 800 !important;
+            }
+
+            /* 시장 필터(전체·코스피·코스닥)도 텍스트 길이와 무관하게 완전히 균등한 너비로 분할.
+               좁은 컬럼이라 너무 넓어지지 않도록 그룹 자체의 최대 폭만 제한 */
+            .st-key-market_filter_box div[data-testid="stRadio"] > div[role="radiogroup"] {
+                justify-content: flex-start !important;
+                max-width: 320px !important; /* 라디오 그룹 전체 폭 제한 (검색창과 균형 유지) */
+            }
+            .st-key-market_filter_box div[data-testid="stRadio"] > div[role="radiogroup"] > * {
+                flex: 1 1 0% !important; /* 🔥 텍스트 길이 무관, 3칸 완전 균등 분할 */
+                min-width: 0 !important;
+                max-width: none !important;
+            }
+            .st-key-market_filter_box div[data-testid="stRadio"] label[data-baseweb="radio"] {
+                min-height: 40px !important;
+                padding: 8px 10px !important;
+            }
+
+            /* ── 대시보드 카드 스타일 ── */
+            .dash-section-title { font-size: 16px; font-weight: 700; color: #0F172A; margin: 18px 0 14px 0; letter-spacing: -0.3px; }
+            .section-divider { border: none; border-top: 1px solid #E5E7EB; margin: 28px 0; }
+
+            .index-card { background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 12px; padding: 20px 22px; min-height: 110px; box-shadow: 0 1px 4px rgba(0,0,0,0.04); transition: box-shadow 0.2s; }
+            .index-card:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
+            .index-card-title { font-size: 13px; font-weight: 700; color: #1E293B; margin-bottom: 6px; letter-spacing: -0.2px; }
+            .index-card-value { font-size: 26px; font-weight: 800; color: #0F172A; margin-bottom: 6px; letter-spacing: -0.5px; }
+            .index-card-up   { font-size: 13px; font-weight: 600; color: #DC2626; margin-bottom: 6px; }
+            .index-card-down { font-size: 13px; font-weight: 600; color: #2563EB; margin-bottom: 6px; }
+            .index-card-neutral { font-size: 13px; font-weight: 600; color: #64748B; margin-bottom: 6px; }
+            .index-card-sub  { font-size: 12px; color: #94A3B8; }
         </style>
 
         <div class="header-container">
@@ -629,16 +963,13 @@ def main():
 
     with st.sidebar:
         st.markdown('<span class="sidebar-logo-text">Inventory Manager</span>', unsafe_allow_html=True)
-        
-        # 💡 [UI 개선] 사이드바 메뉴 상단에 그룹 라벨 추가
         st.markdown('<div style="color: #64748B; font-size: 12px; font-weight: 600; padding: 10px 25px 5px 25px; margin-top: 10px;">MAIN MENU</div>', unsafe_allow_html=True)
         
         selected = option_menu(
             menu_title=None,
-            options=["대시보드 홈", "추천 종목", "저평가 우량주 발굴", "종목 스크리너", "기업 재무 분석", "실시간 배당 순위"],
-            # 💡 [UI 개선] 메뉴별 직관적인 Bootstrap 아이콘 매핑
-            icons=["grid-1x2", "bullseye", "gem", "sliders", "bar-chart-line", "cash-coin"],
-            default_index=1,
+            options=["대시보드 홈", "추천 종목", "종목 스크리너", "기업 재무 분석", "실시간 배당 순위"],
+            icons=["grid-1x2", "bullseye", "sliders", "bar-chart-line", "cash-coin"],
+            default_index=0,
             styles={
                 "container": { "padding": "0!important", "background-color": "transparent!important", "margin": "0", "border-radius": "0"},
                 "icon": {"font-size": "17px", "margin-right": "12px", "color": "inherit"},
@@ -649,30 +980,10 @@ def main():
 
     if   selected == "대시보드 홈":      render_dashboard()
     elif selected == "추천 종목":        render_recommendations()
-    elif selected == "저평가 우량주 발굴": render_undervalued()
     elif selected == "종목 스크리너":    render_screener()
     elif selected == "기업 재무 분석":   render_fnguide()
     elif selected == "실시간 배당 순위": render_dividend()
 
-# =========================
-# 🌟 [공통 기능] 표 열 속성 정의
-# =========================
-def get_table_col_config(include_debt=False):
-    config = {
-        "종목코드": st.column_config.TextColumn("📋종목코드 (클릭 후 복사)"),
-        "PER": st.column_config.NumberColumn("PER", format="%.2f 배"),
-        "PBR": st.column_config.NumberColumn("PBR", format="%.2f 배"),
-        "배당수익률": st.column_config.NumberColumn("배당수익률", format="%.2f %%"),
-        "ROE": st.column_config.NumberColumn("ROE", format="%.2f %%"),
-        "시장": st.column_config.TextColumn("시장")
-    }
-    if include_debt:
-        config["부채비율"] = st.column_config.NumberColumn("부채비율", format="%.2f %%")
-    return config
-
-# =========================
-# 🖥️ 기능 구현 함수
-# =========================
 def render_dashboard():
     now_str = datetime.datetime.now().strftime("%Y.%m.%d %H:%M")
 
@@ -692,7 +1003,6 @@ def render_dashboard():
         if st.button("데이터 새로고침"):
             fetch_market_index_table.clear()
             fetch_sector_ranking.clear()
-            fetch_hot_stocks.clear()
             st.rerun()
 
     st.markdown("<div class='dash-section-title'>📈 시장 지수</div>", unsafe_allow_html=True)
@@ -750,115 +1060,176 @@ def render_dashboard():
             """, unsafe_allow_html=True)
 
     st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-    col_sector, col_stocks = st.columns([1, 1], gap="large")
+    st.markdown("<div class='dash-section-title'>🔥 오늘의 핫 섹터 TOP 10</div>", unsafe_allow_html=True)
+    df_sector = run_with_progress("업종 데이터를 분석 중...", fetch_sector_ranking)
 
-    with col_sector:
-        st.markdown("<div class='dash-section-title'>🔥 오늘의 핫 섹터 TOP 10</div>", unsafe_allow_html=True)
-        df_sector = run_with_progress("업종 데이터를 분석 중...", fetch_sector_ranking)
-
-        if not df_sector.empty:
-            max_abs = df_sector["등락률_num"].abs().max() or 1
-            for _, row in df_sector.iterrows():
-                pct   = row["등락률_num"]
-                name  = row["업종명"]
-                bar_w = int(abs(pct) / max_abs * 100)
-                bar_color = "#DC2626" if pct >= 0 else "#16A34A"
-                sign  = "+" if pct >= 0 else ""
-                pct_disp = f"{sign}{pct:.2f}%"
+    if not df_sector.empty:
+        max_abs = df_sector["등락률_num"].abs().max() or 1
+        col_s1, col_s2 = st.columns(2, gap="large")
+        for i, row in df_sector.iterrows():
+            target_col = col_s1 if i < 5 else col_s2
+            pct   = row["등락률_num"]
+            name  = row["업종명"]
+            bar_w = int(abs(pct) / max_abs * 100)
+            bar_color = "#DC2626" if pct >= 0 else "#16A34A"
+            sign  = "+" if pct >= 0 else ""
+            pct_disp = f"{sign}{pct:.1f}%" 
+            with target_col:
                 st.markdown(f"""
-                <div style="display:flex; align-items:center; gap:10px; margin-bottom:8px;">
-                    <span style="font-size:13px; color:#1E293B; min-width:110px; font-weight:500;">{name}</span>
-                    <div style="flex:1; background:#F1F5F9; border-radius:4px; height:8px;">
-                        <div style="width:{bar_w}%; background:{bar_color}; border-radius:4px; height:8px;"></div>
+                <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px; padding:10px; background:#FFFFFF; border:1px solid #E2E8F0; border-radius:8px;">
+                    <span style="font-size:14px; color:#1E293B; min-width:120px; font-weight:600;">{name}</span>
+                    <div style="flex:1; background:#F1F5F9; border-radius:4px; height:10px;">
+                        <div style="width:{bar_w}%; background:{bar_color}; border-radius:4px; height:10px;"></div>
                     </div>
-                    <span style="font-size:13px; font-weight:700; color:{bar_color}; min-width:60px; text-align:right;">{pct_disp}</span>
+                    <span style="font-size:14px; font-weight:700; color:{bar_color}; min-width:60px; text-align:right;">{pct_disp}</span>
                 </div>
                 """, unsafe_allow_html=True)
-        else:
-            st.info("업종 데이터를 불러올 수 없습니다.")
+    else:
+        st.info("업종 데이터를 불러올 수 없습니다.")
 
-    with col_stocks:
-        st.markdown("<div class='dash-section-title'>관심 종목 모니터링</div>", unsafe_allow_html=True)
-        df_hot = run_with_progress("관심 종목을 탐색 중...", fetch_hot_stocks)
-
-        tab_up, tab_down, tab_52w = st.tabs(["🚀 급등 종목", "📉 급락 종목", "🎯 52주 고점 대비"])
-
-        if not df_hot.empty:
-            def render_stock_list(df_subset):
-                for _, row in df_subset.iterrows():
-                    name     = row["종목명"]
-                    code     = str(row.get("종목코드", "")).zfill(6) if pd.notna(row.get("종목코드")) else "-"
-                    price    = row.get("현재가_num", None)
-                    pct      = row.get("등락률_num", 0)
-                    price_str = f"{int(price):,}원" if pd.notna(price) and price else "-"
-                    sign      = "+" if pct > 0 else ""
-                    pct_str   = f"{sign}{pct:.2f}%"
-                    bar_color = "#DC2626" if pct >= 0 else "#16A34A"
-                    bg_color  = "#FEF2F2" if pct >= 0 else "#F0FDF4"
-                    
-                    st.markdown(f"""
-                    <div style="display:flex; align-items:center; justify-content:space-between; padding:9px 0; border-bottom:1px solid #F1F5F9;">
-                        <div>
-                            <span style="font-size:14px; font-weight:600; color:#0F172A;">{name}</span>
-                            <span style="font-size:11px; color:#94A3B8; margin-left:6px;">{code}</span>
-                        </div>
-                        <div style="text-align:right;">
-                            <span style="font-size:14px; font-weight:600; color:#0F172A;">{price_str}</span>
-                            <span style="font-size:13px; font-weight:700; color:{bar_color}; background:{bg_color}; padding:2px 8px; border-radius:12px; margin-left:8px;">{pct_str}</span>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-            
-            with tab_up:
-                df_up = df_hot[df_hot['등락률_num'] >= 0].head(8)
-                if not df_up.empty: render_stock_list(df_up)
-                else: st.info("현재 상승 중인 종목이 없습니다.")
-                
-            with tab_down:
-                df_down = df_hot[df_hot['등락률_num'] < 0].sort_values("등락률_num", ascending=True).head(8)
-                if not df_down.empty: render_stock_list(df_down)
-                else: st.info("현재 하락 중인 종목이 없습니다.")
-                
-            with tab_52w:
-                st.markdown("<p style='font-size:12px; color:#64748B; margin-bottom:5px;'>현재가가 52주 최고가 대비 얼마나 하락했는지 보여줍니다.</p>", unsafe_allow_html=True)
-                mkt_filter_52w = st.radio("시장 선택", ["코스피", "코스닥"], horizontal=True, label_visibility="collapsed", key="dash_52w")
-                
-                df_52w = df_hot.copy()
-                if '52주최고' in df_52w.columns and '시장' in df_52w.columns:
-                    df_52w = df_52w[df_52w['시장'] == mkt_filter_52w]
-                    df_52w['고점대비하락률'] = ((df_52w['현재가_num'] - df_52w['52주최고']) / df_52w['52주최고']) * 100
-                    df_52w = df_52w.sort_values("고점대비하락률", ascending=True).head(30)
-                    
-                    if not df_52w.empty:
-                        for _, row in df_52w.iterrows():
-                            name = row["종목명"]
-                            price = row["현재가_num"]
-                            drop_pct = row["고점대비하락률"]
-                            st.markdown(f"""
-                            <div style="display:flex; align-items:center; justify-content:space-between; padding:9px 0; border-bottom:1px solid #F1F5F9;">
-                                <div>
-                                    <span style="font-size:14px; font-weight:600; color:#0F172A;">{name}</span>
-                                </div>
-                                <div style="text-align:right;">
-                                    <span style="font-size:14px; font-weight:600; color:#0F172A;">{int(price):,}원</span>
-                                    <span style="font-size:13px; font-weight:700; color:#16A34A; background:#F0FDF4; padding:2px 8px; border-radius:12px; margin-left:8px;">고점대비 {drop_pct:.1f}%</span>
-                                </div>
-                            </div>
-                            """, unsafe_allow_html=True)
-                    else:
-                        st.info(f"선택하신 {mkt_filter_52w} 종목 데이터가 없습니다.")
-                else:
-                    st.info("52주 데이터를 불러오지 못했습니다.")
-        else:
-            st.info("서버가 응답하지 않아 관심 종목 데이터를 불러올 수 없습니다. 잠시 후 새로고침 해주세요.")
-
-    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
     st.markdown("""
-        <div style='background:#F0F9FF; border:1px solid #BAE6FD; border-radius:8px; padding:14px 20px; font-size:13px; color:#374151; line-height:1.7;'>
+        <div style='background:#F0F9FF; border:1px solid #BAE6FD; border-radius:8px; padding:14px 20px; font-size:13px; color:#374151; line-height:1.7; margin-top:20px;'>
             💡 <b>데이터 안내</b> &nbsp;|&nbsp;
-            시장 지수·업종·급등 종목은 <b>네이버 금융</b> 실시간 데이터를 기반으로 합니다. 시장 개장 시간(09:00~15:30) 외에는 전일 종가 기준으로 표시될 수 있습니다.
+            시장 지수 및 업종 테마는 <b>네이버 금융</b> 실시간 데이터를 기반으로 합니다. 시장 개장 시간(09:00~15:30) 외에는 전일 종가 기준으로 표시될 수 있습니다.
         </div>
     """, unsafe_allow_html=True)
+
+# =========================
+# 🤖 AI 종목 진단 엔진
+# =========================
+def calc_ai_scores(per, pbr, roe, debt, drop_pct, div):
+    """재무 데이터 기반 4개 영역 점수 계산 (0~100점) — 타이트 기준"""
+
+    # 1. 재무 건전성 (부채비율 중심 — 빡빡 기준)
+    if debt <= 30:        health = 100
+    elif debt <= 60:      health = 85
+    elif debt <= 100:     health = 68
+    elif debt <= 150:     health = 50
+    elif debt <= 200:     health = 33
+    elif debt <= 300:     health = 18
+    else:                 health = 5
+
+    # PBR 보정 (+/- 8점) — 순자산 대비 고평가 여부 반영
+    if pbr <= 0.4:    health = min(100, health + 8)
+    elif pbr <= 0.8:  health = min(100, health + 4)
+    elif pbr >= 2.5:  health = max(0,   health - 8)
+    elif pbr >= 1.5:  health = max(0,   health - 4)
+
+    # 2. 성장성 (ROE 기준 — 15% 이상부터 의미있는 점수)
+    if roe >= 25:     growth = 100
+    elif roe >= 20:   growth = 88
+    elif roe >= 15:   growth = 73
+    elif roe >= 10:   growth = 52
+    elif roe >= 5:    growth = 32
+    elif roe >= 0:    growth = 15
+    else:             growth = 3
+
+    # 52주 하락률 타이밍 보정 (+/- 12점)
+    if drop_pct <= -40:   growth = min(100, growth + 12)
+    elif drop_pct <= -30: growth = min(100, growth + 8)
+    elif drop_pct <= -20: growth = min(100, growth + 4)
+    elif drop_pct <= -10: growth = min(100, growth + 1)
+    elif drop_pct >= 0:   growth = max(0,   growth - 8)
+
+    # 3. 수익성 (PER 중심 — 한국 평균 PER 10~12배 감안해 타이트하게)
+    if per <= 4:       profit = 100
+    elif per <= 6:     profit = 88
+    elif per <= 8:     profit = 73
+    elif per <= 10:    profit = 58
+    elif per <= 13:    profit = 43
+    elif per <= 18:    profit = 28
+    elif per <= 25:    profit = 15
+    else:              profit = 5
+
+    # ROE 보정 (+/- 10점)
+    if roe >= 20:    profit = min(100, profit + 10)
+    elif roe >= 15:  profit = min(100, profit + 6)
+    elif roe >= 10:  profit = min(100, profit + 2)
+    elif roe < 5:    profit = max(0,   profit - 10)
+
+    # 4. 배당 매력 (3% 이상부터 진짜 매력 구간)
+    if div >= 6.0:        dividend = 100
+    elif div >= 4.0:      dividend = 82
+    elif div >= 3.0:      dividend = 65
+    elif div >= 2.0:      dividend = 45
+    elif div >= 1.0:      dividend = 25
+    elif div >= 0.1:      dividend = 10
+    else:                 dividend = 0
+
+    # 종합 점수 (가중 평균: 건전성 30%, 수익성 30%, 성장 25%, 배당 15%)
+    total = int(health * 0.30 + profit * 0.30 + growth * 0.25 + dividend * 0.15)
+    total = max(0, min(100, total))
+
+    return {
+        "total": total,
+        "health": int(health),
+        "growth": int(growth),
+        "profit": int(profit),
+        "dividend": int(dividend),
+    }
+
+def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_label):
+    """AI 종합 점수 UI 렌더링 (점수 계산만, API 호출 없음)"""
+    scores = calc_ai_scores(per, pbr, roe, debt, drop_pct, div)
+    total = scores["total"]
+
+    # 총점 색상
+    if total >= 85:   total_color = "#7C3AED"; total_label = "최우량"
+    elif total >= 70: total_color = "#2563EB"; total_label = "우량"
+    elif total >= 55: total_color = "#16A34A"; total_label = "양호"
+    elif total >= 40: total_color = "#D97706"; total_label = "보통"
+    else:             total_color = "#DC2626"; total_label = "주의"
+
+    def score_bar(score):
+        if score >= 80:   bar_color = "#7C3AED"
+        elif score >= 65: bar_color = "#2563EB"
+        elif score >= 50: bar_color = "#16A34A"
+        elif score >= 35: bar_color = "#D97706"
+        else:             bar_color = "#DC2626"
+        return (
+            '<div style="display:flex; align-items:center; gap:10px; margin-bottom:8px;">'
+            '<div style="width:80px; font-size:12px; color:#64748B; text-align:right;">' + str(score) + '점</div>'
+            '<div style="flex:1; background:#F1F5F9; border-radius:4px; height:8px;">'
+            '<div style="width:' + str(score) + '%; background:' + bar_color + '; border-radius:4px; height:8px;"></div>'
+            '</div></div>'
+        )
+
+    bar_health   = score_bar(scores['health'])
+    bar_growth   = score_bar(scores['growth'])
+    bar_profit   = score_bar(scores['profit'])
+    bar_dividend = score_bar(scores['dividend'])
+
+    html = (
+        '<div style="background:#FAFBFF; border:1px solid #C7D2FE; border-radius:10px; padding:18px 20px; margin-top:12px;">'
+        '<div style="display:flex; align-items:center; gap:12px; margin-bottom:14px;">'
+        '<div style="text-align:center;">'
+        '<div style="font-size:32px; font-weight:900; color:' + total_color + '; line-height:1;">' + str(total) + '</div>'
+        '<div style="font-size:11px; color:#94A3B8;">/ 100점</div>'
+        '</div>'
+        '<div>'
+        '<div style="font-size:14px; font-weight:700; color:#0F172A;">AI 종합 점수</div>'
+        '<div style="font-size:12px; color:' + total_color + '; font-weight:600;">● ' + total_label + '</div>'
+        '</div></div>'
+        '<div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">'
+        '<div style="background:#FFFFFF; border:1px solid #E2E8F0; border-radius:8px; padding:10px 12px;">'
+        '<div style="font-size:11px; color:#94A3B8; margin-bottom:4px;">🏦 재무 건전성</div>'
+        + bar_health +
+        '</div>'
+        '<div style="background:#FFFFFF; border:1px solid #E2E8F0; border-radius:8px; padding:10px 12px;">'
+        '<div style="font-size:11px; color:#94A3B8; margin-bottom:4px;">📈 성장성</div>'
+        + bar_growth +
+        '</div>'
+        '<div style="background:#FFFFFF; border:1px solid #E2E8F0; border-radius:8px; padding:10px 12px;">'
+        '<div style="font-size:11px; color:#94A3B8; margin-bottom:4px;">💰 수익성</div>'
+        + bar_profit +
+        '</div>'
+        '<div style="background:#FFFFFF; border:1px solid #E2E8F0; border-radius:8px; padding:10px 12px;">'
+        '<div style="font-size:11px; color:#94A3B8; margin-bottom:4px;">🎯 배당 매력</div>'
+        + bar_dividend +
+        '</div>'
+        '</div></div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
 
 def render_recommendations():
     st.header("추천 종목")
@@ -876,16 +1247,16 @@ def render_recommendations():
                     <th style='padding:6px;'>등급</th><th style='padding:6px;'>PER</th><th style='padding:6px;'>PBR</th><th style='padding:6px;'>ROE</th><th style='padding:6px;'>배당수익률</th><th style='padding:6px;'>부채비율(엄격)</th><th style='padding:6px;'>고점 하락률</th>
                 </tr>
                 <tr style='border-bottom:1px solid #E2E8F0;'>
-                    <td style='padding:6px; font-weight:600; color:#F59E0B;'>🥉 C급 성장기대주</td><td>25 이하</td><td>2.5 이하</td><td>5% 이상</td><td>-</td><td>200% 이하</td><td>-5% 이하</td>
+                    <td style='padding:6px; font-weight:600; color:#F59E0B;'>🥉 C급 성장 기대주</td><td>25 이하</td><td>2.5 이하</td><td>5% 이상</td><td>-</td><td>200% 이하</td><td>-5% 이하</td>
                 </tr>
                 <tr style='border-bottom:1px solid #E2E8F0;'>
-                    <td style='padding:6px; font-weight:600; color:#10B981;'>🥈 B급 적정가치주</td><td>15 이하</td><td>1.5 이하</td><td>8% 이상</td><td>-</td><td>150% 이하</td><td>-10% 이하</td>
+                    <td style='padding:6px; font-weight:600; color:#10B981;'>🥈 B급 적정 가치주</td><td>15 이하</td><td>1.5 이하</td><td>8% 이상</td><td>-</td><td>150% 이하</td><td>-10% 이하</td>
                 </tr>
                 <tr style='border-bottom:1px solid #E2E8F0;'>
-                    <td style='padding:6px; font-weight:600; color:#3B82F6;'>🥇 A급 우량가치주</td><td>12 이하</td><td>1.2 이하</td><td>10% 이상</td><td>1.5% 이상</td><td>120% 이하</td><td>-15% 이하</td>
+                    <td style='padding:6px; font-weight:600; color:#3B82F6;'>🥇 A급 우량 가치주</td><td>12 이하</td><td>1.2 이하</td><td>10% 이상</td><td>1.5% 이상</td><td>120% 이하</td><td>-15% 이하</td>
                 </tr>
                 <tr style='background-color:#EEF2FF;'>
-                    <td style='padding:6px; font-weight:600; color:#7C3AED;'>💎 S급 초저평가 (고배당)</td><td style='color:#7C3AED;'>8 이하</td><td style='color:#7C3AED;'>0.8 이하</td><td style='color:#7C3AED;'>12% 이상</td><td style='color:#7C3AED;'>3.0% 이상</td><td style='color:#7C3AED;'>100% 이하</td><td style='color:#7C3AED;'>-20% 이하</td>
+                    <td style='padding:6px; font-weight:600; color:#7C3AED;'>💎 S급 초저평가 고배당</td><td style='color:#7C3AED;'>8 이하</td><td style='color:#7C3AED;'>0.8 이하</td><td style='color:#7C3AED;'>12% 이상</td><td style='color:#7C3AED;'>3.0% 이상</td><td style='color:#7C3AED;'>100% 이하</td><td style='color:#7C3AED;'>-20% 이하</td>
                 </tr>
             </table>
         </div>
@@ -896,37 +1267,56 @@ def render_recommendations():
         st.info("⚠️ '종목 스크리너' 탭에서 [실시간 데이터 ⚡초고속 스캔 실행] 버튼을 눌러 데이터를 먼저 불러와주세요! (최초 1회 필수)")
         return
 
-    btn_scan = st.button("🚀 1단계: 전체 시장 딥 스캔 실행 (최초 1회만 누르세요)", use_container_width=True)
+    high52_map = load_high52_map()
+    if high52_map:
+        st.success(f"✅ 스크리너 CSV 고점 데이터 사용 중 — {len(high52_map):,}종목 로드됨 (네이버 개별 호출 최소화)")
+        scan_label = "🚀 퀀트 스캔 실행 (CSV 고점 데이터 활용)"
+        scan_workers = 8   
+    else:
+        st.info("ℹ️ 스크리너 탭 → [52주 고점 데이터 업데이트]에서 KRX CSV를 업로드하면 더 빠르고 정확해집니다. (현재: 네이버 실시간 API 사용)")
+        scan_label = "🚀 퀀트 스캔 실행 (네이버 실시간 API)"
+        scan_workers = 5
+
+    btn_scan = st.button(scan_label, use_container_width=True)
 
     if btn_scan:
+        load_high52_map.clear()  
+        high52_map = load_high52_map()
+
         df = screener_df.copy()
         finance_keywords = '금융|은행|증권|보험|캐피탈|지주|투자|저축'
         
         cond = (
-            (df['PER'] > 0) & (df['PER'] <= 30) & 
-            (df['PBR'] > 0) & (df['PBR'] <= 3.0) &
-            (df['ROE'] >= 5) &
-            (df['부채비율'] >= 0) & (df['부채비율'] <= 250) &
+            (df['PER'] > 0) & (df['PER'] <= 40) & 
+            (df['PBR'] > 0) & (df['PBR'] <= 4.0) &
+            (df['ROE'] >= 0) &
+            (df['부채비율'] >= 0) & (df['부채비율'] <= 300) &
             (~df['종목명'].astype(str).str.contains(finance_keywords, regex=True, na=False))
         )
         val_df = df[cond].copy()
         
         if val_df.empty:
-            st.error("기본 펀더멘털을 만족하는 종목이 없습니다. 스크리너를 다시 실행해 주세요.")
+            st.warning("현재 시장 데이터 기준, 최소 요건(D급)을 통과한 종목조차 없습니다. 스크리너 데이터를 갱신해주세요.")
         else:
-            val_df = val_df.sort_values('ROE', ascending=False).head(150) 
+            val_df = val_df.sort_values('ROE', ascending=False).head(150)
             
             rows = []
             dict_records = val_df.to_dict('records')
             total = len(dict_records)
-            pb = st.progress(0, text="가치주 52주 고점 데이터 병렬 분석 중...")
+
+            if high52_map:
+                progress_text = "⚡ CSV 고점 데이터 매칭 중..."
+            else:
+                progress_text = "⚡ 네이버 실시간 API 스캔 중..."
+
+            pb = st.progress(0, text=progress_text)
             completed = 0
             
-            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=scan_workers) as executor:
                 futures = {executor.submit(check_naver_52w_robust, r): r for r in dict_records}
                 for future in concurrent.futures.as_completed(futures):
                     completed += 1
-                    pb.progress(int((completed/total)*100), text=f"⚡ 펀더멘털 통과 종목 초고속 스캔 중... ({completed}/{total})")
+                    pb.progress(int((completed/total)*100), text=f"{progress_text} ({completed}/{total})")
                     res = future.result()
                     if res: rows.append(res)
                 
@@ -948,32 +1338,35 @@ def render_recommendations():
             market_filter = st.selectbox("시장 분류", ["전체", "코스피", "코스닥"], key="reco_mkt_filter")
         with col2:
             st.markdown("<div style='padding-top:28px;'></div>", unsafe_allow_html=True)
-            strict_debt = st.toggle("☑️ 부채비율 '엄격 기준' 적용 (권장)", value=True, help="해제 시 모든 등급의 부채비율 허들을 200%로 완화하여 더 많은 종목을 탐색합니다.")
+            strict_debt = st.toggle("부채비율 '엄격 기준' 적용 (권장)", value=True, help="해제 시 모든 등급의 부채비율 허들을 300%로 완화하여 더 많은 종목을 탐색합니다.")
 
         st.markdown("<br>", unsafe_allow_html=True)
         selected_grade = st.radio(
             "등급 필터", 
-            ["전체보기", "💎 S급", "🥇 A급", "🥈 B급", "🥉 C급"], 
+            ["전체보기", "💎 S급", "🥇 A급", "🥈 B급", "🥉 C급", "👀 D급"], 
             horizontal=True, 
             label_visibility="collapsed"
         )
 
         def assign_grade(row, is_strict):
-            per, pbr, roe, debt, drop, div = row['PER'], row['PBR'], row['ROE'], row['부채비율'], row['고점대비하락률'], row['배당수익률']
+            per, pbr, roe, debt, drop, div = row['PER'], row['PBR'], row['ROE'], row['부채비율'], row['고점 / 하락률'], row['배당수익률']
             
-            s_debt = 100 if is_strict else 200
-            a_debt = 120 if is_strict else 200
-            b_debt = 150 if is_strict else 200
-            c_debt = 200
+            s_debt = 100 if is_strict else 300
+            a_debt = 120 if is_strict else 300
+            b_debt = 150 if is_strict else 300
+            c_debt = 200 if is_strict else 300
+            d_debt = 300
             
             if per <= 8 and pbr <= 0.8 and roe >= 12 and debt <= s_debt and drop <= -20.0 and div >= 3.0:
-                return "💎 S급 초저평가 (고배당)"
+                return "💎 S급 초저평가 고배당"
             elif per <= 12 and pbr <= 1.2 and roe >= 10 and debt <= a_debt and drop <= -15.0 and div >= 1.5:
-                return "🥇 A급 우량가치주"
+                return "🥇 A급 우량 가치주"
             elif per <= 15 and pbr <= 1.5 and roe >= 8 and debt <= b_debt and drop <= -10.0:
-                return "🥈 B급 적정가치주"
+                return "🥈 B급 적정 가치주"
             elif per <= 25 and pbr <= 2.5 and roe >= 5 and debt <= c_debt and drop <= -5.0:
-                return "🥉 C급 성장기대주"
+                return "🥉 C급 성장 기대주"
+            elif per <= 40 and pbr <= 4.0 and roe >= 0 and debt <= d_debt and drop <= 0.0:
+                return "👀 D급 관심 종목"
             return None
 
         display_df = st.session_state['reco_raw_data'].copy()
@@ -987,22 +1380,21 @@ def render_recommendations():
             grade_key = selected_grade.split()[1] 
             display_df = display_df[display_df['등급'].str.contains(grade_key)]
 
-        display_df = display_df.sort_values('고점대비하락률', ascending=True).reset_index(drop=True)
+        display_df = display_df.sort_values('고점 / 하락률', ascending=True).reset_index(drop=True)
 
         if display_df.empty:
             st.info(f"현재 설정된 필터({market_filter}, {selected_grade})에 부합하는 종목이 없습니다. 조건을 완화해보세요.")
         else:
-            st.markdown(f"<div style='margin-bottom:15px; font-weight:600; color:#0F172A;'>검색 결과: 총 {len(display_df)} 종목</div>", unsafe_allow_html=True)
-            
             for _, row in display_df.iterrows():
                 name  = row['종목명']
                 code  = str(row['종목코드']).zfill(6)
                 market_str = row.get('시장', '')
                 price = row['현재가_num']
-                drop_pct = row['고점대비하락률']
+                drop_pct = row['고점 / 하락률']
                 per, pbr, roe, debt = row['PER'], row['PBR'], row['ROE'], row['부채비율']
                 div = row.get('배당수익률', 0.0)
                 grade_label = row['등급']
+                source_badge = row.get('데이터출처', '🌐 실시간')
 
                 entry_2nd = price * 0.85
                 entry_3rd = price * 0.70
@@ -1020,131 +1412,93 @@ def render_recommendations():
                             <span style="font-size:15px; font-weight:700; color:#0F172A;">{name}</span>
                             <span style="font-size:11px; color:#94A3B8; margin-left:6px;">{code} | {market_str}</span>
                             <span style="font-size:11px; font-weight:700; color:#111827; background:#FFFFFF; border: 1px solid #D1D5DB; padding:2px 10px; border-radius:10px; margin-left:8px;">{grade_label}</span>
+                            <span style="font-size:10px; color:#94A3B8; background:#F1F5F9; border: 1px solid #E2E8F0; padding:2px 7px; border-radius:8px; margin-left:6px;">{source_badge}</span>
                         </div>
                         <div style="text-align:right;">
-                            <span style="font-size:15px; font-weight:700; color:#0F172A;">{int(price):,}원</span>
+                            <span style="font-size:15px; font-weight:700; color:#0F172A;">{int(price):,}</span>
                             <span style="font-size:12px; font-weight:700; color:#16A34A; background:#FFFFFF; border: 1px solid #D1D5DB; padding:2px 8px; border-radius:12px; margin-left:8px;">52주최고 대비 {drop_pct:.1f}%</span>
                         </div>
                     </div>
                     <div style="display:flex; gap:18px; font-size:12px; color:#64748B; margin-bottom:12px; flex-wrap:wrap;">
                         <span>PER <b style="color:#1E293B;">{per:.2f}배</b></span>
                         <span>PBR <b style="color:#1E293B;">{pbr:.2f}배</b></span>
-                        <span>ROE <b style="color:#1E293B;">{roe:.2f}%</b></span>
+                        <span>ROE <b style="color:#1E293B;">{roe:.1f}%</b></span>
                         <span>부채비율 <b style="color:#1E293B;">{debt:.1f}%</b></span>
-                        <span>배당수익률 <b style="color:#DC2626;">{div:.2f}%</b></span>
+                        <span>배당수익률 <b style="color:#DC2626;">{div:.1f}%</b></span>
                     </div>
                     <div style="display:flex; gap:10px;">
                         <div style="flex:1; background:#FFFFFF; border:1px solid #E2E8F0; border-radius:6px; padding:8px 4px; text-align:center;">
                             <div style="font-size:11px; color:#94A3B8; margin-bottom:2px;">1차 진입 (비중 25%)</div>
-                            <div style="font-size:13px; font-weight:700; color:#5A4EE5;">{int(price):,}원</div>
+                            <div style="font-size:13px; font-weight:700; color:#5A4EE5;">{int(price):,}</div>
                         </div>
                         <div style="flex:1; background:#FFFFFF; border:1px solid #E2E8F0; border-radius:6px; padding:8px 4px; text-align:center;">
                             <div style="font-size:11px; color:#94A3B8; margin-bottom:2px;">2차 진입 (-15% / 35%)</div>
-                            <div style="font-size:13px; font-weight:700; color:#1E293B;">{int(entry_2nd):,}원</div>
+                            <div style="font-size:13px; font-weight:700; color:#1E293B;">{int(entry_2nd):,}</div>
                         </div>
                         <div style="flex:1; background:#FFFFFF; border:1px solid #E2E8F0; border-radius:6px; padding:8px 4px; text-align:center;">
                             <div style="font-size:11px; color:#94A3B8; margin-bottom:2px;">3차 진입 (-30% / 40%)</div>
-                            <div style="font-size:13px; font-weight:700; color:#1E293B;">{int(entry_3rd):,}원</div>
+                            <div style="font-size:13px; font-weight:700; color:#1E293B;">{int(entry_3rd):,}</div>
                         </div>
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
                 
-                with st.expander(f"📖 {name} 기업 개요 및 상세 재무분석 열기"):
-                    if st.button(f"실시간 재무 데이터 불러오기 (FnGuide)", key=f"reco_fn_{code}"):
+                with st.expander(f"{name} · AI 진단 · 재무분석"):
+                    # ── AI 종목 진단 ──
+                    render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_label)
+
+                    st.markdown("<hr style='margin:16px 0 12px 0; border-color:#E5E7EB;'>", unsafe_allow_html=True)
+
+                    # ── 기존 FnGuide 재무 분석 ──
+                    btn_key = f"reco_fn_{code}"
+                    data_key = f"reco_fn_data_{code}"
+                    if st.button(f"📊 실시간 재무 데이터 불러오기 (FnGuide)", key=btn_key):
                         with st.spinner(f"'{name}'의 최신 기업 개요와 재무제표를 가져오는 중입니다..."):
-                            draw_fnguide_details(code)
+                            st.session_state[data_key] = True
+                    if st.session_state.get(data_key):
+                        draw_fnguide_details(code)
 
-def render_undervalued():
-    st.header("저평가 우량주 발굴")
-    st.markdown("<hr style='margin: 10px 0 15px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
-    
-    st.markdown("""
-        <div style='background:#F8FAFC; border:1px solid #E2E8F0; border-radius:8px; padding:20px; margin-bottom:20px;'>
-            <h4 style='margin-top:0; font-size:16px; color:#0F172A;'>💡 퀀트 필터링 기준표 (안정성 포함)</h4>
-            <table style='width:100%; border-collapse: collapse; font-size:13px; text-align:center;'>
-                <tr style='background-color:#F1F5F9; border-bottom:2px solid #CBD5E1;'>
-                    <th style='padding:8px;'>구분</th><th style='padding:8px;'>PER (가치)</th><th style='padding:8px;'>PBR (자산)</th><th style='padding:8px;'>ROE (수익성)</th><th style='padding:8px;'>부채비율 (안정성)</th>
-                </tr>
-                <tr style='border-bottom:1px solid #E2E8F0;'>
-                    <td style='padding:8px; font-weight:600;'>약저평가</td><td>10 ~ 15배</td><td>0.8 ~ 1.0배</td><td>8 ~ 10%</td><td>150% 이하</td>
-                </tr>
-                <tr style='border-bottom:1px solid #E2E8F0;'>
-                    <td style='padding:8px; font-weight:600;'>저평가</td><td>5 ~ 10배</td><td>0.5 ~ 0.8배</td><td>10 ~ 15%</td><td>100% 이하</td>
-                </tr>
-                <tr style='background-color:#FEF2F2;'>
-                    <td style='padding:8px; font-weight:600; color:#DC2626;'>극저평가</td><td style='color:#DC2626;'>5배 미만</td><td style='color:#DC2626;'>0.5배 미만</td><td style='color:#DC2626;'>15% 이상</td><td style='color:#DC2626;'>80% 이하</td>
-                </tr>
-            </table>
-            <div style='margin-top:15px; font-size:12.5px; color:#475569; background-color:#FFFFFF; padding:12px; border:1px dashed #CBD5E1; border-radius:6px;'>
-                <b>🚨 투자 전 필수 체크리스트 (가치 함정 피하기)</b><br>
-                1. <b>금융업종(은행/증권/보험) 예외:</b> 금융업은 사업 특성상 부채비율이 수백%에 달하는 것이 정상이므로 아래 필터에서 제외하는 것이 안전합니다.<br>
-                2. <b>부채의 질 (좀비기업 확인):</b> 부채비율 숫자가 낮더라도, 영업이익으로 이자도 못 갚는 기업(이자보상비율 1배 미만 지속)은 위험합니다. 스크리닝 후 <b>'기업 재무 분석'</b> 탭에서 영업이익이 꾸준한지 확인하세요.
-            </div>
-        </div>
-    """, unsafe_allow_html=True)
-
-    col1, col2 = st.columns([1.5, 1])
-    with col1:
-        selected_level = st.radio("검색할 저평가 구간을 선택하세요.", ["극저평가 (강력 추천)", "저평가", "약저평가"], horizontal=True)
-    with col2:
-        st.markdown("<div style='padding-top:10px;'></div>", unsafe_allow_html=True)
-        exclude_finance = st.checkbox("금융/지주사 제외 (부채비율 왜곡 방지)", value=True)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-    
-    save_path = "saved_screener_data.csv"
-
-    if st.button("저평가 우량주 ⚡초고속 스캔 실행"):
-        pb = st.progress(0, text="시장 전체 종목 스캔 중...")
-        try:
-            fetch_and_cache_screener_data.clear()
-            temp_df = pd.DataFrame()
-            for status_msg, pct in fetch_screener_data_generator():
-                if isinstance(status_msg, str): pb.progress(pct, text=f"{status_msg}")
-                else: temp_df = status_msg
-            pb.progress(100, text="분석 및 필터링 완료!")
-            time.sleep(0.5)
-            pb.empty()
-            
-            if not temp_df.empty:
-                temp_df.to_csv(save_path, index=False, encoding='utf-8-sig')
-                st.session_state['shared_screener_df'] = temp_df
-        except Exception as e:
-            pb.empty()
-            st.error(f"데이터를 가져오는데 실패했습니다: {e}")
-
-    df = load_screener_df()
-
-    if not df.empty:
-        if "극저평가" in selected_level:
-            cond = (df['PER'] > 0) & (df['PER'] < 5) & (df['PBR'] > 0) & (df['PBR'] < 0.5) & (df['ROE'] >= 15) & (df['부채비율'] >= 0) & (df['부채비율'] <= 80)
-        elif "저평가" in selected_level:
-            cond = (df['PER'] > 0) & (df['PER'] <= 10) & (df['PBR'] > 0) & (df['PBR'] <= 0.8) & (df['ROE'] >= 10) & (df['부채비율'] >= 0) & (df['부채비율'] <= 100)
-        else: # 약저평가
-            cond = (df['PER'] > 0) & (df['PER'] <= 15) & (df['PBR'] > 0) & (df['PBR'] <= 1.0) & (df['ROE'] >= 8) & (df['부채비율'] >= 0) & (df['부채비율'] <= 150)
-
-        if exclude_finance:
-            finance_keywords = '금융|은행|증권|보험|캐피탈|지주|투자|저축'
-            cond = cond & (~df['종목명'].str.contains(finance_keywords, regex=True))
-
-        result_df = df[cond].sort_values(by=['ROE'], ascending=False).reset_index(drop=True)
-        
-        st.markdown(f"<h4 style='font-size: 16px; margin-top:20px; margin-bottom: 10px;'>🎯 필터링 결과: 총 {len(result_df)} 종목 발견 (ROE 높은 순)</h4>", unsafe_allow_html=True)
-        if not result_df.empty:
-            st.dataframe(result_df, width='stretch', hide_index=True, column_config=get_table_col_config(include_debt=True))
-            st.markdown("<p style='font-size:13px; color:#64748B;'>💡 <b>Tip:</b> 표 안의 종목코드 셀을 마우스로 한 번 클릭한 뒤 <code>Ctrl + C</code> (Mac은 <code>Cmd + C</code>)를 누르면 바로 복사됩니다.</p>", unsafe_allow_html=True)
-        else:
-            st.warning("현재 시장 상황에서 해당 조건에 부합하는 종목이 없습니다. 구간을 변경하여 다시 검색해 보세요.")
+SCREENER_PRESETS = {
+    "1단계 · 배당형 저평가": {
+        "desc": "PER ≤ 10 · PBR ≤ 1.0 · 배당 ≥ 2% · ROE ≥ 10% · 부채비율 ≤ 100% — 싸고 배당주면서 실제로 돈도 버는 기업",
+        "per": 10.0, "pbr": 1.0, "div": 2.0, "roe": 10.0, "debt": 100.0, "use_div": True,
+    },
+    "2단계 · 가치주 (밸런스)": {
+        "desc": "PER ≤ 15 · PBR ≤ 1.0 · ROE ≥ 10% · 부채비율 ≤ 150% — 싸면서 돈 잘 버는 기업, 업종 다양",
+        "per": 15.0, "pbr": 1.0, "div": 0.0, "roe": 10.0, "debt": 150.0, "use_div": False,
+    },
+    "3단계 · 성장형 저평가": {
+        "desc": "PER ≤ 20 · PBR ≤ 1.5 · ROE ≥ 15% · 부채비율 ≤ 200% — 성장성 있으면서 아직 저평가인 기업",
+        "per": 20.0, "pbr": 1.5, "div": 0.0, "roe": 15.0, "debt": 200.0, "use_div": False,
+    },
+    "직접 설정": None,
+}
 
 def render_screener():
     st.header("종목 스크리너")
     st.markdown("<hr style='margin: 10px 0 15px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
-    col1, col2, col3, col4 = st.columns(4)
-    with col1: max_per = st.number_input("PER 이하 (배)", value=10.0, step=0.5, format="%.1f")
-    with col2: max_pbr = st.number_input("PBR 이하 (배)", value=1.0, step=0.1, format="%.1f")
-    with col3: min_div = st.number_input("배당수익률 이상 (%)", value=2.0, step=0.1, format="%.1f")
-    with col4: search_text = st.text_input("종목명/코드 검색", placeholder="예: 삼성")
+
+    # 탭 디자인 부분
+    preset_names = list(SCREENER_PRESETS.keys())
+    selected_preset = st.radio("필터 단계", preset_names, horizontal=True, key="screener_preset", label_visibility="collapsed")
+    preset = SCREENER_PRESETS[selected_preset]
+
+    if preset:
+        st.markdown(f"<div style='font-size:13px; color:#5A4EE5; margin: 6px 0 14px 0;'>💡 {preset['desc']}</div>", unsafe_allow_html=True)
+        max_per = preset['per']; max_pbr = preset['pbr']
+        min_div = preset['div']; min_roe = preset['roe']
+        max_debt = preset['debt']; use_div = preset['use_div']
+    else:
+        # 💡 [핵심 UI 수정] 직접 설정일 때 검색창은 분리하고 숫자 5개만 황금비율로 배치!
+        st.markdown("<div style='margin-top: 15px; margin-bottom: 5px;'><span style='font-weight: 700; color: #1E293B; font-size: 14px;'>⚙️ 나만의 상세 지표 커스텀 설정</span></div>", unsafe_allow_html=True)
+        c1, c2, c3, c4, c5 = st.columns(5)
+        with c1: max_per = st.number_input("PER 이하 (배)", value=15.0, step=0.5, format="%.1f")
+        with c2: max_pbr = st.number_input("PBR 이하 (배)", value=1.0, step=0.1, format="%.1f")
+        with c3: min_div = st.number_input("배당수익률 이상 (%)", value=0.0, step=0.1, format="%.1f")
+        with c4: min_roe = st.number_input("ROE 이상 (%)", value=10.0, step=0.5, format="%.1f")
+        with c5: max_debt = st.number_input("부채비율 이하 (%)", value=150.0, step=10.0, format="%.0f")
+        use_div = min_div > 0
+        st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
     save_path = "saved_screener_data.csv"
@@ -1159,7 +1513,6 @@ def render_screener():
     if st.button("실시간 데이터 ⚡초고속 스캔 실행"):
         pb = st.progress(0, text="데이터 검색 준비 중...")
         try:
-            fetch_and_cache_screener_data.clear()
             temp_df = pd.DataFrame()
             for status_msg, pct in fetch_screener_data_generator():
                 if isinstance(status_msg, str): pb.progress(pct, text=f"{status_msg}")
@@ -1175,97 +1528,247 @@ def render_screener():
             pb.empty()
             st.error(f"데이터를 가져오는데 실패했습니다: {e}")
 
-    with st.expander("고급 설정 / 서버 접속 장애 시 수동 갱신"):
-        st.markdown("""<p style="font-size: 13px; color: #5D6475;">자동 연동이 막혔을 경우, 직접 다운로드한 CSV 파일을 업로드하여 데이터를 갱신할 수 있습니다.</p>""", unsafe_allow_html=True)
-        st.link_button("KRX 데이터 다운로드 페이지", "http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020502", use_container_width=True)
-        uploaded = st.file_uploader("데이터 수동 갱신", type=['csv'])
-        if uploaded:
+    with st.expander("📈 52주 고점 데이터 업데이트"):
+        st.markdown("""
+            <p style="font-size: 13px; color: #5D6475; margin-bottom: 6px;">
+                KRX 종목시세추이 CSV(약 1년치)를 <b>코스피 / 코스닥 각각 업로드</b>하면 종목코드 매칭 후
+                <b>52주고점</b>과 <b>고점대비(%)</b> 컬럼이 자동으로 추가됩니다.
+            </p>
+        """, unsafe_allow_html=True)
+        st.link_button("🔗 KRX [52주 최고/최저] 데이터 다운로드", "http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020104", use_container_width=True)
+
+        def process_high52_upload(uploaded_file, market_label):
             try:
-                try: raw_df = pd.read_csv(uploaded, encoding='cp949')
+                try: h_df = pd.read_csv(uploaded_file, encoding='cp949')
                 except:
-                    uploaded.seek(0)
-                    raw_df = pd.read_csv(uploaded, encoding='utf-8')
-                raw_df.columns = raw_df.columns.str.strip()
-                def find_col(candidates):
-                    for c in candidates:
-                        if c in raw_df.columns: return c
-                    for c in raw_df.columns:
-                        for cand in candidates:
-                            if cand.lower() in c.lower(): return c
+                    uploaded_file.seek(0)
+                    h_df = pd.read_csv(uploaded_file, encoding='utf-8')
+                h_df.columns = h_df.columns.str.strip()
+                h_code_col = find_col(h_df, ['종목코드', '단축코드'])
+                h_high_col = find_col(h_df, ['최고가(종가)', '최고가', '52주최고'])
+                if not h_code_col or not h_high_col:
+                    st.error(f"[{market_label}] 종목코드 또는 최고가 컬럼을 찾을 수 없습니다. (감지된 컬럼: {list(h_df.columns)})")
                     return None
-                code_col = find_col(["종목코드", "단축코드", "Code"])
-                name_col = find_col(["종목명", "한글 종목명", "Name"])
-                per_col  = find_col(["PER", "주가수익비율"])
-                pbr_col  = find_col(["PBR", "주가순자산비율"])
-                div_col  = find_col(["배당수익률", "배당률"])
-                roe_col  = find_col(["ROE", "자기자본이익률"])
-                debt_col = find_col(["부채비율", "부채비율(%)"])
-                mkt_col  = find_col(["시장", "Market"])
-                price_col = find_col(["현재가", "종가"])
-                
-                if not (per_col and pbr_col): st.error("PER 또는 PBR 데이터가 없습니다.")
+                h_df['종목코드'] = h_df[h_code_col].astype(str).str.zfill(6)
+                h_df[h_high_col] = pd.to_numeric(h_df[h_high_col].astype(str).str.replace(',', ''), errors='coerce')
+                return h_df.groupby('종목코드')[h_high_col].max()
+            except Exception as e:
+                st.error(f"[{market_label}] 파일 처리 오류: {e}")
+                return None
+
+        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+        col_kp, col_kq = st.columns(2)
+
+        with col_kp:
+            st.markdown("<b style='font-size:13px;'>🔵 KOSPI (코스피) CSV</b>", unsafe_allow_html=True)
+            uploaded_kospi = st.file_uploader("코스피 파일 업로드", type=['csv'], key='high52_kospi')
+
+        with col_kq:
+            st.markdown("<b style='font-size:13px;'>🟢 KOSDAQ (코스닥) CSV</b>", unsafe_allow_html=True)
+            uploaded_kosdaq = st.file_uploader("코스닥 파일 업로드", type=['csv'], key='high52_kosdaq')
+
+        if uploaded_kospi or uploaded_kosdaq:
+            maps = {}
+            if uploaded_kospi:
+                m = process_high52_upload(uploaded_kospi, "코스피")
+                if m is not None: maps['코스피'] = m
+            if uploaded_kosdaq:
+                m = process_high52_upload(uploaded_kosdaq, "코스닥")
+                if m is not None: maps['코스닥'] = m
+
+            if maps:
+                combined_map = pd.concat(maps.values()).groupby(level=0).max()
+                base_df = load_screener_df()
+                if base_df.empty:
+                    st.error("먼저 실시간 스캔 데이터가 필요합니다. 위 [실시간 데이터 ⚡초고속 스캔 실행] 버튼을 눌러주세요.")
                 else:
-                    raw_df['종목코드'] = raw_df[code_col].astype(str).str.zfill(6)
-                    raw_df['종목명']   = raw_df[name_col]
-                    raw_df['PER']      = raw_df[per_col]
-                    raw_df['PBR']      = raw_df[pbr_col]
-                    raw_df['배당수익률'] = raw_df[div_col] if div_col else 0.0
-                    raw_df['ROE'] = raw_df[roe_col] if roe_col else 0.0
-                    raw_df['부채비율'] = raw_df[debt_col] if debt_col else 0.0
-                    raw_df['시장'] = raw_df[mkt_col] if mkt_col else "코스피"
-                    raw_df['현재가'] = pd.to_numeric(raw_df[price_col].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0) if price_col else 0.0
-                    
-                    for col in ['PER', 'PBR', '배당수익률', 'ROE', '부채비율', '현재가']:
-                        raw_df[col] = pd.to_numeric(raw_df[col].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0)
-                    df_to_save = raw_df[['종목코드', '종목명', '시장', '현재가', 'PER', 'PBR', '배당수익률', 'ROE', '부채비율']]
-                    df_to_save.to_csv(save_path, index=False, encoding='utf-8-sig')
-                    st.session_state['shared_screener_df'] = df_to_save
-                    st.success("✅ 수동 데이터 저장 완료!")
-            except: st.error("파일 오류")
+                    base_df['52주고점'] = base_df['종목코드'].map(combined_map)
+                    mask_h = (base_df['현재가'] > 0) & (base_df['52주고점'] > 0)
+                    base_df['고점대비(%)'] = None
+                    base_df.loc[mask_h, '고점대비(%)'] = (
+                        (base_df.loc[mask_h, '현재가'] - base_df.loc[mask_h, '52주고점'])
+                        / base_df.loc[mask_h, '52주고점']
+                    ) * 100
+                    base_cols = [c for c in base_df.columns if c not in ['52주고점', '고점대비(%)']]
+                    base_df[base_cols].to_csv(save_path, index=False, encoding='utf-8-sig')
+                    high52_save = base_df[['종목코드', '52주고점', '고점대비(%)']].dropna(subset=['52주고점'])
+                    high52_save.to_csv(HIGH52_PATH, index=False, encoding='utf-8-sig')
+                    st.session_state['shared_screener_df'] = base_df
+                    load_high52_map.clear()
+                    if 'reco_raw_data' in st.session_state:
+                        del st.session_state['reco_raw_data']
+                    matched = int(mask_h.sum())
+                    markets_done = " + ".join(maps.keys())
+                    st.success(f"✅ 52주 고점 매칭 완료! ({markets_done}) {matched}종목 업데이트되었습니다. 추천 종목 탭에서 재스캔 시 새 데이터가 바로 적용됩니다.")
 
     df = load_screener_df()
 
     if not df.empty:
         st.markdown("<hr style='margin: 30px 0 20px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
-        cond_per = (df['PER'] <= max_per) & (df['PER'] > 0)
-        cond_pbr = (df['PBR'] <= max_pbr) & (df['PBR'] > 0)
-        cond_div = (df['배당수익률'] >= min_div)
-        result_df = df[cond_per & cond_pbr & cond_div]
-        if search_text:
-            result_df = result_df[result_df['종목명'].str.contains(search_text, case=False, na=False) | result_df['종목코드'].astype(str).str.contains(search_text, case=False, na=False)]
-        st.markdown(f"<div style='margin-bottom: 10px; font-weight: 600; color: #374151;'>검색 결과 ({len(result_df)}건)</div>", unsafe_allow_html=True)
-        st.dataframe(result_df, width='stretch', hide_index=True, column_config=get_table_col_config(include_debt=True))
-        st.markdown("<p style='font-size:13px; color:#64748B;'>💡 <b>Tip:</b> 표 안의 종목코드 셀을 마우스로 한 번 클릭한 뒤 <code>Ctrl + C</code> (Mac은 <code>Cmd + C</code>)를 누르면 바로 복사됩니다.</p>", unsafe_allow_html=True)
+
+        ETF_KEYWORDS = 'TIGER|KODEX|ARIRANG|KBSTAR|HANARO|KOSEF|TREX|ACE|SOL|RISE|ETF|인버스|레버리지|선물|리츠|REIT|인덱스|TR$'
+        df = df[~df['종목명'].str.contains(ETF_KEYWORDS, regex=True, case=False, na=False)]
+
+        # 💡 [UI 수정] 검색창을 설정 탭 안이 아닌, 하단 결과표 컨트롤러 영역으로 독립 배치!
+        col_tools1, col_tools2 = st.columns([3, 2])
+        with col_tools1:
+            with st.container(key="market_filter_box"):
+                market_filter = st.radio("시장", ["전체", "코스피", "코스닥"], horizontal=True, key="screener_market", label_visibility="collapsed")
+            
+            t1, t2 = st.columns(2)
+            with t1:
+                if 'screener_show_all' not in st.session_state:
+                    st.session_state['screener_show_all'] = False
+                show_all = st.toggle("📋 전체 종목 보기 (필터 해제)", value=st.session_state['screener_show_all'], key="screener_toggle")
+                st.session_state['screener_show_all'] = show_all
+            with t2:
+                exclude_finance = st.toggle("🚫 금융/지주 업종 제외", value=False, key="screener_excl_finance")
+                
+        with col_tools2:
+            st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
+            search_text = st.text_input("검색", placeholder="🔍 결과 내 종목명 또는 코드 검색 (예: 삼성전자)", label_visibility="collapsed")
+
+        if market_filter != "전체":
+            df = df[df['시장'].str.contains(market_filter, na=False)]
+
+        finance_keywords = '금융|은행|증권|보험|캐피탈|지주|투자|저축'
+
+        if show_all:
+            result_df = df.copy()
+            if exclude_finance:
+                result_df = result_df[~result_df['종목명'].str.contains(finance_keywords, regex=True, na=False)]
+            if search_text:
+                result_df = result_df[result_df['종목명'].str.contains(search_text, case=False, na=False) | result_df['종목코드'].astype(str).str.contains(search_text, case=False, na=False)]
+            label = f"전체 종목{' · ' + market_filter if market_filter != '전체' else ''} ({len(result_df)}건) · 지표 필터 미적용"
+        else:
+            cond = (df['PER'] <= max_per) & (df['PER'] > 0) & (df['PBR'] <= max_pbr) & (df['PBR'] > 0) & (df['ROE'] >= min_roe) & (df['부채비율'] <= max_debt) & (df['부채비율'] >= 0)
+            if use_div:
+                cond = cond & (df['배당수익률'] >= min_div)
+            if exclude_finance:
+                cond = cond & (~df['종목명'].str.contains(finance_keywords, regex=True, na=False))
+            result_df = df[cond].sort_values('ROE', ascending=False).reset_index(drop=True)
+            if search_text:
+                result_df = result_df[result_df['종목명'].str.contains(search_text, case=False, na=False) | result_df['종목코드'].astype(str).str.contains(search_text, case=False, na=False)]
+            label = f"{selected_preset} 결과 ({len(result_df)}건) · ROE 높은 순"
+
+        st.markdown(f"<div style='margin-bottom: 10px; font-weight: 600; color: #374151;'>{label}</div>", unsafe_allow_html=True)
+        st.dataframe(get_styled_dataframe(result_df), use_container_width=True, hide_index=True)
 
 def render_fnguide():
     st.header("기업 재무 분석")
     st.markdown("<hr style='margin: 10px 0 25px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
 
-    col1, col2 = st.columns([1, 3])
+    col1, col2, col3 = st.columns([1, 1, 4])
     with col1:
-        code = st.text_input("종목코드 6자리 입력", placeholder="예: 005930")
-        search_btn = st.button("재무 및 기업정보 조회", use_container_width=True)
+        code = st.text_input("종목코드 6자리 입력", placeholder="예: 005930", label_visibility="collapsed")
+    with col2:
+        search_btn = st.button("🔍 조회", use_container_width=True)
 
     if search_btn and code:
         code = normalize_kr_code(code)
-        
         with st.spinner("에프앤가이드(FnGuide) 서버에서 데이터를 분석 중입니다..."):
             draw_fnguide_details(code)
 
 def render_dividend():
     st.header("실시간 배당 순위")
     st.markdown("<hr style='margin: 10px 0 25px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
-    
-    if st.button("데이터 새로고침"):
-        fetch_dividend_ranking.clear()
-        
+
+    # ── 1행: 검색창 + 조회 ──
+    col_search, col_btn = st.columns([8, 1])
+    with col_search:
+        search_text = st.text_input(
+            "검색",
+            placeholder="종목명 또는 종목코드 검색",
+            label_visibility="collapsed",
+            key="dividend_search"
+        )
+    with col_btn:
+        st.button("조회", key="dividend_search_btn", use_container_width=True)
+
+    # ── 2행: 새로고침(좌) | 캡션(중) | 정상 종목만 보기(우 끝) ──
+    col_refresh, col_caption2, col_toggle = st.columns([1.5, 5, 1.5])
+    with col_refresh:
+        if st.button("데이터 새로고침"):
+            fetch_dividend_ranking.clear()
+    with col_toggle:
+        st.markdown("<div style='display:flex; justify-content:flex-end; align-items:center; padding-top:4px; width:100%;'>", unsafe_allow_html=True)
+        st.toggle(
+            "정상만 보기",
+            value=True,
+            key="dividend_clean_filter",
+            help="리츠(REITs) / 배당성향 100% 초과 / 배당수익률 30% 초과 종목을 제외합니다."
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+
     df = run_with_progress("마켓 데이터 수집 중...", fetch_dividend_ranking)
     
     if not df.empty: 
-        st.dataframe(df, width='stretch', hide_index=True, column_config=get_table_col_config(include_debt=False))
-        st.markdown("<p style='font-size:13px; color:#64748B;'>💡 <b>Tip:</b> 표 안의 종목코드 셀을 마우스로 클릭한 뒤 <code>Ctrl + C</code> (Mac은 <code>Cmd + C</code>)를 누르면 바로 복사됩니다.</p>", unsafe_allow_html=True)
+        if isinstance(df.columns, pd.MultiIndex):
+            new_cols = []
+            for col in df.columns:
+                valid_parts = [str(c).strip() for c in col if str(c).strip() and "Unnamed" not in str(c)]
+                unique_parts = list(dict.fromkeys(valid_parts))
+                new_cols.append(" ".join(unique_parts))
+            df.columns = new_cols
+
+        price_col = find_col(df, ["현재가"])
+        if price_col:
+            df[price_col] = pd.to_numeric(df[price_col].astype(str).str.replace(",", ""), errors="coerce")
+
+        past_years = ["1년전", "2년전", "3년전"]
+        for yr in past_years:
+            col_name = find_col(df, [yr])
+            if col_name and price_col:
+                past_div_amount = pd.to_numeric(df[col_name].astype(str).str.replace(",", ""), errors="coerce").fillna(0)
+                yield_col_name = f"{yr} 배당" 
+                df[yield_col_name] = (past_div_amount / df[price_col]) * 100
+                df = df.drop(columns=[col_name])
+
+        drop_cols = [c for c in df.columns if re.search(r"과거.*배당금", str(c)) and not any(yr in str(c) for yr in past_years)]
+        if drop_cols:
+            df = df.drop(columns=drop_cols)
+
+        df = df.loc[:, ~df.columns.duplicated()]
+
+        # ── 정상 종목 필터 적용 ──
+        clean_filter_val = st.session_state.get("dividend_clean_filter", True)
+        if clean_filter_val:
+            name_col = find_col(df, ["종목명"])
+            REIT_KEYWORDS = r'리츠|REIT|reit|부동산투자|리얼티'
+            if name_col:
+                df = df[~df[name_col].astype(str).str.contains(REIT_KEYWORDS, regex=True, case=False, na=False)]
+            payout_col = find_col(df, ["배당성향", "성향"])
+            if payout_col:
+                payout_num = pd.to_numeric(df[payout_col].astype(str).str.replace(r'[^\d.-]', '', regex=True), errors='coerce')
+                df = df[payout_num.isna() | (payout_num <= 100)]
+            yield_col = find_col(df, ["배당수익률", "수익률"])
+            if yield_col:
+                yield_num = pd.to_numeric(df[yield_col].astype(str).str.replace(r'[^\d.-]', '', regex=True), errors='coerce')
+                df = df[yield_num.isna() | (yield_num <= 30)]
+
+        # ── 검색 필터 적용 ──
+        if search_text:
+            name_col = find_col(df, ["종목명"])
+            code_col = find_col(df, ["종목코드", "코드"])
+            mask = pd.Series([False] * len(df), index=df.index)
+            if name_col:
+                mask = mask | df[name_col].astype(str).str.contains(search_text, case=False, na=False)
+            if code_col:
+                mask = mask | df[code_col].astype(str).str.contains(search_text, case=False, na=False)
+            df = df[mask]
+
+        # ── 캡션: 2행 중앙에 표시 ──
+        with col_caption2:
+            st.markdown("<div style='padding-top:8px;'>", unsafe_allow_html=True)
+            if search_text:
+                st.caption(f"🔍 '{search_text}' 검색 결과 {len(df)}건")
+            elif clean_filter_val:
+                st.caption(f"ℹ️ 리츠·배당성향 100% 초과·수익률 30% 초과 종목 제외 후 {len(df)}건 표시 중")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        st.dataframe(get_styled_dataframe(df), use_container_width=True, hide_index=True)
     else: 
-        st.error("데이터를 불러올 수 없습니다.")
+        st.error("데이터를 불러올 수 없습니다. 네이버 금융 서버 통신이 지연되고 있습니다.")
 
 if __name__ == '__main__':
     main()
