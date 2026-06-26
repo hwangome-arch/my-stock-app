@@ -56,382 +56,54 @@ def run_with_progress(text, func, *args, **kwargs):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_market_index_table():
-    """
-    코스피/코스닥: 네이버 m.stock API (실시간, 지연 없음)
-    나스닥/환율/금/WTI: yfinance 1분봉 (기존 20분 지연 -> 수 분 이내로 개선)
-    """
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-
-    naver_targets = {
-        "kospi":  {"symbol": "KOSPI",  "name": "KOSPI",  "subtitle": "한국 코스피"},
-        "kosdaq": {"symbol": "KOSDAQ", "name": "KOSDAQ", "subtitle": "한국 코스닥"},
-    }
-    yf_targets = {
-        "nasdaq": {"symbol": "^IXIC", "name": "NASDAQ",   "subtitle": "미국 나스닥"},
-        "usdkrw": {"symbol": "KRW=X", "name": "USD/KRW",  "subtitle": "원/달러 환율"},
-        "gold":   {"symbol": "GC=F",  "name": "Gold",     "subtitle": "금 선물"},
-        "wti":    {"symbol": "CL=F",  "name": "WTI Crude","subtitle": "서부텍사스산 원유"},
-    }
-
-    def get_naver(key, meta):
-        try:
-            url = f"https://m.stock.naver.com/api/index/{meta['symbol']}/basic"
-            res = requests.get(url, headers=headers, timeout=6)
-            data = res.json()
-            price    = float(str(data.get("closePrice", "0")).replace(",", ""))
-            diff     = float(str(data.get("compareToPreviousClosePrice", "0")).replace(",", ""))
-            diff_pct = float(str(data.get("fluctuationsRatio", "0")).replace(",", ""))
-            sign     = "+" if diff >= 0 else ""
-            vol_raw  = data.get("accumulatedTradingVolume", None)
-            vol      = f"{int(str(vol_raw).replace(',', '')):,}" if vol_raw else "N/A"
-            return key, {
-                "name": meta["name"], "subtitle": meta["subtitle"],
-                "value": f"{price:,.2f}",
-                "change": f"{sign}{diff:,.2f}",
-                "change_pct": f"{sign}{diff_pct:.2f}%",
-                "status": "up" if diff > 0 else ("down" if diff < 0 else "neutral"),
-                "volume": vol,
-            }
-        except Exception:
-            return key, None
-
-    def get_yfinance(key, meta):
-        try:
-            import yfinance as yf
-            df = yf.Ticker(meta["symbol"]).history(period="2d", interval="1m")
-            if df.empty:
-                raise ValueError("empty")
-            price   = float(df["Close"].dropna().iloc[-1])
-            today   = df.index[-1].date()
-            prev_df = df[df.index.date < today]["Close"].dropna()
-            prev    = float(prev_df.iloc[-1]) if not prev_df.empty else price
-            diff     = price - prev
-            diff_pct = diff / prev * 100 if prev else 0
-            sign     = "+" if diff >= 0 else ""
-            fmt      = f"{price:,.1f}" if key == "usdkrw" else f"{price:,.2f}"
-            return key, {
-                "name": meta["name"], "subtitle": meta["subtitle"],
-                "value": fmt,
-                "change": f"{sign}{diff:,.2f}",
-                "change_pct": f"{sign}{diff_pct:.2f}%",
-                "status": "up" if diff > 0 else ("down" if diff < 0 else "neutral"),
-                "volume": "N/A",
-            }
-        except Exception:
-            return key, None
-
-    result = {}
-    all_tasks = (
-        [(get_naver,    k, m) for k, m in naver_targets.items()] +
-        [(get_yfinance, k, m) for k, m in yf_targets.items()]
-    )
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
-        futures = {executor.submit(fn, k, m): k for fn, k, m in all_tasks}
-        for future in concurrent.futures.as_completed(futures):
-            k, entry = future.result()
-            if entry:
-                result[k] = entry
-
-    all_targets = {**naver_targets, **yf_targets}
-    return {k: result.get(k, {"name": all_targets[k]["name"], "value": "-", "status": "neutral"})
-            for k in all_targets.keys()}
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_sparkline_data():
-    """시장 지수 카드용 180일 스파크라인 데이터를 yfinance로 수집."""
     targets = {
-        "kospi":  "^KS11",
-        "kosdaq": "^KQ11",
-        "nasdaq": "^IXIC",
-        "usdkrw": "KRW=X",
-        "gold":   "GC=F",
-        "wti":    "CL=F",
+        "kospi":  {"symbol": "^KS11",  "name": "KOSPI",  "subtitle": "한국 코스피"},
+        "kosdaq": {"symbol": "^KQ11",  "name": "KOSDAQ", "subtitle": "한국 코스닥"},
+        "nasdaq": {"symbol": "^IXIC",  "name": "NASDAQ", "subtitle": "미국 나스닥"},
+        "usdkrw": {"symbol": "KRW=X",  "name": "USD/KRW", "subtitle": "원/달러 환율"},
+        "gold":   {"symbol": "GC=F",   "name": "Gold",    "subtitle": "금 선물"},
+        "wti":    {"symbol": "CL=F",   "name": "WTI Crude", "subtitle": "서부텍사스산 원유"},
     }
-
-    def get_history(key, symbol):
+    
+    def get_data(key, meta):
         try:
             import yfinance as yf
-            df = yf.Ticker(symbol).history(period="180d", interval="1d")
-            if df.empty or "Close" not in df.columns:
-                return key, []
-            closes = df["Close"].dropna().tolist()
-            return key, closes
-        except:
-            return key, []
+            ticker = yf.Ticker(meta["symbol"])
+            info = ticker.fast_info
+            price = info.last_price
+            prev = info.previous_close
+            vol = getattr(info, "three_month_average_volume", None) or getattr(info, "regular_market_volume", None)
+            
+            entry = {
+                "name": meta["name"], "subtitle": meta["subtitle"],
+                "value": "-", "change": "-", "change_pct": "-",
+                "status": "neutral", "volume": "-"
+            }
+            if price and prev:
+                diff = price - prev
+                diff_pct = diff / prev * 100
+                sign = "+" if diff >= 0 else ""
+                
+                if key == "usdkrw": entry["value"] = f"{price:,.1f}"
+                else: entry["value"] = f"{price:,.2f}"
+                
+                entry["change"] = f"{sign}{diff:,.2f}"
+                entry["change_pct"] = f"{sign}{diff_pct:.2f}%"
+                entry["status"] = "up" if diff > 0 else ("down" if diff < 0 else "neutral")
+            
+            if vol and key not in ["usdkrw"]: entry["volume"] = f"{int(vol):,}"
+            else: entry["volume"] = "N/A"
+            return key, entry
+        except: return key, None
 
     result = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
-        futures = {executor.submit(get_history, k, s): k for k, s in targets.items()}
-        for future in concurrent.futures.as_completed(futures):
-            k, closes = future.result()
-            result[k] = closes
-    return result
-
-
-def make_sparkline_svg(closes, status, width=160, height=52):
-    """종가 리스트를 받아 인라인 SVG 스파크라인 문자열을 반환."""
-    if not closes or len(closes) < 2:
-        return ""
-    mn, mx = min(closes), max(closes)
-    rng = mx - mn if mx != mn else 1.0
-    pad = 3
-    def cx(i): return round(i / (len(closes) - 1) * width, 2)
-    def cy(v): return round(pad + (1 - (v - mn) / rng) * (height - pad * 2), 2)
-    pts = " ".join(f"{cx(i)},{cy(v)}" for i, v in enumerate(closes))
-    color = "#DC2626" if status == "up" else ("#2563EB" if status == "down" else "#94A3B8")
-    fill_color = color + "15"
-    first_x, last_x = cx(0), cx(len(closes) - 1)
-    poly_pts = f"{pts} {last_x},{height} {first_x},{height}"
-    svg = (
-        f'<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" '
-        f'style="width:100%;height:{height}px;display:block;">'
-        f'<polygon points="{poly_pts}" fill="{fill_color}" stroke="none"/>'
-        f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="1.8" '
-        f'stroke-linejoin="round" stroke-linecap="round"/>'
-        f'</svg>'
-    )
-    return svg
-
-
-@st.cache_data(ttl=120, show_spinner=False)
-def fetch_investor_trend():
-    """코스피/코스닥 당일(최근 거래일) 투자자별(외국인/기관/개인) 순매수 동향을 억원 단위로 가져온다."""
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    markets = {"kospi": "01", "kosdaq": "02"}  # 01: 코스피, 02: 코스닥
-
-    def get_data(key, sosok):
-        try:
-            today = datetime.datetime.now().strftime("%Y%m%d")
-            url = f"https://finance.naver.com/sise/investorDealTrendDay.naver?bizdate={today}&sosok={sosok}"
-            res = requests.get(url, headers=headers, timeout=7)
-            res.encoding = 'euc-kr'
-            dfs = pd.read_html(io.StringIO(res.text))
-
-            target = None
-            for df in dfs:
-                cols = [str(c) for c in df.columns.to_flat_index()]
-                if any('외국인' in c for c in cols) and any('기관' in c for c in cols):
-                    target = df.dropna(how="all").reset_index(drop=True)
-                    break
-            if target is None or target.empty:
-                return key, None
-
-            target.columns = [str(c).strip() for c in target.columns.to_flat_index()]
-            row = target.iloc[0]  # 가장 최근 거래일(맨 위 행)
-
-            def pick(keyword):
-                col = next((c for c in target.columns if keyword in c), None)
-                if col is None:
-                    return None
-                try:
-                    return float(str(row[col]).replace(',', '').strip())
-                except Exception:
-                    return None
-
-            entry = {
-                "foreign": pick("외국인"),
-                "institution": pick("기관"),
-                "individual": pick("개인"),
-            }
-            if all(v is None for v in entry.values()):
-                return key, None
-            return key, entry
-        except Exception:
-            return key, None
-
-    result = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        futures = {executor.submit(get_data, k, s): k for k, s in markets.items()}
+        futures = {executor.submit(get_data, k, m): k for k, m in targets.items()}
         for future in concurrent.futures.as_completed(futures):
             k, entry = future.result()
-            result[k] = entry if entry else {"foreign": None, "institution": None, "individual": None}
-    return result
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_investor_trend_monthly(sosok):
-    """코스피(01)/코스닥(02) 최근 한달 일별 투자자별 순매수 동향을 가져온다."""
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-
-    today = datetime.datetime.now()
-    business_days = []
-    for delta in range(45):
-        date = today - datetime.timedelta(days=delta)
-        if date.weekday() < 5:
-            business_days.append(date)
-        if len(business_days) >= 22:
-            break
-
-    def fetch_one(date):
-        try:
-            time.sleep(random.uniform(0.1, 0.2))
-            date_str = date.strftime("%Y%m%d")
-            url = f"https://finance.naver.com/sise/investorDealTrendDay.naver?bizdate={date_str}&sosok={sosok}"
-            res = requests.get(url, headers=headers, timeout=5)
-            res.encoding = 'euc-kr'
-            dfs = pd.read_html(io.StringIO(res.text))
-            target = None
-            for df in dfs:
-                cols = [str(c) for c in df.columns.to_flat_index()]
-                if any('외국인' in c for c in cols) and any('기관' in c for c in cols):
-                    target = df.dropna(how="all").reset_index(drop=True)
-                    break
-            if target is None or target.empty:
-                return None
-            target.columns = [str(c).strip() for c in target.columns.to_flat_index()]
-            row = target.iloc[0]
-
-            def pick(keyword):
-                col = next((c for c in target.columns if keyword in c), None)
-                if col is None: return None
-                try: return float(str(row[col]).replace(',', '').strip())
-                except: return None
-
-            f_val = pick("외국인")
-            i_val = pick("기관")
-            p_val = pick("개인")
-            if f_val is None and i_val is None and p_val is None:
-                return None
-            return {
-                "날짜": date.strftime("%m/%d"),
-                "외국인": f_val or 0.0,
-                "기관":   i_val or 0.0,
-                "개인":   p_val or 0.0,
-            }
-        except Exception:
-            return None
-
-    rows = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(fetch_one, d): d for d in business_days}
-        for future in concurrent.futures.as_completed(futures):
-            res = future.result()
-            if res:
-                rows.append(res)
-
-    rows.sort(key=lambda r: r["날짜"])
-    return rows
-
-# =========================
-# 📅 통화정책 회의 일정 (공식 확정 일정)
-# =========================
-FOMC_MEETING_DATES = [
-    "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
-    "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09",
-]
-BOK_MEETING_DATES = [
-    "2026-01-15", "2026-02-26", "2026-04-10", "2026-05-28",
-    "2026-07-16", "2026-08-27", "2026-10-22", "2026-11-26",
-]
-
-FED_RATE_HISTORY = [
-    {"date": "2026-06-17", "range": "3.50~3.75%", "action": "인하 (-0.25%p)"},
-    {"date": "2026-04-29", "range": "3.75~4.00%", "action": "동결"},
-    {"date": "2026-03-18", "range": "3.75~4.00%", "action": "동결"},
-    {"date": "2026-01-28", "range": "3.75~4.00%", "action": "인하 (-0.25%p)"},
-    {"date": "2025-12-10", "range": "4.00~4.25%", "action": "동결"},
-    {"date": "2025-10-29", "range": "4.00~4.25%", "action": "인하 (-0.25%p)"},
-    {"date": "2025-09-17", "range": "4.25~4.50%", "action": "동결"},
-    {"date": "2025-07-30", "range": "4.25~4.50%", "action": "동결"},
-    {"date": "2025-06-18", "range": "4.25~4.50%", "action": "인하 (-0.25%p)"},
-    {"date": "2025-04-30", "range": "4.50~4.75%", "action": "동결"},
-]
-
-BOK_RATE_HISTORY = [
-    {"date": "2026-05-28", "rate": 2.50, "action": "동결"},
-    {"date": "2026-04-10", "rate": 2.50, "action": "동결"},
-    {"date": "2026-02-26", "rate": 2.50, "action": "동결"},
-    {"date": "2026-01-15", "rate": 2.50, "action": "동결"},
-    {"date": "2025-11-27", "rate": 2.50, "action": "동결"},
-    {"date": "2025-10-16", "rate": 2.75, "action": "인하 (-0.25%p)"},
-    {"date": "2025-08-28", "rate": 2.75, "action": "동결"},
-    {"date": "2025-07-17", "rate": 3.00, "action": "인하 (-0.25%p)"},
-    {"date": "2025-05-29", "rate": 3.00, "action": "동결"},
-    {"date": "2025-04-17", "rate": 3.00, "action": "동결"},
-    {"date": "2025-02-25", "rate": 3.00, "action": "인하 (-0.25%p)"},
-    {"date": "2025-01-16", "rate": 3.25, "action": "동결"},
-]
-
-def next_meeting_label(date_list):
-    today = datetime.datetime.now().date()
-    dates = sorted(datetime.datetime.strptime(d, "%Y-%m-%d").date() for d in date_list)
-    upcoming = [d for d in dates if d >= today]
-    if not upcoming:
-        return None
-    d = upcoming[0]
-    return f"{d.month}/{d.day}"
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_fed_rate_data():
-    try:
-        history = [
-            {"date": h["date"], "range": h["range"], "action": h["action"]}
-            for h in FED_RATE_HISTORY[:10]
-        ]
-        latest = FED_RATE_HISTORY[0]
-        current = {
-            "range": latest["range"],
-            "date": latest["date"],
-        }
-        return {"current": current, "history": history}
-    except Exception:
-        return None
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_bok_rate_data():
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-
-    try:
-        url = "https://m.stock.naver.com/api/index/IRR_BOK/basic"
-        res = requests.get(url, headers=headers, timeout=8)
-        data = res.json()
-        rate_val = float(str(data.get("closePrice", "0")).replace(",", ""))
-        date_str = str(data.get("localTradedAt", ""))[:10]
-        dt = pd.to_datetime(date_str, errors="coerce")
-        date_display = dt.strftime("%Y-%m-%d") if pd.notna(dt) else "최신"
-
-        if rate_val > 0:
-            history = [
-                {"date": h["date"], "range": f"{h['rate']:.2f}%", "action": h["action"]}
-                for h in BOK_RATE_HISTORY[:10]
-            ]
-            return {"current": {"rate": f"{rate_val:.2f}%", "date": date_display}, "history": history}
-    except Exception:
-        pass
-
-    history = [
-        {"date": h["date"], "range": f"{h['rate']:.2f}%", "action": h["action"]}
-        for h in BOK_RATE_HISTORY[:10]
-    ]
-    latest = BOK_RATE_HISTORY[0]
-    return {"current": {"rate": f"{latest['rate']:.2f}%", "date": latest["date"]}, "history": history}
-
-def render_rate_widget():
-    fed = run_with_progress("연준 금리 데이터를 불러오는 중...", fetch_fed_rate_data)
-    bok = run_with_progress("한국은행 금리 데이터를 불러오는 중...", fetch_bok_rate_data)
-
-    def build_help(history, value_key):
-        if not history:
-            return "최근 10건 변동 이력을 가져오지 못했습니다."
-        lines = [f"- {h['date']} · {h[value_key]} ({h['action']})" for h in history[:10]]
-        return "**최근 10건 변동 이력**\n\n" + "\n".join(lines)
-
-    if fed:
-        st.metric(
-            label="🇺🇸 미국 기준금리 (FOMC)",
-            value=fed["current"]["range"],
-            help=build_help(fed["history"], "range") + f"\n\n_기준일: {fed['current']['date']}_",
-        )
-    else:
-        st.metric(label="🇺🇸 미국 기준금리 (FOMC)", value="-", help="데이터를 불러오지 못했습니다.")
-        
-    if bok:
-        st.metric(
-            label="🇰🇷 한국 기준금리 (한국은행)",
-            value=bok["current"]["rate"],
-            help=build_help(bok["history"], "range") + f"\n\n_기준일: {bok['current']['date']}_",
-        )
-    else:
-        st.metric(label="🇰🇷 한국 기준금리 (한국은행)", value="-", help="데이터를 불러오지 못했습니다.")
+            if entry: result[k] = entry
+            
+    return {k: result.get(k, {"name": targets[k]["name"], "value": "-", "status": "neutral"}) for k in targets.keys()}
 
 @st.cache_data(ttl=180, show_spinner=False)
 def fetch_sector_ranking():
@@ -471,31 +143,23 @@ def fetch_dividend_ranking():
         try:
             res = requests.get(f"{base_url}?page={page}", headers=headers, timeout=10)
             res.encoding = 'euc-kr'
-            
-            # ✅ 정규식으로 href 속성에서 종목코드 추출 후 딕셔너리에 저장
-            code_matches = re.findall(r'href="/item/main\.naver\?code=(\d+)"[^>]*>(.*?)</a>', res.text)
-            name_to_code = {re.sub(r'<[^>]+>', '', name).strip(): code for code, name in code_matches}
-
             dfs = pd.read_html(io.StringIO(res.text))
             for df in dfs:
                 if any('종목명' in str(c) for c in df.columns.to_flat_index()):
-                    name_col = next((c for c in df.columns if '종목명' in str(c)), None)
-                    if name_col:
-                        page_df = df.dropna(subset=[name_col])
-                        if not page_df.empty:
-                            page_df['종목코드'] = page_df[name_col].map(name_to_code)
-                            return page_df
+                    page_df = df.dropna()
+                    return page_df if not page_df.empty else None
         except:
             pass
         return None
 
     try:
+        # 1페이지로 전체 페이지 수 파악
         import re as _re
         res0 = requests.get(base_url, headers=headers, timeout=10)
         res0.encoding = 'euc-kr'
         page_nums = [int(p) for p in _re.findall(r'[?&]page=(\d+)', res0.text)]
         max_page = max(page_nums) if page_nums else 10
-        max_page = min(max_page, 15)
+        max_page = min(max_page, 15)  # 안전 상한선 15페이지(450개)
 
         all_pages = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
@@ -857,15 +521,18 @@ def check_naver_52w_robust(row_dict):
     code = str(row_dict['종목코드']).replace('.0','').zfill(6)
     mkt = row_dict.get('시장', '코스피')
     
+    # 1. 종목 스크리너에서 긁어온 '현재가' 그대로 활용 (네이버 전체 스캔 데이터)
     price = float(str(row_dict.get('현재가', 0)).replace(',', ''))
     high = 0.0
 
+    # 2. CSV에서 업데이트된 '52주고점' 데이터 가져오기
     if '52주고점' in row_dict and pd.notna(row_dict['52주고점']) and float(row_dict['52주고점']) > 0:
         high = float(row_dict['52주고점'])
     else:
         high52_map = load_high52_map()
         high = high52_map.get(code, 0.0)
 
+    # 🚀 핵심 최적화: 스크리너 현재가와 CSV 고점이 모두 존재하면 API 호출 없이 즉시 계산!
     if price > 0 and high > 0:
         drop_pct = ((price - high) / high) * 100
         if drop_pct <= 0.0:
@@ -878,6 +545,10 @@ def check_naver_52w_robust(row_dict):
             }
         return None  
         
+    # ---------------------------------------------------------------------
+    # ⚠️ 이하 코드는 CSV 고점 데이터가 없거나 스크리너 현재가에 오류가 났을 때만 
+    # 예외적으로 작동하는 '실시간 API 안전망' 입니다.
+    # ---------------------------------------------------------------------
     try:
         time.sleep(random.uniform(0.1, 0.3))
         url = f"https://m.stock.naver.com/api/stock/{code}/basic"
@@ -1121,80 +792,132 @@ def main():
             
             div[data-testid="stCheckbox"] label { color: #374151 !important; font-weight: 500 !important; }
 
+            /* 💡 stRadio 위젯 자체 및 상위 래퍼의 잔여 마진/패딩을 모두 제거하여
+               다른 요소(버튼, info-box 등)와 좌측 시작선을 완전히 일치시킴. 구버전(.element-container)과 신버전(stElementContainer) DOM 둘 다 대응 */
             div[data-testid="stRadio"],
             div[data-testid="stRadio"] > div,
             .element-container:has(div[data-testid="stRadio"]),
             div[data-testid="stElementContainer"]:has(div[data-testid="stRadio"]) {
-                width: 100% !important; max-width: none !important; margin: 0 !important; padding: 0 !important; left: 0 !important; position: relative !important; }
+                width: 100% !important; max-width: none !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                left: 0 !important;
+                position: relative !important;
+            }
             div[data-testid="stRadio"] > label[data-testid="stWidgetLabel"] {
-                display: none !important; }
+                display: none !important; /* collapsed label이 차지하는 잔여 공간 제거 */
+            }
 
+            /* 💡 [궁극의 UI 교정] 라디오 그룹을 flex로 변경하여 똑같은 비율로 균등 분할
+               (grid보다 BaseWeb 원본 레이아웃 방식과 호환성이 높아 잔여 오프셋 위험이 적음) */
             div[data-testid="stRadio"] > div[role="radiogroup"] {
-                display: flex !important; flex-direction: row !important; flex-wrap: nowrap !important; gap: 10px !important; width: 100% !important; margin: 0 !important; margin-left: 0 !important; padding-left: 0 !important; background-color: transparent !important; border: none !important; padding: 0 !important; align-items: stretch !important; justify-content: flex-start !important; }
+                display: flex !important;
+                flex-direction: row !important;
+                flex-wrap: nowrap !important;
+                gap: 10px !important;
+                width: 100% !important;
+                margin: 0 !important; margin-left: 0 !important;
+                padding-left: 0 !important;
+                background-color: transparent !important;
+                border: none !important;
+                padding: 0 !important;
+                align-items: stretch !important; /* 모든 박스 높이를 동일한 트랙 높이로 정렬 */
+                justify-content: flex-start !important;
+            }
 
+            /* radiogroup 직속 자식(각 라디오 옵션 wrapper)에 남아있을 수 있는
+               BaseWeb 기본 margin/padding을 모두 제거 — 좌측 정렬 오프셋 원인 차단 */
             div[data-testid="stRadio"] > div[role="radiogroup"] > * {
-                margin: 0 !important; min-width: 0 !important; flex: 1 1 0% !important; 
+                margin: 0 !important; min-width: 0 !important;
+                flex: 1 1 0% !important; /* 🔥 동일한 너비로 균등 분할 (grid의 1fr과 동일한 효과) */
             }
             div[data-testid="stRadio"] > div[role="radiogroup"] > *:first-child {
-                margin-left: 0 !important; }
+                margin-left: 0 !important;
+            }
 
+            /* 라디오 탭 내부 블록 디자인 */
             div[data-testid="stRadio"] label[data-baseweb="radio"] {
-                background-color: rgba(248, 250, 252, 0.7) !important; backdrop-filter: blur(4px) !important; border: none !important; outline: 2px solid #CBD5E1 !important; outline-offset: -2px !important; border-radius: 8px !important; padding: 10px 5px !important; margin: 0 !important; cursor: pointer !important; transition: background-color 0.2s ease-in-out, outline-color 0.2s ease-in-out, box-shadow 0.2s ease-in-out !important; display: flex !important; flex-direction: row !important; justify-content: center !important; align-items: center !important; width: 100% !important; min-height: 44px !important; box-sizing: border-box !important; box-shadow: none !important; }
+                background-color: rgba(248, 250, 252, 0.7) !important; backdrop-filter: blur(4px) !important;
+                border: none !important; /* 🔥 border는 outline으로 대체 → grid 셀 크기 계산에 영향 없음 */
+                outline: 2px solid #CBD5E1 !important; outline-offset: -2px !important; /* outline이 박스 안쪽에 그려지도록 보정 */
+                border-radius: 8px !important; padding: 10px 5px !important; 
+                margin: 0 !important;
+                cursor: pointer !important; transition: background-color 0.2s ease-in-out, outline-color 0.2s ease-in-out, box-shadow 0.2s ease-in-out !important;
+                display: flex !important;
+                flex-direction: row !important;
+                justify-content: center !important; align-items: center !important;
+                width: 100% !important;
+                min-height: 44px !important; /* 🔥 모든 박스 높이를 동일하게 고정 */
+                box-sizing: border-box !important; box-shadow: none !important; /* 기본 그림자 없음 → 선택 시에만 부여 */
+            }
 
             div[data-testid="stRadio"] label[data-baseweb="radio"]:hover {
-                background-color: rgba(226, 232, 240, 0.8) !important; }
+                background-color: rgba(226, 232, 240, 0.8) !important;
+            }
 
+            /* ✅ 클릭 시 (선택된 상태) 파란색 활성화 효과 — outline 두께는 그대로, 색상만 변경 */
             div[data-testid="stRadio"] label[data-baseweb="radio"]:has(input[type="radio"]:checked) {
-                background-color: #EEF2FF !important; outline-color: #6366F1 !important; box-shadow: 0 4px 10px rgba(99, 102, 241, 0.15) !important; }
+                background-color: #EEF2FF !important; /* 연한 파란색 배경 */
+                outline-color: #6366F1 !important; /* 파란색 테두리 (두께 변화 없음) */
+                box-shadow: 0 4px 10px rgba(99, 102, 241, 0.15) !important; /* 입체적인 파란 그림자 */
+            }
 
+            /* 🚫 기존 기본 동그라미 아이콘 완벽 숨김 (텍스트 정렬에 영향 없도록 너비 0 처리) */
             div[data-testid="stRadio"] label[data-baseweb="radio"] > div:first-child {
-                display: none !important; width: 0 !important; margin: 0 !important;
+                display: none !important; width: 0 !important;
+                margin: 0 !important;
             }
 
+            /* 텍스트 컨테이너 정렬 강제 (남은 영역을 가운데 정렬) */
             div[data-testid="stRadio"] label[data-baseweb="radio"] > div:last-child {
-                flex: 1 1 auto !important; width: 100% !important; text-align: center !important; display: flex !important; justify-content: center !important; align-items: center !important; }
+                flex: 1 1 auto !important; width: 100% !important;
+                text-align: center !important;
+                display: flex !important;
+                justify-content: center !important;
+                align-items: center !important;
+            }
 
+            /* 텍스트 컬러 및 사이즈 */
             div[data-testid="stRadio"] label[data-baseweb="radio"] p {
-                color: #475569 !important; font-size: 14.5px !important; font-weight: 600 !important; margin: 0 !important; line-height: 1.3 !important; white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important; text-align: center !important;
+                color: #475569 !important; font-size: 14.5px !important;
+                font-weight: 600 !important;
+                margin: 0 !important;
+                line-height: 1.3 !important;
+                white-space: nowrap !important; /* 🔥 글씨 무조건 한 줄 고정 */
+                overflow: hidden !important; text-overflow: ellipsis !important; /* 박스를 넘어가면 ... 처리 */
+                text-align: center !important;
             }
 
+            /* 텍스트 컬러 (선택됨) */
             div[data-testid="stRadio"] label[data-baseweb="radio"]:has(input[type="radio"]:checked) p {
-                color: #4338CA !important; font-weight: 800 !important;
+                color: #4338CA !important; /* 진한 파란색 텍스트 */
+                font-weight: 800 !important;
             }
 
+            /* 시장 필터(전체·코스피·코스닥)도 텍스트 길이와 무관하게 완전히 균등한 너비로 분할. 좁은 컬럼이라 너무 넓어지지 않도록 그룹 자체의 최대 폭만 제한 */
             .st-key-market_filter_box div[data-testid="stRadio"] > div[role="radiogroup"] {
-                justify-content: flex-start !important; max-width: 320px !important; 
+                justify-content: flex-start !important; max-width: 320px !important; /* 라디오 그룹 전체 폭 제한 (검색창과 균형 유지) */
             }
             .st-key-market_filter_box div[data-testid="stRadio"] > div[role="radiogroup"] > * {
-                flex: 1 1 0% !important; min-width: 0 !important; max-width: none !important;
+                flex: 1 1 0% !important; /* 🔥 텍스트 길이 무관, 3칸 완전 균등 분할 */
+                min-width: 0 !important; max-width: none !important;
             }
             .st-key-market_filter_box div[data-testid="stRadio"] label[data-baseweb="radio"] {
                 min-height: 40px !important; padding: 8px 10px !important;
             }
 
+            /* ── 대시보드 카드 스타일 ── */
             .dash-section-title { font-size: 16px; font-weight: 700; color: #0F172A; margin: 18px 0 14px 0; letter-spacing: -0.3px; }
             .section-divider { border: none; border-top: 1px solid #E5E7EB; margin: 28px 0; }
 
-            .index-card {
-                background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 12px; padding: 20px 22px 20px 22px; min-height: 110px; box-shadow: 0 1px 4px rgba(0,0,0,0.04); transition: box-shadow 0.22s ease, border-color 0.22s ease, padding-bottom 0.25s ease; position: relative; overflow: visible; cursor: default; }
-            .index-card:hover { box-shadow: 0 6px 20px rgba(0,0,0,0.10); border-color: #C7D2FE; }
+            .index-card { background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 12px; padding: 20px 22px; min-height: 110px; box-shadow: 0 1px 4px rgba(0,0,0,0.04); transition: box-shadow 0.2s; }
+            .index-card:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
             .index-card-title { font-size: 13px; font-weight: 700; color: #1E293B; margin-bottom: 6px; letter-spacing: -0.2px; }
             .index-card-value { font-size: 26px; font-weight: 800; color: #0F172A; margin-bottom: 6px; letter-spacing: -0.5px; }
             .index-card-up   { font-size: 13px; font-weight: 600; color: #DC2626; margin-bottom: 6px; }
             .index-card-down { font-size: 13px; font-weight: 600; color: #2563EB; margin-bottom: 6px; }
             .index-card-neutral { font-size: 13px; font-weight: 600; color: #64748B; margin-bottom: 6px; }
             .index-card-sub  { font-size: 12px; color: #94A3B8; }
-            .index-card-chart {
-                max-height: 0; overflow: hidden; opacity: 0; transition: max-height 0.32s cubic-bezier(0.4,0,0.2,1), opacity 0.25s ease, margin-top 0.25s ease; margin-top: 0; }
-            .index-card:hover .index-card-chart {
-                max-height: 80px; opacity: 1; margin-top: 12px;
-            }
-            .index-card-chart-label { font-size: 10px; color: #94A3B8; font-weight: 500; margin-bottom: 3px; letter-spacing: 0.2px; }
-
-            /* Streamlit 컬럼 컨테이너의 overflow 클리핑 해제 (스파크라인 잘림 방지) */
-            [data-testid="column"] { overflow: visible !important; }
-            [data-testid="stVerticalBlock"] { overflow: visible !important; }
-            [data-testid="stHorizontalBlock"] { overflow: visible !important; }
         </style>
 
         <div class="header-container">
@@ -1226,44 +949,6 @@ def main():
     elif selected == "기업 재무 분석":   render_fnguide()
     elif selected == "실시간 배당 순위": render_dividend()
 
-def render_rate_strip():
-    """기준금리 현황을 한 줄짜리 컴팩트 형태로 우측 정렬 표시."""
-    fed = fetch_fed_rate_data()
-    bok = fetch_bok_rate_data()
-
-    def status_word(history):
-        if not history:
-            return "-"
-        return history[0]["action"].split(" ")[0]
-
-    def tooltip_text(history, value_key):
-        if not history:
-            return "최근 10건 변동 이력을 가져오지 못했습니다."
-        lines = [f"{h['date']}  {h[value_key]}  ({h['action']})" for h in history[:10]]
-        return "최근 10건 변동 이력\n" + "\n".join(lines)
-
-    fed_val = fed["current"]["range"] if fed else "-"
-    fed_status = status_word(fed["history"]) if fed else "-"
-    fed_tip = html_lib.escape(tooltip_text(fed["history"], "range") if fed else "데이터를 불러오지 못했습니다.")
-    fed_next = next_meeting_label(FOMC_MEETING_DATES)
-    fed_meta = f"{fed_status}, 다음 회의 {fed_next}" if fed_next else fed_status
-
-    bok_val = bok["current"]["rate"] if bok else "-"
-    bok_status = status_word(bok["history"]) if bok else "-"
-    bok_tip = html_lib.escape(tooltip_text(bok["history"], "range") if bok else "데이터를 불러오지 못했습니다.")
-    bok_next = next_meeting_label(BOK_MEETING_DATES)
-    bok_meta = f"{bok_status}, 다음 회의 {bok_next}" if bok_next else bok_status
-
-    strip_html = (
-        '<div style="display:flex; justify-content:flex-end; align-items:center; gap:20px; height:38px;">'
-        f'<span title="{fed_tip}" style="font-size:13px; color:#374151; cursor:help; white-space:nowrap; border-bottom:1px dashed #CBD5E1;">'
-        f'🇺🇸 미국(FOMC) <b style="color:#0F172A;">{fed_val}</b> <span style="color:#64748B;">({fed_meta})</span></span>'
-        f'<span title="{bok_tip}" style="font-size:13px; color:#374151; cursor:help; white-space:nowrap; border-bottom:1px dashed #CBD5E1;">'
-        f'🇰🇷 한국(한국은행) <b style="color:#0F172A;">{bok_val}</b> <span style="color:#64748B;">({bok_meta})</span></span>'
-        '</div>'
-    )
-    st.markdown(strip_html, unsafe_allow_html=True)
-
 def render_dashboard():
     now_str = datetime.datetime.now().strftime("%Y.%m.%d %H:%M")
 
@@ -1278,240 +963,66 @@ def render_dashboard():
         )
     st.markdown("<hr style='margin: 10px 0 25px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
 
-    col_refresh, col_rate_strip = st.columns([1.3, 4.7])
+    col_refresh, _ = st.columns([1, 5])
     with col_refresh:
         if st.button("데이터 새로고침"):
             fetch_market_index_table.clear()
-            fetch_investor_trend.clear()
-            fetch_investor_trend_monthly.clear()
-            fetch_sparkline_data.clear()
             fetch_sector_ranking.clear()
-            fetch_fed_rate_data.clear()
-            fetch_bok_rate_data.clear()
             st.rerun()
-    with col_rate_strip:
-        render_rate_strip()
 
     st.markdown("<div class='dash-section-title'>📈 시장 지수</div>", unsafe_allow_html=True)
-    indices    = run_with_progress("시장 지수를 불러오는 중...", fetch_market_index_table)
-    sparklines = fetch_sparkline_data()
+    indices = run_with_progress("시장 지수를 불러오는 중...", fetch_market_index_table)
 
     def index_color_class(status):
-        if status == "up":   return "index-card-up"
-        if status == "down": return "index-card-down"
+        if status == "up":      return "index-card-up"
+        if status == "down":    return "index-card-down"
         return "index-card-neutral"
     def index_arrow(status):
         if status == "up":   return "▲"
         if status == "down": return "▼"
         return "–"
 
-    def render_index_card(col, key, idx, show_volume=True):
-        label     = idx.get("name", "-")
-        subtitle  = idx.get("subtitle", "")
-        status    = idx.get("status", "neutral")
-        arrow     = index_arrow(status)
-        chg       = idx.get("change", "-")
-        chgpct    = idx.get("change_pct", "")
-        vol       = idx.get("volume", "-")
-        closes    = sparklines.get(key, [])
-        svg       = make_sparkline_svg(closes, status, width=240, height=56)
-
-        chg_color = "#DC2626" if status == "up" else ("#2563EB" if status == "down" else "#64748B")
-        chg_bg    = "#FEF2F2" if status == "up" else ("#EFF6FF" if status == "down" else "#F8FAFC")
-
-        vol_html = (
-            f'<div style="font-size:11px;color:#94A3B8;margin-top:3px;">거래량 {vol}</div>'
-            if show_volume else ""
-        )
-
-        chart_section = (
-            f'<div style="margin-top:10px;border-top:1px solid #F1F5F9;padding-top:6px;">'
-            f'<div style="text-align:right;font-size:10px;color:#CBD5E1;font-weight:500;margin-bottom:3px;letter-spacing:0.2px;">180일 추이</div>'
-            f'{svg}'
-            f'</div>'
-        ) if svg else ""
-
-        html = f"""
-        <style>
-        .icard-{key} {{
-            background:#FFFFFF; border:1px solid #E2E8F0; border-radius:12px;
-            padding:16px 18px 14px 18px; box-shadow:0 1px 4px rgba(0,0,0,0.04);
-            transition:box-shadow .22s ease, border-color .22s ease;
-            font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-        }}
-        .icard-{key}:hover {{ box-shadow:0 6px 20px rgba(0,0,0,0.10); border-color:#C7D2FE; }}
-        </style>
-        <div class="icard-{key}">
-            <div style="display:flex;align-items:baseline;gap:5px;margin-bottom:8px;">
-                <span style="font-size:13px;font-weight:700;color:#1E293B;">{label}</span>
-                <span style="font-size:11px;color:#94A3B8;">{subtitle}</span>
-            </div>
-            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:5px;">
-                <span style="font-size:22px;font-weight:800;color:#0F172A;letter-spacing:-0.5px;">{idx.get('value', '-')}</span>
-                <span style="font-size:12px;font-weight:600;color:{chg_color};">{chg}</span>
-                <span style="display:inline-flex;align-items:center;gap:3px;
-                             background:{chg_bg};border-radius:6px;
-                             padding:3px 7px;font-size:12px;font-weight:700;color:{chg_color};">
-                    {arrow} {chgpct}
-                </span>
-            </div>
-            {vol_html}
-            {chart_section}
-        </div>
-        """
-        with col:
-            import streamlit.components.v1 as components
-            components.html(html, height=230 if show_volume else 210, scrolling=False)
-
     c1, c2, c3 = st.columns(3)
-    for col, key in [(c1, "kospi"), (c2, "kosdaq"), (c3, "nasdaq")]:
-        render_index_card(col, key, indices.get(key, {}), show_volume=True)
-
+    cards1 = [(c1, indices.get("kospi",  {})), (c2, indices.get("kosdaq", {})), (c3, indices.get("nasdaq", {}))]
+    for col, idx in cards1:
+        label    = idx.get("name", "-")
+        subtitle = idx.get("subtitle", "")
+        status = idx.get("status", "neutral")
+        arrow  = index_arrow(status)
+        chg    = idx.get("change", "-")
+        chgpct = idx.get("change_pct", "")
+        vol    = idx.get("volume", "-")
+        color_cls = index_color_class(status)
+        with col:
+            st.markdown(f"""
+            <div class="index-card">
+                <div class="index-card-title">{label} <span style="font-size:11px; color:#94A3B8;">({subtitle})</span></div>
+                <div class="index-card-value">{idx.get('value', '-')}</div>
+                <div class="{color_cls}">{arrow} {chg} &nbsp; {chgpct}</div>
+                <div class="index-card-sub">거래량 {vol}</div>
+            </div>
+            """, unsafe_allow_html=True)
+            
     st.markdown("<br>", unsafe_allow_html=True)
 
     c4, c5, c6 = st.columns(3)
-    for col, key in [(c4, "usdkrw"), (c5, "gold"), (c6, "wti")]:
-        render_index_card(col, key, indices.get(key, {}), show_volume=False)
-
-    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-    st.markdown(
-        "<div class='dash-section-title'>💰 투자자별 수급 동향 "
-        "<span style='font-size:11px; color:#94A3B8; font-weight:500;'>(최근 거래일 순매수, 억원)</span></div>",
-        unsafe_allow_html=True
-    )
-    trend = run_with_progress("수급 데이터를 불러오는 중...", fetch_investor_trend)
-
-    def investor_value_html(val):
-        if val is None:
-            return "#94A3B8", "데이터 없음"
-        status = "up" if val > 0 else ("down" if val < 0 else "neutral")
-        color = "#DC2626" if status == "up" else ("#2563EB" if status == "down" else "#64748B")
-        arrow = "▲" if status == "up" else ("▼" if status == "down" else "–")
-        sign = "+" if val > 0 else ""
-        return color, f"{arrow} {sign}{val:,.0f}억"
-
-    if "investor_open" not in st.session_state:
-        st.session_state["investor_open"] = {"kospi": False, "kosdaq": False}
-
-    def render_investor_row(market_label, market_key, sosok, data):
-        items = [("foreign", "외국인"), ("institution", "기관"), ("individual", "개인")]
-        is_open = st.session_state["investor_open"].get(market_key, False)
-        arrow_icon = "▲" if is_open else "▼"
-
-        cells_html = ""
-        for i, (key, name) in enumerate(items):
-            color, text = investor_value_html((data or {}).get(key))
-            border = "border-left:1px solid #E5E7EB;" if i > 0 else ""
-            cells_html += (
-                f'<div style="flex:1;text-align:center;padding:0 6px;{border}">'
-                f'<span style="font-size:12.5px;color:#64748B;font-weight:600;">{name}</span>'
-                f'<span style="font-size:14px;font-weight:800;color:{color};margin-left:6px;">{text}</span>'
-                f'</div>'
-            )
-
-        border_bottom = "border-radius:8px 8px 0 0;" if is_open else "border-radius:8px;"
-        row_html = (
-            f'<div class="inv-row-{market_key}" style="display:flex;align-items:center;background:#FFFFFF;border:1px solid #E2E8F0;'
-            f'{border_bottom}padding:10px 16px;margin-bottom:0;min-height:44px;box-sizing:border-box; transition:all 0.2s ease;">'
-            f'<div style="font-size:13px;font-weight:800;color:#0F172A;min-width:50px;">{market_label}</div>'
-            f'<div style="display:flex;flex:1;align-items:center;">{cells_html}</div>'
-            f'<div style="font-size:11px;color:#94A3B8;margin-left:8px;">{arrow_icon}</div>'
-            f'</div>'
-        )
-
-        st.markdown(row_html, unsafe_allow_html=True)
-        
-        if st.button(" ", key=f"inv_btn_{market_key}", use_container_width=True, help=f"{market_label} 수급 추이 토글하기"):
-            st.session_state["investor_open"][market_key] = not is_open
-            st.rerun()
-
-        br_css = "8px 8px 0 0" if is_open else "8px"
-        
-        st.markdown(f"""
-        <style>
-        div.st-key-inv_btn_{market_key} {{
-            margin-top: -44px !important;
-            position: relative;
-            z-index: 10;
-        }}
-        div.st-key-inv_btn_{market_key} button {{
-            height: 44px !important; width: 100% !important;
-            background: transparent !important; border: none !important; box-shadow: none !important;
-            border-radius: {br_css} !important; cursor: pointer !important; padding: 0 !important; transition: none !important;
-        }}
-        div.st-key-inv_btn_{market_key} button:hover,
-        div.st-key-inv_btn_{market_key} button:active,
-        div.st-key-inv_btn_{market_key} button:focus {{
-            background: transparent !important; box-shadow: none !important; outline: none !important; border: none !important;
-        }}
-        div.st-key-inv_btn_{market_key} button * {{
-            display: none !important; color: transparent !important;
-        }}
-        </style>
-        """, unsafe_allow_html=True)
-
-        if is_open:
-            monthly = run_with_progress(f"{market_label} 월별 수급 불러오는 중...", fetch_investor_trend_monthly, sosok)
-            if not monthly:
-                st.markdown(
-                    '<div style="border:1px solid #E2E8F0;border-top:none;border-radius:0 0 8px 8px;'
-                    'padding:12px 16px;font-size:12px;color:#94A3B8;">데이터를 불러올 수 없습니다.</div>',
-                    unsafe_allow_html=True
-                )
-            else:
-                monthly_desc = list(reversed(monthly))
-                investor_colors = {"외국인": "#DC2626", "기관": "#2563EB", "개인": "#16A34A"}
-                max_abs = max(abs(r[k]) for r in monthly_desc for k in ["외국인", "기관", "개인"]) or 1
-
-                header_html = (
-                    '<div style="border:1px solid #E2E8F0;border-top:none;padding:10px 12px 6px 12px;">'
-                    '<div style="display:grid;grid-template-columns:48px repeat(3,1fr);gap:4px;'
-                    'font-size:11px;font-weight:700;padding-bottom:6px;border-bottom:1px solid #F1F5F9;">'
-                    '<div style="color:#94A3B8;">날짜</div>'
-                    '<div style="text-align:center;color:#DC2626;">외국인</div>'
-                    '<div style="text-align:center;color:#2563EB;">기관</div>'
-                    '<div style="text-align:center;color:#16A34A;">개인</div>'
-                    '</div></div>'
-                )
-                st.markdown(header_html, unsafe_allow_html=True)
-
-                for row_d in monthly_desc:
-                    date_lbl = row_d["날짜"]
-                    cols_m = st.columns([1, 3, 3, 3])
-                    with cols_m[0]:
-                        st.markdown(
-                            f'<div style="font-size:11px;font-weight:600;color:#475569;padding-top:5px;">{date_lbl}</div>',
-                            unsafe_allow_html=True
-                        )
-                    for ci, inv_key in enumerate(["외국인", "기관", "개인"]):
-                        val = row_d[inv_key]
-                        color = investor_colors[inv_key]
-                        bar_w = int(abs(val) / max_abs * 100)
-                        sign = "+" if val > 0 else ""
-                        val_str = f"{sign}{val:,.0f}억"
-                        bar_color = color if val >= 0 else color + "88"
-                        with cols_m[ci + 1]:
-                            st.markdown(f"""
-                            <div style="padding:3px 0;">
-                                <div style="font-size:11px;font-weight:700;color:{color};text-align:center;margin-bottom:2px;">{val_str}</div>
-                                <div style="background:#F1F5F9;border-radius:3px;height:6px;">
-                                    <div style="width:{bar_w}%;background:{bar_color};border-radius:3px;height:6px;"></div>
-                                </div>
-                            </div>
-                            """, unsafe_allow_html=True)
-
-                st.markdown(
-                    '<div style="border:1px solid #E2E8F0;border-top:none;border-radius:0 0 8px 8px;height:8px;"></div>',
-                    unsafe_allow_html=True
-                )
-
-        st.markdown("<div style='margin-bottom:8px;'></div>", unsafe_allow_html=True)
-
-    render_investor_row("코스피", "kospi", "01", trend.get("kospi"))
-    render_investor_row("코스닥", "kosdaq", "02", trend.get("kosdaq"))
-
-    if all(v is None for v in (trend.get("kospi") or {}).values()) and all(v is None for v in (trend.get("kosdaq") or {}).values()):
-        st.caption("⚠️ 네이버 금융 수급 데이터를 일시적으로 불러오지 못했습니다. 새로고침을 눌러 다시 시도해보세요.")
+    cards2 = [(c4, indices.get("usdkrw", {})), (c5, indices.get("gold", {})), (c6, indices.get("wti", {}))]
+    for col, idx in cards2:
+        label    = idx.get("name", "-")
+        subtitle = idx.get("subtitle", "")
+        status = idx.get("status", "neutral")
+        arrow  = index_arrow(status)
+        chg    = idx.get("change", "-")
+        chgpct = idx.get("change_pct", "")
+        color_cls = index_color_class(status)
+        with col:
+            st.markdown(f"""
+            <div class="index-card" style="background:#FFFFFF;">
+                <div class="index-card-title">{label} <span style="font-size:11px; color:#94A3B8;">({subtitle})</span></div>
+                <div class="index-card-value">{idx.get('value', '-')}</div>
+                <div class="{color_cls}">{arrow} {chg} &nbsp; {chgpct}</div>
+            </div>
+            """, unsafe_allow_html=True)
 
     st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
     st.markdown("<div class='dash-section-title'>🔥 오늘의 핫 섹터 TOP 10</div>", unsafe_allow_html=True)
@@ -1544,7 +1055,7 @@ def render_dashboard():
     st.markdown("""
         <div style='background:#F0F9FF; border:1px solid #BAE6FD; border-radius:8px; padding:14px 20px; font-size:13px; color:#374151; line-height:1.7; margin-top:20px;'>
             💡 <b>데이터 안내</b> &nbsp;|&nbsp;
-            시장 지수, 수급 동향 및 업종 테마는 <b>네이버 금융</b> 실시간 데이터를 기반으로 합니다. 시장 개장 시간(09:00~15:30) 외에는 전일 종가/마감 기준으로 표시될 수 있습니다.
+            시장 지수 및 업종 테마는 <b>네이버 금융</b> 실시간 데이터를 기반으로 합니다. 시장 개장 시간(09:00~15:30) 외에는 전일 종가 기준으로 표시될 수 있습니다.
         </div>
     """, unsafe_allow_html=True)
 
@@ -1552,94 +1063,87 @@ def render_dashboard():
 # 🤖 AI 종목 진단 엔진
 # =========================
 def calc_ai_scores(per, pbr, roe, debt, drop_pct, div):
-    if debt < 0:           health = 50   
-    elif debt == 0:        health = 100  
-    elif debt <= 30:       health = 100
-    elif debt <= 60:       health = 85
-    elif debt <= 100:      health = 68
-    elif debt <= 150:      health = 50
-    elif debt <= 200:      health = 33
-    elif debt <= 300:      health = 18
-    else:                  health = 5
+    """재무 데이터 기반 4개 영역 점수 계산 (0~100점) — 타이트 기준"""
 
-    if pbr > 0:  
-        if pbr <= 0.4:   health = min(100, health + 8)
-        elif pbr <= 0.8: health = min(100, health + 4)
-        elif pbr >= 2.5: health = max(0,   health - 8)
-        elif pbr >= 1.5: health = max(0,   health - 4)
+    # 1. 재무 건전성 (부채비율 중심 — 빡빡 기준)
+    if debt <= 30:        health = 100
+    elif debt <= 60:      health = 85
+    elif debt <= 100:     health = 68
+    elif debt <= 150:     health = 50
+    elif debt <= 200:     health = 33
+    elif debt <= 300:     health = 18
+    else:                 health = 5
 
-    if roe == -999:  growth = 16   
-    elif roe >= 25:  growth = 100
-    elif roe >= 20:  growth = 85
-    elif roe >= 15:  growth = 65
-    elif roe >= 10:  growth = 42
-    elif roe >= 5:   growth = 22
-    elif roe >= 0:   growth = 10
-    else:            growth = 3   
+    # PBR 보정 (+/- 8점) — 순자산 대비 고평가 여부 반영
+    if pbr <= 0.4:    health = min(100, health + 8)
+    elif pbr <= 0.8:  health = min(100, health + 4)
+    elif pbr >= 2.5:  health = max(0,   health - 8)
+    elif pbr >= 1.5:  health = max(0,   health - 4)
 
-    if drop_pct == 0.0:        pass           
-    elif drop_pct <= -40:      growth = min(100, growth + 18)
-    elif drop_pct <= -30:      growth = min(100, growth + 12)
-    elif drop_pct <= -20:      growth = min(100, growth + 6)
-    elif drop_pct <= -10:      growth = min(100, growth + 2)
-    elif drop_pct < 0:         growth = min(100, growth + 1)  
-    else:                      growth = max(0,   growth - 8)  
+    # 2. 성장성 (ROE 기준 — 15% 이상부터 의미있는 점수)
+    if roe >= 25:     growth = 100
+    elif roe >= 20:   growth = 88
+    elif roe >= 15:   growth = 73
+    elif roe >= 10:   growth = 52
+    elif roe >= 5:    growth = 32
+    elif roe >= 0:    growth = 15
+    else:             growth = 3
 
-    if per == 0.0:    profit = 30   
-    elif per < 0:     profit = 10   
-    elif per <= 4:    profit = 100
-    elif per <= 6:    profit = 88
-    elif per <= 8:    profit = 73
-    elif per <= 10:   profit = 58
-    elif per <= 13:   profit = 43
-    elif per <= 18:   profit = 28
-    elif per <= 25:   profit = 15
-    else:             profit = 5
+    # 52주 하락률 타이밍 보정 (+/- 12점)
+    if drop_pct <= -40:   growth = min(100, growth + 12)
+    elif drop_pct <= -30: growth = min(100, growth + 8)
+    elif drop_pct <= -20: growth = min(100, growth + 4)
+    elif drop_pct <= -10: growth = min(100, growth + 1)
+    elif drop_pct >= 0:   growth = max(0,   growth - 8)
 
-    if roe != -999:
-        if roe >= 20:   profit = min(100, profit + 10)
-        elif roe >= 15: profit = min(100, profit + 6)
-        elif roe >= 10: profit = min(100, profit + 2)
-        elif roe < 5:   profit = max(0,   profit - 10)
+    # 3. 수익성 (PER 중심 — 한국 평균 PER 10~12배 감안해 타이트하게)
+    if per <= 4:       profit = 100
+    elif per <= 6:     profit = 88
+    elif per <= 8:     profit = 73
+    elif per <= 10:    profit = 58
+    elif per <= 13:    profit = 43
+    elif per <= 18:    profit = 28
+    elif per <= 25:    profit = 15
+    else:              profit = 5
 
-    if div >= 8.0:        dividend = 100  
-    elif div >= 5.0:      dividend = 70   
-    elif div >= 3.5:      dividend = 50   
-    elif div >= 2.5:      dividend = 35   
-    elif div >= 1.5:      dividend = 18   
-    elif div >= 0.5:      dividend = 7    
+    # ROE 보정 (+/- 10점)
+    if roe >= 20:    profit = min(100, profit + 10)
+    elif roe >= 15:  profit = min(100, profit + 6)
+    elif roe >= 10:  profit = min(100, profit + 2)
+    elif roe < 5:    profit = max(0,   profit - 10)
+
+    # 4. 배당 매력 (3% 이상부터 진짜 매력 구간)
+    if div >= 6.0:        dividend = 100
+    elif div >= 4.0:      dividend = 82
+    elif div >= 3.0:      dividend = 65
+    elif div >= 2.0:      dividend = 45
+    elif div >= 1.0:      dividend = 25
+    elif div >= 0.1:      dividend = 10
     else:                 dividend = 0
 
-    if div == 0.0:
-        total = int(health * 0.37 + profit * 0.37 + growth * 0.26)
-    else:
-        total = int(health * 0.30 + profit * 0.30 + growth * 0.25 + dividend * 0.15)
-
+    # 종합 점수 (가중 평균: 건전성 30%, 수익성 30%, 성장 25%, 배당 15%)
+    total = int(health * 0.30 + profit * 0.30 + growth * 0.25 + dividend * 0.15)
     total = max(0, min(100, total))
 
     return {
-        "total":    total,
-        "health":   int(health),
-        "growth":   int(growth),
-        "profit":   int(profit),
+        "total": total,
+        "health": int(health),
+        "growth": int(growth),
+        "profit": int(profit),
         "dividend": int(dividend),
     }
 
 def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_label):
+    """AI 종합 점수 UI 렌더링 (점수 계산만, API 호출 없음)"""
     scores = calc_ai_scores(per, pbr, roe, debt, drop_pct, div)
-    total  = scores["total"]
+    total = scores["total"]
 
+    # 총점 색상
     if total >= 85:   total_color = "#7C3AED"; total_label = "최우량"
     elif total >= 70: total_color = "#2563EB"; total_label = "우량"
     elif total >= 55: total_color = "#16A34A"; total_label = "양호"
     elif total >= 40: total_color = "#D97706"; total_label = "보통"
     else:             total_color = "#DC2626"; total_label = "주의"
-
-    grade_badge = (
-        f'<span style="font-size:11px; background:#EEF2FF; color:#4F46E5; '
-        f'border-radius:4px; padding:2px 7px; margin-left:8px; font-weight:600;">'
-        f'{grade_label}</span>'
-    ) if grade_label else ""
 
     def score_bar(score):
         if score >= 80:   bar_color = "#7C3AED"
@@ -1668,7 +1172,7 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         '<div style="font-size:11px; color:#94A3B8;">/ 100점</div>'
         '</div>'
         '<div>'
-        '<div style="font-size:14px; font-weight:700; color:#0F172A;">AI 종합 점수' + grade_badge + '</div>'
+        '<div style="font-size:14px; font-weight:700; color:#0F172A;">AI 종합 점수</div>'
         '<div style="font-size:12px; color:' + total_color + '; font-weight:600;">● ' + total_label + '</div>'
         '</div></div>'
         '<div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">'
@@ -1693,10 +1197,7 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
     st.markdown(html, unsafe_allow_html=True)
 
 def render_recommendations():
-    st.header(
-        "추천 종목",
-        help="""💡 **[추천 종목 엔진 목표]**\n\n단순히 재무제표만 좋은 기업을 찾는 것이 아닙니다.\n안정적인 실적과 고배당 매력을 갖춘 '우량주' 중에서도,\n최근 52주 고점 대비 유의미하게 하락하여 **'안전 마진'이 확보된 진입하기 좋은 저평가 종목**만을 엄선합니다."""
-    )
+    st.header("추천 종목")
     st.markdown("<hr style='margin: 10px 0 15px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
 
     st.markdown("""
@@ -1728,6 +1229,9 @@ def render_recommendations():
 
     screener_df = load_screener_df()
 
+    # -------------------------------------------------------------
+    # 💡 여기서 팅겨내던 기존 방식을 지우고, 한방에 스캔하는 로직으로 변경
+    # -------------------------------------------------------------
     high52_map = load_high52_map()
     if high52_map:
         st.success(f"✅ 스크리너 CSV 고점 데이터 사용 중 — {len(high52_map):,}종목 로드됨 (네이버 개별 호출 최소화)")
@@ -1738,6 +1242,7 @@ def render_recommendations():
         scan_label = "🚀 퀀트 스캔 실행 (네이버 실시간 API)"
         scan_workers = 5
 
+    # 데이터가 비어있으면 텍스트 변경
     if screener_df.empty:
         st.warning("⚠️ 저장된 전체 시장 데이터가 없습니다. 스캔 버튼 클릭 시 '전체 시장 스캔'이 1단계로 자동 진행됩니다. (약 15초 추가 소요)")
         scan_label = "🚀 전체 시장 스캔 및 추천 스캔 원클릭 실행"
@@ -1745,6 +1250,7 @@ def render_recommendations():
     btn_scan = st.button(scan_label, use_container_width=True)
 
     if btn_scan:
+        # ✅ 1단계: 시장 데이터가 없으면 먼저 알아서 스크리너 동작을 수행
         if screener_df.empty:
             pb_init = st.progress(0, text="[1/2] 전체 시장 데이터 스캔 준비 중...")
             try:
@@ -1760,7 +1266,7 @@ def render_recommendations():
                 if not temp_df.empty:
                     temp_df.to_csv("saved_screener_data.csv", index=False, encoding='utf-8-sig')
                     st.session_state['shared_screener_df'] = temp_df
-                    screener_df = temp_df
+                    screener_df = temp_df  # 방금 긁어온 데이터를 바로 이어받음!
                 else:
                     st.error("통신 지연으로 시장 스캔에 실패했습니다. 다시 시도해주세요.")
                     st.stop()
@@ -1769,6 +1275,7 @@ def render_recommendations():
                 st.error(f"스캔 실패: {e}")
                 st.stop()
 
+        # ✅ 2단계: 원래 하려던 추천 종목 필터링 및 52주 고점 분석 진행
         load_high52_map.clear()  
         high52_map = load_high52_map()
 
@@ -1783,7 +1290,7 @@ def render_recommendations():
             (~df['종목명'].astype(str).str.contains(finance_keywords, regex=True, na=False))
         )
         val_df = df[cond].copy()
-        
+       
         if val_df.empty:
             st.warning("현재 시장 데이터 기준, 최소 요건(D급)을 통과한 종목조차 없습니다. 스크리너 데이터를 갱신해주세요.")
         else:
@@ -1818,6 +1325,7 @@ def render_recommendations():
             else:
                 st.warning("분석 결과 고점 대비 유의미하게 하락한 종목이 없습니다.")
 
+    # 제어판 및 종목 카드 출력 UI (수정 없음)
     if 'reco_raw_data' in st.session_state and not st.session_state['reco_raw_data'].empty:
         st.markdown("<hr style='margin: 25px 0 20px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
         st.markdown("<h4 style='font-size: 16px; margin-bottom:15px;'>🎛️ 추천 종목 제어판 (실시간 필터링)</h4>", unsafe_allow_html=True)
@@ -1961,12 +1469,10 @@ SCREENER_PRESETS = {
 }
 
 def render_screener():
-    st.header(
-        "종목 스크리너",
-        help="""💡 **[종목 스크리너 안내]**\n\n네이버 금융의 전체 시장 데이터를 실시간으로 스캔하여 원하는 조건(PER, PBR, ROE, 배당수익률 등)에 맞는 종목을 빠르게 필터링합니다.\n\n나만의 맞춤형 가치주를 직접 발굴해 보세요."""
-    )
+    st.header("종목 스크리너")
     st.markdown("<hr style='margin: 10px 0 15px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
 
+    # 탭 디자인 부분
     preset_names = list(SCREENER_PRESETS.keys())
     selected_preset = st.radio("필터 단계", preset_names, horizontal=True, key="screener_preset", label_visibility="collapsed")
     preset = SCREENER_PRESETS[selected_preset]
@@ -1977,6 +1483,7 @@ def render_screener():
         min_div = preset['div']; min_roe = preset['roe']
         max_debt = preset['debt']; use_div = preset['use_div']
     else:
+        # 💡 [핵심 UI 수정] 직접 설정일 때 검색창은 분리하고 숫자 5개만 황금비율로 배치!
         st.markdown("<div style='margin-top: 15px; margin-bottom: 5px;'><span style='font-weight: 700; color: #1E293B; font-size: 14px;'>⚙️ 나만의 상세 지표 커스텀 설정</span></div>", unsafe_allow_html=True)
         c1, c2, c3, c4, c5 = st.columns(5)
         with c1: max_per = st.number_input("PER 이하 (배)", value=15.0, step=0.5, format="%.1f")
@@ -2086,7 +1593,6 @@ def render_screener():
                     load_high52_map.clear()
                     if 'reco_raw_data' in st.session_state:
                         del st.session_state['reco_raw_data']
-                
                     matched = int(mask_h.sum())
                     markets_done = " + ".join(maps.keys())
                     st.success(f"✅ 52주 고점 매칭 완료! ({markets_done}) {matched}종목 업데이트되었습니다. 추천 종목 탭에서 재스캔 시 새 데이터가 바로 적용됩니다.")
@@ -2099,6 +1605,7 @@ def render_screener():
         ETF_KEYWORDS = 'TIGER|KODEX|ARIRANG|KBSTAR|HANARO|KOSEF|TREX|ACE|SOL|RISE|ETF|인버스|레버리지|선물|리츠|REIT|인덱스|TR$'
         df = df[~df['종목명'].str.contains(ETF_KEYWORDS, regex=True, case=False, na=False)]
 
+        # 💡 [UI 수정] 검색창을 설정 탭 안이 아닌, 하단 결과표 컨트롤러 영역으로 독립 배치!
         col_tools1, col_tools2 = st.columns([3, 2])
         with col_tools1:
             with st.container(key="market_filter_box"):
@@ -2132,7 +1639,7 @@ def render_screener():
         else:
             cond = (df['PER'] <= max_per) & (df['PER'] > 0) & (df['PBR'] <= max_pbr) & (df['PBR'] > 0) & (df['ROE'] >= min_roe) & (df['부채비율'] <= max_debt) & (df['부채비율'] >= 0)
             if use_div:
-                cond = cond & (df['배당수익률'] >= min_div)
+                 cond = cond & (df['배당수익률'] >= min_div)
             if exclude_finance:
                 cond = cond & (~df['종목명'].str.contains(finance_keywords, regex=True, na=False))
             result_df = df[cond].sort_values('ROE', ascending=False).reset_index(drop=True)
@@ -2151,24 +1658,18 @@ def _to_float_safe(val):
         return 0.0
 
 def get_ai_diagnosis_inputs(code, df_annual):
+    """기업 재무 분석 탭에서 AI 진단에 필요한 PER/PBR/ROE/부채비율/52주 하락률/배당수익률을 수집.
+    PER·PBR·ROE·부채비율은 FnGuide 최신 연간 데이터를 우선 사용하고,
+    배당수익률·52주 하락률(고점대비%)은 저장된 스크리너 데이터(추천 종목 탭과 동일 소스)에서 보완한다."""
     code = normalize_kr_code(code)
-    per, pbr, roe, debt, div, drop_pct = 0.0, 0.0, -999.0, -1.0, 0.0, 0.0
+    per, pbr, roe, debt, div, drop_pct = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     if df_annual is not None and not df_annual.empty:
         latest = df_annual.iloc[-1]
-        if 'PER' in df_annual.columns:
-            v = _to_float_safe(latest['PER'])
-            per = v  
-        if 'PBR' in df_annual.columns:
-            pbr = _to_float_safe(latest['PBR'])
-        if 'ROE' in df_annual.columns:
-            raw = latest['ROE']
-            if pd.notna(raw) and str(raw).strip() not in ('', '-', 'nan'):
-                roe = _to_float_safe(raw)   
-        if '부채비율' in df_annual.columns:
-            raw = latest['부채비율']
-            if pd.notna(raw) and str(raw).strip() not in ('', '-', 'nan'):
-                debt = _to_float_safe(raw)  
+        if 'PER' in df_annual.columns: per = _to_float_safe(latest['PER'])
+        if 'PBR' in df_annual.columns: pbr = _to_float_safe(latest['PBR'])
+        if 'ROE' in df_annual.columns: roe = _to_float_safe(latest['ROE'])
+        if '부채비율' in df_annual.columns: debt = _to_float_safe(latest['부채비율'])
 
     try:
         screener_df = load_screener_df()
@@ -2179,29 +1680,19 @@ def get_ai_diagnosis_inputs(code, df_annual):
                 if '배당수익률' in row.index and pd.notna(row['배당수익률']):
                     div = _to_float_safe(row['배당수익률'])
                 if '고점대비(%)' in row.index and pd.notna(row['고점대비(%)']):
-                    drop_pct = -abs(_to_float_safe(row['고점대비(%)']))
-                if per == 0.0 and 'PER' in row.index and pd.notna(row['PER']):
-                    per = _to_float_safe(row['PER'])
-                if pbr == 0.0 and 'PBR' in row.index and pd.notna(row['PBR']):
-                    pbr = _to_float_safe(row['PBR'])
-                if roe == -999.0 and 'ROE' in row.index and pd.notna(row['ROE']):
-                    raw_roe = row['ROE']
-                    if str(raw_roe).strip() not in ('', '-', 'nan'):
-                        roe = _to_float_safe(raw_roe)
-                if debt < 0 and '부채비율' in row.index and pd.notna(row['부채비율']):
-                    raw_debt = row['부채비율']
-                    if str(raw_debt).strip() not in ('', '-', 'nan'):
-                        debt = _to_float_safe(raw_debt)
+                    drop_pct = _to_float_safe(row['고점대비(%)'])
+                # FnGuide에서 못 가져온 값은 스크리너 데이터로 보완
+                if per == 0.0 and 'PER' in row.index and pd.notna(row['PER']): per = _to_float_safe(row['PER'])
+                if pbr == 0.0 and 'PBR' in row.index and pd.notna(row['PBR']): pbr = _to_float_safe(row['PBR'])
+                if roe == 0.0 and 'ROE' in row.index and pd.notna(row['ROE']): roe = _to_float_safe(row['ROE'])
+                if debt == 0.0 and '부채비율' in row.index and pd.notna(row['부채비율']): debt = _to_float_safe(row['부채비율'])
     except Exception:
         pass
 
     return per, pbr, roe, debt, drop_pct, div
 
 def render_fnguide():
-    st.header(
-        "기업 재무 분석",
-        help="""💡 **[기업 재무 분석 안내]**\n\n특정 종목의 상세한 재무 상태를 분석합니다.\n\nFnGuide 기반의 최신 연간/분기 실적 흐름, 매출 및 이익 성장률(YoY, QoQ), 증권사 목표주가 컨센서스와 통합 AI 종합 진단 결과를 한눈에 확인할 수 있습니다."""
-    )
+    st.header("기업 재무 분석")
     st.markdown("<hr style='margin: 10px 0 25px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
 
     col1, col2, col3 = st.columns([1, 1, 4])
@@ -2210,373 +1701,27 @@ def render_fnguide():
     with col2:
         search_btn = st.button("🔍 조회", use_container_width=True)
 
-    # 조회 버튼 클릭 시 session_state에 코드 저장 → 위젯 조작시 리렌더링에도 유지
     if search_btn and code:
-        st.session_state['fnguide_code'] = normalize_kr_code(code)
+        code = normalize_kr_code(code)
+        with st.spinner("에프앤가이드(FnGuide) 서버에서 데이터를 분석 중입니다..."):
+            draw_fnguide_details(code)
 
-    active_code = st.session_state.get('fnguide_code', '')
-
-    if active_code:
-        code = active_code
-
-        # 코드가 바뀌었을 때만 데이터 재조회 (spinner는 첫 조회 시에만)
-        cache_key = f'fnguide_result_{code}'
-        if search_btn or cache_key not in st.session_state:
-            with st.spinner("에프앤가이드(FnGuide) 서버에서 데이터를 분석 중입니다..."):
-                _info = fetch_company_info_fnguide(code)
-                _df_annual, _ = fetch_fnguide_data(code)
-                _per_ai, _pbr_ai, _roe_ai, _debt_ai, _drop_pct_ai, _div_ai = get_ai_diagnosis_inputs(code, _df_annual)
-                st.session_state[cache_key] = {
-                    'info': _info,
-                    'per_ai': _per_ai, 'pbr_ai': _pbr_ai, 'roe_ai': _roe_ai,
-                    'debt_ai': _debt_ai, 'drop_pct_ai': _drop_pct_ai, 'div_ai': _div_ai,
-                }
-
-        cached = st.session_state[cache_key]
-        info        = cached['info']
-        per_ai      = cached['per_ai']
-        pbr_ai      = cached['pbr_ai']
-        roe_ai      = cached['roe_ai']
-        debt_ai     = cached['debt_ai']
-        drop_pct_ai = cached['drop_pct_ai']
-        div_ai      = cached['div_ai']
-
-        draw_fnguide_details(code)
-
-        if info['name'] != "알 수 없음":
-            st.markdown("<hr style='margin:20px 0 16px 0; border-color:#E5E7EB;'>", unsafe_allow_html=True)
-            st.markdown("<h4 style='font-size:16px; margin-bottom:0;'>🤖 AI 종목 진단</h4>", unsafe_allow_html=True)
-            render_ai_diagnosis(info['name'], code, per_ai, pbr_ai, roe_ai, debt_ai, drop_pct_ai, div_ai, "")
-            if drop_pct_ai == 0.0 and div_ai == 0.0:
-                st.caption("ℹ️ 배당수익률·52주 하락률은 '종목 스크리너' 탭에서 전체 데이터를 한 번 불러온 종목에 한해 정확히 반영됩니다. (해당 데이터가 없으면 0으로 처리되어 점수가 보수적으로 나올 수 있습니다)")
-
-        # ── 분할매수 전략 계산기 ─────────────────────────────────────────────
-        st.markdown("<hr style='margin:24px 0 16px 0; border-color:#E5E7EB;'>", unsafe_allow_html=True)
-        st.markdown("<h4 style='font-size:16px; margin-bottom:4px;'>📐 분할매수 전략 계산기</h4>", unsafe_allow_html=True)
-        st.markdown(
-            "<p style='font-size:12px; color:#64748B; margin-bottom:16px;'>"
-            "1차 진입가(또는 현재가)를 입력하면 펀더멘털·낙폭·이동평균 기반으로 "
-            "2차·3차 진입가와 비중·평균단가·목표가·손절가를 자동 산출합니다.</p>",
-            unsafe_allow_html=True,
-        )
-
-        # ── 비중 프리셋 선택 ──────────────────────────────────────────────────
-        _PRESETS = {
-            "🎯 공격형 (20:30:50)": (20, 30, 50),
-            "⚖️ 표준형 (25:35:40)": (25, 35, 40),
-            "🛡️ 보수형 (20:40:40)": (20, 40, 40),
-            "✏️ 직접 입력":          None,
-        }
-        preset_choice = st.radio(
-            "분할 비중 프리셋",
-            list(_PRESETS.keys()),
-            index=0,
-            horizontal=True,
-            key=f"preset_{code}",
-            help="3차까지 하락이 왔을 때 실탄이 가장 많은 공격형(20:30:50)이 평균단가 절감 효과가 가장 큽니다."
-        )
-
-        if _PRESETS[preset_choice] is not None:
-            _pw1, _pw2, _pw3 = _PRESETS[preset_choice]
-        else:
-            _pc1, _pc2, _pc3 = st.columns(3)
-            with _pc1:
-                _pw1 = st.number_input("1차 비중 (%)", min_value=5, max_value=60, value=20, step=5, key=f"w1_{code}")
-            with _pc2:
-                _pw2 = st.number_input("2차 비중 (%)", min_value=5, max_value=60, value=30, step=5, key=f"w2_{code}")
-            with _pc3:
-                _pw3 = st.number_input("3차 비중 (%)", min_value=5, max_value=60, value=50, step=5, key=f"w3_{code}")
-            _total = _pw1 + _pw2 + _pw3
-            if _total != 100:
-                st.warning(f"⚠️ 비중 합계가 {_total}%입니다. 합계가 100%가 되도록 조정해주세요.")
-
-        # ── 실시간 현재가 자동 세팅 ─────────────────────────────────────────
-        @st.cache_data(ttl=60, show_spinner=False)
-        def _fetch_cur_price_for_fill(stock_code):
-            try:
-                url = f"https://m.stock.naver.com/api/stock/{stock_code}/basic"
-                r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
-                d = r.json()
-                return int(str(d.get("closePrice", "0")).replace(",", ""))
-            except Exception:
-                return 0
-
-        _auto_price = _fetch_cur_price_for_fill(code)
-        _entry1_key = f"entry1_{code}"
-        # 조회 직후(search_btn) 또는 session_state에 아직 없을 때만 자동 세팅
-        if search_btn or _entry1_key not in st.session_state:
-            if _auto_price > 0:
-                st.session_state[_entry1_key] = _auto_price
-
-        # ── 입력 영역 (진입가 / 주 개수 / 총 투자금액 / 계산 버튼) ─────────
-        _c1, _c2, _c3, _c4 = st.columns([1.2, 1, 1, 1.6])
-        with _c1:
-            entry1_input = st.number_input(
-                "1차 진입가 (원)",
-                min_value=0, max_value=10_000_000,
-                value=st.session_state.get(_entry1_key, 0),
-                step=100,
-                key=_entry1_key,
-                help="실시간 현재가가 자동으로 입력됩니다. 직접 수정도 가능합니다.",
-                format="%d",
-            )
-        with _c2:
-            # text_input 사용: 처음엔 완전 빈칸, 0 지울 필요 없이 바로 입력 가능
-            _shares_key = f"shares_text_{code}"
-            _shares_raw = st.text_input(
-                "주 개수 (주)",
-                value="",
-                placeholder="예: 100",
-                key=_shares_key,
-                help="1차 진입 시 매수할 주 수를 입력하세요.",
-            )
-            try:
-                shares_input = max(0, int(_shares_raw.replace(",", "").strip()))
-            except Exception:
-                shares_input = 0
-        with _c3:
-            _total_invest = entry1_input * shares_input
-            st.markdown(
-                f"<div style='padding-top:4px;'>"
-                f"<div style='font-size:12px; color:#64748B; margin-bottom:4px;'>총 투자금액</div>"
-                f"<div style='font-size:20px; font-weight:800; color:#1E293B; letter-spacing:-0.5px;'>"
-                f"{_total_invest:,}"
-                f"<span style='font-size:13px; font-weight:600; color:#64748B;'>원</span>"
-                f"</div>"
-                f"<div style='font-size:10px; color:#94A3B8; margin-top:2px;'>"
-                f"{entry1_input:,}원 × {shares_input:,}주"
-                f"</div></div>",
-                unsafe_allow_html=True,
-            )
-        with _c4:
-            st.markdown("<div style='padding-top:22px;'>", unsafe_allow_html=True)
-            calc_btn = st.button("🧮 전략 계산", key=f"calc_btn_{code}", use_container_width=True)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        # 주 개수 기반 총 투자금액(원) — 이후 계산 로직에서 사용
-        budget_won_from_shares = _total_invest
-
-        if calc_btn and entry1_input > 0:
-            # ── cached 값 로컬 변수로 명시적 바인딩 (스코프 혼동 방지) ──
-            _per_ai      = cached['per_ai']
-            _pbr_ai      = cached['pbr_ai']
-            _roe_ai      = cached['roe_ai']
-            _debt_ai     = cached['debt_ai']
-            _drop_pct_ai = cached['drop_pct_ai']
-            _div_ai      = cached['div_ai']
-
-            # ── 현재가 / 목표가 파악 ──────────────────────────────────────
-            _target_raw = info.get("target", "")
-            _target_price = 0
-            try:
-                _target_price = int(re.sub(r"[^\d]", "", str(_target_raw)))
-            except Exception:
-                _target_price = 0
-
-            _cur_price = _fetch_cur_price_for_fill(code)  # 자동세팅과 동일 캐시 재사용
-            e1 = entry1_input
-
-            # ── ① 고정 % 기반 (2차 -8%, 3차 -17%) ──────────────────────
-            # 기존 -8%/-17% 은 충분한 낙폭 간격을 확보하지 못해 -8%/-17%로 조정
-            e2_fixed = round(e1 * 0.92)   # -8%
-            e3_fixed = round(e1 * 0.83)   # -17%
-
-            # ── ② 고점 대비 낙폭 기반 ───────────────────────────────────
-            # [BUG FIX] 기존 e2_drop = e1*(1-0.10) = e1*0.90 이 e2_fixed(e1*0.92)보다
-            # 낮으므로 방향은 맞지만, e3_drop = e1*0.80 이 e3_fixed(e1*0.83)보다
-            # 낮아 가중평균을 끌어내리는 효과가 있었음.
-            # _drop_pct_ai(음수, 예: -30.0)를 실제 반영하여 추가 낙폭 여지를 계산.
-            e2_drop, e3_drop = 0, 0
-            if _drop_pct_ai != 0.0:
-                # 현재 이미 drop_pct_ai 만큼 빠진 상태 → 추가 하락 여지 10%·20% 적용
-                e2_drop = round(e1 * 0.90)   # 1차 대비 -10%
-                e3_drop = round(e1 * 0.80)   # 1차 대비 -20%
-
-            # ── ③ PBR 적정가 기반 (펀더멘털) ────────────────────────────
-            # [BUG FIX] pbr_ai → _pbr_ai 로 통일 (캐시된 값 사용)
-            e2_fund, e3_fund = 0, 0
-            if _pbr_ai > 0 and _cur_price > 0:
-                _bps_est = _cur_price / _pbr_ai   # BPS 추정치
-                e2_fund = round(_bps_est * 1.0)   # PBR=1.0 수준
-                e3_fund = round(_bps_est * 0.8)   # PBR=0.8 수준 (역사적 저점)
-
-            # ── ④ 이동평균 기반 (기술적) ────────────────────────────────
-            @st.cache_data(ttl=300, show_spinner=False)
-            def _fetch_ma(stock_code):
-                try:
-                    import yfinance as yf
-                    ticker = f"{stock_code}.KS"
-                    df_ma = yf.Ticker(ticker).history(period="90d", interval="1d")
-                    if df_ma.empty:
-                        ticker = f"{stock_code}.KQ"
-                        df_ma = yf.Ticker(ticker).history(period="90d", interval="1d")
-                    closes = df_ma["Close"].dropna()
-                    ma20 = round(closes.tail(20).mean()) if len(closes) >= 20 else 0
-                    ma60 = round(closes.tail(60).mean()) if len(closes) >= 60 else 0
-                    return ma20, ma60
-                except Exception:
-                    return 0, 0
-
-            _ma20, _ma60 = _fetch_ma(code)
-
-            # ── 최종 2·3차 진입가 결정 (4가지 기준 가중 평균) ──────────
-            def _wavg(*candidates, weights=None):
-                vals = [(v, w) for v, w in zip(candidates, weights or [1]*len(candidates)) if v > 0]
-                if not vals:
-                    return 0
-                return round(sum(v * w for v, w in vals) / sum(w for _, w in vals))
-
-            entry2 = _wavg(e2_fixed, e2_drop, e2_fund, _ma20, weights=[1.5, 1.0, 2.0, 1.5])
-            if entry2 == 0: entry2 = e2_fixed
-            entry3 = _wavg(e3_fixed, e3_drop, e3_fund, _ma60, weights=[1.0, 1.5, 2.5, 1.5])
-            if entry3 == 0: entry3 = e3_fixed
-
-            # [BUG FIX] entry2 >= e1 이면 고정% fallback, entry3 >= entry2 이면
-            # entry2 대비 -8% 로 보정 (기존 -9% 하드코딩을 e2_fixed 기반 간격과 일치시킴)
-            if entry2 >= e1:
-                entry2 = e2_fixed
-            if entry3 >= entry2:
-                entry3 = round(entry2 * 0.92)   # entry2 대비 추가 -8%
-
-            # [BUG FIX] 비중 합계가 100이 아닐 때도 평균단가 계산이 올바르도록
-            # 비중 합계 기준으로 나눔 (직접 입력 모드에서 합계 != 100 케이스 방어)
-            W1, W2, W3 = _pw1, _pw2, _pw3
-            _w_total = W1 + W2 + W3
-            if _w_total <= 0:
-                _w_total = 100
-            avg_price = round((e1 * W1 + entry2 * W2 + entry3 * W3) / _w_total)
-
-            # ── 목표가 산출 ───────────────────────────────────────────────
-            if _target_price > 0:
-                target_price = _target_price
-                expected_ret = round((_target_price / avg_price - 1) * 100, 1)
-                target_src   = "증권사 컨센서스"
-            else:
-                # [BUG FIX] 기존 (_cur_price / per_ai) * 15 는 EPS=현재가/PER 이므로
-                # per_ai 가 스크리너 기준이 아닐 때 오차가 큼.
-                # 현재가 기준 목표 PER 15배 → target = e1 * (15 / per_ai) 로 수정
-                # (e1이 현재가에 가깝다는 전제)
-                if _per_ai > 0:
-                    target_price = round(e1 * (15.0 / _per_ai))
-                elif _pbr_ai > 0 and _cur_price > 0:
-                    # PBR 기반: BPS * 1.3 수준
-                    target_price = round((_cur_price / _pbr_ai) * 1.3)
-                else:
-                    target_price = round(avg_price * 1.25)
-                expected_ret = round((target_price / avg_price - 1) * 100, 1)
-                target_src   = "PER 15× 추정" if _per_ai > 0 else ("PBR 1.3× 추정" if _pbr_ai > 0 else "평균단가 +25%")
-
-            # ── 손절가 산출 ───────────────────────────────────────────────
-            # [BUG FIX] stop_loss_pbr = _cur_price / pbr_ai * 0.5 → _pbr_ai 사용,
-            # 0.5 곱셈은 BPS의 50% 수준 — 지나치게 낮을 수 있어 0.7로 완화
-            stop_loss_basic = round(entry3 * 0.90)
-            stop_loss_pbr   = round(_cur_price / _pbr_ai * 0.7) if (_pbr_ai > 0 and _cur_price > 0) else 0
-            # 손절가는 두 기준 중 높은 값(덜 극단적인 값)을 사용
-            stop_loss = max(stop_loss_basic, stop_loss_pbr) if stop_loss_pbr > 0 else stop_loss_basic
-            # 단, 손절가가 entry3보다 높아지는 역전 방지
-            if stop_loss >= entry3:
-                stop_loss = stop_loss_basic
-
-            # 주 개수로 각 차수별 금액 계산 (비중 가중 주 수 배분)
-            _shares_1st = shares_input  # 1차: 입력한 주 개수
-            _w_total_s  = W1 + W2 + W3 if (W1 + W2 + W3) > 0 else 100
-            _shares_2nd = round(_shares_1st * W2 / W1) if W1 > 0 else 0
-            _shares_3rd = round(_shares_1st * W3 / W1) if W1 > 0 else 0
-
-            def _fmt_shares_amt(price, sh):
-                if sh <= 0 or price <= 0: return "-", "-"
-                return f"{sh:,}주", f"{sh * price:,}원"
-
-            budget_won = budget_won_from_shares  # 하위 조건 판단용
-            sh1, am1 = _fmt_shares_amt(e1,     _shares_1st)
-            sh2, am2 = _fmt_shares_amt(entry2, _shares_2nd)
-            sh3, am3 = _fmt_shares_amt(entry3, _shares_3rd)
-
-            def _basis_tags(fixed, drop, fund, ma):
-                tags = []
-                if fixed > 0: tags.append(f"고정%({fixed:,})")
-                if drop  > 0: tags.append(f"낙폭({drop:,})")
-                if fund  > 0: tags.append(f"PBR({fund:,})")
-                if ma    > 0: tags.append(f"MA({ma:,})")
-                return " · ".join(tags)
-
-            basis2    = _basis_tags(e2_fixed, e2_drop, e2_fund, _ma20)
-            basis3    = _basis_tags(e3_fixed, e3_drop, e3_fund, _ma60)
-            ret_color = "#16A34A" if expected_ret >= 0 else "#DC2626"
-            ret_sign  = "+" if expected_ret >= 0 else ""
-
-            # ── 주 개수 안내/수량 표시 HTML (f-string 따옴표 충돌 방지) ──
-            if shares_input > 0:
-                _sh1_html = f'<div style="font-size:11px; color:#6366F1; margin-top:4px;">{sh1} · {am1}</div>'
-                _sh2_html = f'<div style="font-size:11px; color:#475569; margin-top:4px;">{sh2} · {am2}</div>'
-                _sh3_html = f'<div style="font-size:11px; color:#475569; margin-top:4px;">{sh3} · {am3}</div>'
-            else:
-                _sh1_html = '<div style="font-size:10px; color:#94A3B8; margin-top:6px;">📌 주 개수를 입력하면<br>수량·금액이 표시됩니다</div>'
-                _sh2_html = ""
-                _sh3_html = ""
-
-            # 진입가 카드 HTML — 변수를 미리 문자열로 조립 후 삽입 (f-string 충돌 방지)
-            _e2_pct = f"{round((entry2/e1-1)*100,1):+.1f}%"
-            _e3_pct = f"{round((entry3/e1-1)*100,1):+.1f}%"
-            _card_html = (
-                f'''<div style="background:#F8FAFC; border:1px solid #E2E8F0; border-radius:10px; padding:20px; margin-top:8px;">
-              <div style="display:flex; gap:10px; margin-bottom:16px;">
-                <div style="flex:1; background:#EEF2FF; border:1.5px solid #5A4EE5; border-radius:8px; padding:12px; text-align:center;">
-                  <div style="font-size:11px; color:#5A4EE5; font-weight:700; margin-bottom:4px;">1차 진입 · {W1}%</div>
-                  <div style="font-size:18px; font-weight:800; color:#3730A3;">{e1:,}원</div>'''
-                + _sh1_html +
-                f'''</div>
-                <div style="flex:1; background:#FFFFFF; border:1px solid #CBD5E1; border-radius:8px; padding:12px; text-align:center;">
-                  <div style="font-size:11px; color:#475569; font-weight:700; margin-bottom:4px;">2차 진입 · {W2}%</div>
-                  <div style="font-size:18px; font-weight:800; color:#0F172A;">{entry2:,}원</div>
-                  <div style="font-size:10px; color:#94A3B8; margin-top:3px;">({_e2_pct})</div>'''
-                + _sh2_html +
-                f'''</div>
-                <div style="flex:1; background:#FFFFFF; border:1px solid #CBD5E1; border-radius:8px; padding:12px; text-align:center;">
-                  <div style="font-size:11px; color:#475569; font-weight:700; margin-bottom:4px;">3차 진입 · {W3}%</div>
-                  <div style="font-size:18px; font-weight:800; color:#0F172A;">{entry3:,}원</div>
-                  <div style="font-size:10px; color:#94A3B8; margin-top:3px;">({_e3_pct})</div>'''
-                + _sh3_html +
-                '''</div>
-              </div>'''
-            )
-            st.markdown(_card_html + f"""
-              <div style="display:flex; gap:10px; margin-bottom:16px;">
-                <div style="flex:1; background:#F1F5F9; border-radius:8px; padding:10px 12px;">
-                  <div style="font-size:11px; color:#64748B; margin-bottom:3px;">📊 예상 평균단가</div>
-                  <div style="font-size:16px; font-weight:700; color:#1E293B;">{avg_price:,}원</div>
-                  <div style="font-size:10px; color:#94A3B8;">3차 완료 기준 ({W1}:{W2}:{W3} 비중)</div>
-                </div>
-                <div style="flex:1; background:#F0FDF4; border-radius:8px; padding:10px 12px;">
-                  <div style="font-size:11px; color:#16A34A; margin-bottom:3px;">🎯 목표가 ({target_src})</div>
-                  <div style="font-size:16px; font-weight:700; color:#15803D;">{target_price:,}원</div>
-                  <div style="font-size:10px; color:{ret_color}; font-weight:600;">기대수익률 {ret_sign}{expected_ret}%</div>
-                </div>
-                <div style="flex:1; background:#FFF7F7; border-radius:8px; padding:10px 12px;">
-                  <div style="font-size:11px; color:#DC2626; margin-bottom:3px;">🛑 손절가 제안</div>
-                  <div style="font-size:16px; font-weight:700; color:#B91C1C;">{stop_loss:,}원</div>
-                  <div style="font-size:10px; color:#94A3B8;">3차 진입가 대비 {round((stop_loss/entry3-1)*100,1):+.1f}%</div>
-                </div>
-              </div>
-              <div style="background:#FFFFFF; border:1px solid #E2E8F0; border-radius:6px; padding:10px 14px; font-size:11px; color:#475569; line-height:1.9;">
-                <b style="color:#1E293B;">📌 산출 근거</b><br>
-                <b>2차 진입가</b> {entry2:,}원 — {basis2}<br>
-                <b>3차 진입가</b> {entry3:,}원 — {basis3}<br>
-                {'<b>이동평균</b> MA20 ' + f'{_ma20:,}원 / MA60 {_ma60:,}원<br>' if _ma20 > 0 else ''}
-                {'<b>PBR 기반 장부가 추정</b> ' + f'BPS ≈ {round(_cur_price/_pbr_ai):,}원 (현재가 {_cur_price:,}원 ÷ PBR {_pbr_ai:.2f}×)<br>' if _pbr_ai > 0 and _cur_price > 0 else ''}
-                <span style="color:#94A3B8; font-size:10px;">⚠️ 본 수치는 투자 참고용이며 매수·매도 추천이 아닙니다.</span>
-              </div>
-            </div>
-            """, unsafe_allow_html=True)
-
+            # ── 🤖 AI 종목 진단 (추천 종목 탭과 동일 로직 재사용) ──
+            info = fetch_company_info_fnguide(code)
+            df_annual_for_ai, _ = fetch_fnguide_data(code)
+            if info['name'] != "알 수 없음" or not df_annual_for_ai.empty:
+                per_ai, pbr_ai, roe_ai, debt_ai, drop_pct_ai, div_ai = get_ai_diagnosis_inputs(code, df_annual_for_ai)
+                st.markdown("<hr style='margin:20px 0 16px 0; border-color:#E5E7EB;'>", unsafe_allow_html=True)
+                st.markdown("<h4 style='font-size:16px; margin-bottom:0;'>🤖 AI 종목 진단</h4>", unsafe_allow_html=True)
+                render_ai_diagnosis(info['name'], code, per_ai, pbr_ai, roe_ai, debt_ai, drop_pct_ai, div_ai, "")
+                if drop_pct_ai == 0.0 and div_ai == 0.0:
+                    st.caption("ℹ️ 배당수익률·52주 하락률은 '종목 스크리너' 탭에서 전체 데이터를 한 번 불러온 종목에 한해 정확히 반영됩니다. (해당 데이터가 없으면 0으로 처리되어 점수가 보수적으로 나올 수 있습니다)")
 
 def render_dividend():
-    st.header(
-        "실시간 배당 순위",
-        help="""💡 **[실시간 배당 순위 안내]**\n\n현재 주가 기준으로 가장 배당 매력이 높은 종목들을 순위별로 보여줍니다.\n\n'정상만 보기' 필터를 켜면 리츠(REITs)나 배당성향이 비정상적으로 높은(100% 초과) 위험 종목을 자동으로 제외하여 건강한 고배당주를 찾기 쉽습니다."""
-    )
+    st.header("실시간 배당 순위")
     st.markdown("<hr style='margin: 10px 0 25px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
 
+    # ── 1행: 검색창 + 조회 ──
     col_search, col_btn = st.columns([8, 1])
     with col_search:
         search_text = st.text_input(
@@ -2588,6 +1733,7 @@ def render_dividend():
     with col_btn:
         st.button("조회", key="dividend_search_btn", use_container_width=True)
 
+    # ── 2행: 새로고침(좌) | 캡션(중) | 정상 종목만 보기(우 끝) ──
     col_refresh, col_caption2, col_toggle = st.columns([1.5, 5, 1.5])
     with col_refresh:
         if st.button("데이터 새로고침"):
@@ -2603,7 +1749,7 @@ def render_dividend():
         st.markdown("</div>", unsafe_allow_html=True)
 
     df = run_with_progress("마켓 데이터 수집 중...", fetch_dividend_ranking)
-   
+    
     if not df.empty: 
         if isinstance(df.columns, pd.MultiIndex):
             new_cols = []
@@ -2632,31 +1778,7 @@ def render_dividend():
 
         df = df.loc[:, ~df.columns.duplicated()]
 
-        # ✅ 1. 시장 정보 매핑 (스크리너 데이터 활용)
-        screener_df = load_screener_df()
-        if not screener_df.empty and '종목코드' in df.columns:
-            market_map = dict(zip(screener_df['종목코드'], screener_df['시장']))
-            df['시장'] = df['종목코드'].map(market_map).fillna("-")
-        else:
-            df['시장'] = "-"
-
-        # ✅ 2. 컬럼 순서 재배치 (종목코드, 종목명, 시장 순서)
-        cols = list(df.columns)
-        name_col = find_col(df, ["종목명"])
-        
-        front_cols = []
-        if '종목코드' in cols:
-            front_cols.append('종목코드')
-            cols.remove('종목코드')
-        if name_col in cols:
-            front_cols.append(name_col)
-            cols.remove(name_col)
-        if '시장' in cols:
-            front_cols.append('시장')
-            cols.remove('시장')
-            
-        df = df[front_cols + cols]
-
+        # ── 정상 종목 필터 적용 ──
         clean_filter_val = st.session_state.get("dividend_clean_filter", True)
         if clean_filter_val:
             name_col = find_col(df, ["종목명"])
@@ -2672,6 +1794,7 @@ def render_dividend():
                 yield_num = pd.to_numeric(df[yield_col].astype(str).str.replace(r'[^\d.-]', '', regex=True), errors='coerce')
                 df = df[yield_num.isna() | (yield_num <= 30)]
 
+        # ── 검색 필터 적용 ──
         if search_text:
             name_col = find_col(df, ["종목명"])
             code_col = find_col(df, ["종목코드", "코드"])
@@ -2682,6 +1805,7 @@ def render_dividend():
                 mask = mask | df[code_col].astype(str).str.contains(search_text, case=False, na=False)
             df = df[mask]
 
+        # ── 캡션: 2행 중앙에 표시 ──
         with col_caption2:
             st.markdown("<div style='padding-top:8px;'>", unsafe_allow_html=True)
             if search_text:
