@@ -1,0 +1,12 @@
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+.DS_Store
+
+# 캐시성 데이터 (앱 실행 중 자동 생성됨)
+data_*.xlsx
+saved_screener_data.*
+saved_high52_data.*
+watchlist.*
+users.*
+back/
