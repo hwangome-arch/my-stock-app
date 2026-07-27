@@ -2706,6 +2706,19 @@ def render_watchlist():
         "_pinned", ascending=False, kind="stable"
     ).drop(columns="_pinned").reset_index(drop=True)
 
+    # 종목 스크리너를 한 번이라도 불러온 상태면 현재가·PER·PBR·배당수익률을 함께 보여줌
+    # (아래 병렬 조회에서 시장 구분에도 필요해서 여기로 끌어올림)
+    screener_df = load_screener_df()
+    has_live_data = screener_df is not None and not screener_df.empty and '종목코드' in screener_df.columns
+    if has_live_data:
+        screener_df = screener_df.copy()
+        screener_df['종목코드'] = screener_df['종목코드'].astype(str).str.zfill(6)
+        _wl_market_map = (
+            dict(zip(screener_df['종목코드'], screener_df['시장'])) if '시장' in screener_df.columns else {}
+        )
+    else:
+        _wl_market_map = {}
+
     # ── 진입가(1차/2차/3차) 도달 여부 사전 계산 (카드 렌더링 + 상단 요약에 공용 사용) ──
     def _parse_entry(v):
         try:
@@ -2714,12 +2727,38 @@ def render_watchlist():
         except Exception:
             return None
 
+    # ── 관심종목 전체의 현재가/스파크라인/AI점수를 병렬로 미리 조회 (캐시 예열) ──
+    # 예전엔 종목마다 순차적으로 여러 개의 네트워크 호출(현재가·차트·재무데이터)을 했었는데,
+    # 관심종목이 많으면 이게 다 더해져서 페이지 전환할 때마다 체감상 무한 로딩처럼 느껴졌음.
+    # ThreadPoolExecutor로 종목별 조회를 동시에 실행해서 전체 대기시간을 크게 줄임.
     wl_price_cache = {}
+    ai_score_cache = {}
+    sparkline_cache = {}
+    _wl_codes = list(dict.fromkeys(watchlist_df['종목코드'].tolist()))
+
+    def _wl_prefetch_one(code):
+        market = _wl_market_map.get(code)
+        price_info = fetch_live_price_change(code)
+        spark = fetch_watchlist_sparkline_prices(code, market)
+        ai_score = get_ai_total_score(code)
+        return code, price_info, spark, ai_score
+
+    if _wl_codes:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as _wl_executor:
+            _wl_futures = [_wl_executor.submit(_wl_prefetch_one, c) for c in _wl_codes]
+            for _wl_future in concurrent.futures.as_completed(_wl_futures):
+                try:
+                    _code, _price_info, _spark, _ai_score = _wl_future.result()
+                except Exception:
+                    continue
+                wl_price_cache[_code] = _price_info
+                sparkline_cache[_code] = _spark
+                ai_score_cache[_code] = _ai_score
+
     reached_summary = []  # [(종목명, 종목코드, 도달차수, 진입가, 현재가), ...]
     for _, _row in watchlist_df.iterrows():
         _code = _row['종목코드']
-        _live_price, _chg_pct, _chg_amt = fetch_live_price_change(_code)
-        wl_price_cache[_code] = (_live_price, _chg_pct, _chg_amt)
+        _live_price, _chg_pct, _chg_amt = wl_price_cache.get(_code, (None, None, None))
         if _live_price is None or _live_price <= 0:
             continue
         entries = [
@@ -2792,13 +2831,7 @@ def render_watchlist():
             unsafe_allow_html=True,
         )
 
-    # 종목 스크리너를 한 번이라도 불러온 상태면 현재가·PER·PBR·배당수익률을 함께 보여줌
-    screener_df = load_screener_df()
-    has_live_data = screener_df is not None and not screener_df.empty and '종목코드' in screener_df.columns
-    if has_live_data:
-        screener_df = screener_df.copy()
-        screener_df['종목코드'] = screener_df['종목코드'].astype(str).str.zfill(6)
-    else:
+    if not has_live_data:
         st.caption("ℹ️ PER·배당수익률은 '종목 스크리너' 탭에서 전체 데이터를 한 번 불러오면 함께 표시됩니다. (현재가는 실시간으로 조회됩니다)")
 
     st.markdown(
@@ -3022,7 +3055,7 @@ def render_watchlist():
             if not match.empty:
                 live = match.iloc[0]
 
-        ai_total = get_ai_total_score(code)
+        ai_total = ai_score_cache.get(code)
 
         with st.container(border=True, key=f"wl_card_{code}"):
             with st.container(key=f"wl_top_row_{code}"):
@@ -3081,8 +3114,7 @@ def render_watchlist():
                     else:
                         st.markdown("<div style='color:#CBD5E1; font-size:13px;'>AI 종합점수 -</div>", unsafe_allow_html=True)
                 with c_chart:
-                    _wl_market = live.get('시장') if live is not None else None
-                    sp_prices = fetch_watchlist_sparkline_prices(code, _wl_market)
+                    sp_prices = sparkline_cache.get(code, [])
                     st.markdown(
                         f"<div style='display:flex; justify-content:flex-start; padding-top:4px;'>{render_mini_sparkline_svg(sp_prices)}</div>",
                         unsafe_allow_html=True,
