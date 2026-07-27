@@ -1322,7 +1322,7 @@ def render_disclosure_tab(code):
 
 
 def fetch_page_data(sosok, page, headers, cookies):
-    time.sleep(random.uniform(0.2, 0.6))
+    time.sleep(random.uniform(0.1, 0.3))
     url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
     try:
         res = requests.get(url, headers=headers, cookies=cookies, timeout=10)
@@ -1361,7 +1361,7 @@ def fetch_screener_data_generator():
     completed = 0
     failed_pages = []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         future_to_url = {executor.submit(fetch_page_data, s, p, headers, cookies): (s, p) for s, p in urls}
         for future in concurrent.futures.as_completed(future_to_url):
             completed += 1
