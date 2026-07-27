@@ -3432,9 +3432,11 @@ def render_login_page():
             with tab_login:
                 if st.session_state.get("signup_success_msg"):
                     st.success(st.session_state.pop("signup_success_msg"))
-                login_id = st.text_input("아이디", key="login_id", placeholder="아이디")
-                login_pw = st.text_input("비밀번호", type="password", key="login_pw", placeholder="비밀번호")
-                if st.button("로그인", use_container_width=True, key="login_btn"):
+                with st.form("login_form", clear_on_submit=False):
+                    login_id = st.text_input("아이디", key="login_id", placeholder="아이디")
+                    login_pw = st.text_input("비밀번호", type="password", key="login_pw", placeholder="비밀번호")
+                    login_submitted = st.form_submit_button("로그인", use_container_width=True)
+                if login_submitted:
                     if not login_id or not login_pw:
                         st.warning("아이디와 비밀번호를 모두 입력해주세요.")
                     elif authenticate_user(login_id.strip(), login_pw):
