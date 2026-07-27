@@ -12,6 +12,25 @@ import base64
 import difflib
 import numpy as np
 
+# ── 백그라운드 스레드(ThreadPoolExecutor)에서도 안전하게 쓸 수 있는 디버그 정보 저장소 ──
+# st.session_state는 스크립트를 실행하는 메인 스레드 밖(예: 관심종목 페이지의 병렬 조회
+# 워커 스레드)에서 접근하면 Streamlit 공식 문서상 지원되지 않으며, 실제로 이로 인해
+# 스크립트 실행이 멈춰버리는(무한 로딩) 문제가 발생했다. 단순 dict 대입/조회는 CPython의
+# GIL 덕분에 스레드에서 안전하므로, 디버그용 정보는 여기로 옮겨서 저장한다.
+_DEBUG_STORE = {}
+
+# 스크리너 데이터도 관심종목 병렬조회(백그라운드 스레드)에서 읽히므로, session_state와
+# 별개로 여기에도 항상 최신값을 미러링해두고 스레드에서는 이쪽만 사용한다.
+_SCREENER_DF_CACHE = {"df": None}
+
+def _set_shared_screener_df(df):
+    """스크리너 결과 df를 session_state(메인 스레드용)와 모듈 캐시(백그라운드 스레드용)에 동시 반영."""
+    _SCREENER_DF_CACHE["df"] = df
+    try:
+        st.session_state['shared_screener_df'] = df
+    except Exception:
+        pass  # 백그라운드 스레드 등 session_state 접근이 불가능한 상황이면 모듈 캐시만 사용
+
 # ==== 🚀 [테마 강제 고정 로직] ====
 try:
     config_dir = ".streamlit"
@@ -48,6 +67,44 @@ st.set_page_config(page_title="Inventory Manager", page_icon="📦", layout="wid
 # =========================
 def normalize_kr_code(code):
     return re.sub(r"\D", "", str(code)).zfill(6)[:6]
+
+# ── 병렬 조회용 안전 실행 헬퍼 ──────────────────────────────────────────────
+# 문제: concurrent.futures.as_completed(futures)를 타임아웃 없이 쓰면, 스레드
+# 하나라도 응답이 안 오는 상태(클라우드 배포 환경에서 외부 API가 datacenter IP를
+# 느리게/불안정하게 처리하는 경우 등)로 걸리면 메인 스크립트 실행 스레드가 그
+# 자리에서 영원히 멈춘다(= Streamlit 프로세스 전체가 응답 없음 상태가 되어 브라우저
+# 쪽에서 "Connection timed out"으로 나타남). 개별 requests/yfinance 호출에 걸린
+# timeout만으로는 소켓이 완전히 멎어버리는 경우까지 막지 못한다.
+# 해결: as_completed에 전체 상한 시간(overall_timeout)을 걸고, future.result()에도
+# 개별 상한 시간을 걸어서, 무슨 일이 있어도 이 함수가 메인 스레드를 무한정 막지
+# 않도록 한다. 상한을 넘긴 나머지 작업은 결과 없이 건너뛰고(다음 새로고침 때 캐시가
+# 채워지며 자연히 채워짐), 아직 안 끝난 스레드는 shutdown(wait=False)로 기다리지
+# 않고 그냥 백그라운드에 남겨둔 채 진행한다.
+def run_parallel_safe(task_fn, items, max_workers=5, overall_timeout=25, per_result_timeout=10):
+    """
+    task_fn(item) -> (key, result) 형태의 함수를 items 각각에 대해 병렬 실행.
+    반환: {key: result} dict (실패/타임아웃난 항목은 아예 키가 없음)
+    """
+    results = {}
+    if not items:
+        return results
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    try:
+        futures = {executor.submit(task_fn, item): item for item in items}
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=overall_timeout):
+                try:
+                    k, entry = future.result(timeout=per_result_timeout)
+                    if entry is not None:
+                        results[k] = entry
+                except Exception:
+                    continue
+        except concurrent.futures.TimeoutError:
+            pass  # 전체 상한 초과 → 나머지는 건너뛰고 계속 진행
+    finally:
+        executor.shutdown(wait=False)
+    return results
+# ────────────────────────────────────────────────────────────────────────
 
 def run_with_progress(text, func, *args, **kwargs):
     pb = st.progress(0, text=f"🔄 {text}")
@@ -126,17 +183,14 @@ def fetch_market_index_table():
         except Exception:
             return key, None
 
-    result = {}
     all_tasks = (
         [(get_naver, k, m) for k, m in naver_targets.items()] +
         [(get_yfinance, k, m) for k, m in yf_targets.items()]
     )
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(fn, k, m): k for fn, k, m in all_tasks}
-        for future in concurrent.futures.as_completed(futures):
-            k, entry = future.result()
-            if entry:
-                result[k] = entry
+    result = run_parallel_safe(
+        lambda t: t[0](t[1], t[2]), all_tasks,
+        max_workers=6, overall_timeout=20, per_result_timeout=10,
+    )
 
     all_targets = {**naver_targets, **yf_targets}
     return {k: result.get(k, {"name": all_targets[k]["name"], "value": "-", "status": "neutral"})
@@ -165,12 +219,13 @@ def fetch_sparkline_data():
         except:
             return key, []
 
-    result = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(get_history, k, s): k for k, s in targets.items()}
-        for future in concurrent.futures.as_completed(futures):
-            k, closes = future.result()
-            result[k] = closes
+    result = run_parallel_safe(
+        lambda kv: get_history(kv[0], kv[1]), list(targets.items()),
+        max_workers=6, overall_timeout=20, per_result_timeout=10,
+    )
+    # 실패/타임아웃난 종목은 빈 리스트로 채워서 카드가 항상 렌더링되게 함
+    for k in targets.keys():
+        result.setdefault(k, [])
     return result
 
 
@@ -245,12 +300,12 @@ def fetch_investor_trend():
         except Exception:
             return key, None
 
-    result = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        futures = {executor.submit(get_data, k, s): k for k, s in markets.items()}
-        for future in concurrent.futures.as_completed(futures):
-            k, entry = future.result()
-            result[k] = entry if entry else {"foreign": None, "institution": None, "individual": None}
+    result = run_parallel_safe(
+        lambda kv: get_data(kv[0], kv[1]), list(markets.items()),
+        max_workers=2, overall_timeout=15, per_result_timeout=8,
+    )
+    for k in markets.keys():
+        result.setdefault(k, {"foreign": None, "institution": None, "individual": None})
     return result
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -307,12 +362,21 @@ def fetch_investor_trend_monthly(sosok):
             return None
 
     rows = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(fetch_one, d): d for d in business_days}
-        for future in concurrent.futures.as_completed(futures):
-            res = future.result()
-            if res:
-                rows.append(res)
+    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+    try:
+        futures = {_executor.submit(fetch_one, d): d for d in business_days}
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=20):
+                try:
+                    res = future.result(timeout=8)
+                    if res:
+                        rows.append(res)
+                except Exception:
+                    continue
+        except concurrent.futures.TimeoutError:
+            pass  # 전체 상한 초과 → 지금까지 모인 결과로 진행
+    finally:
+        _executor.shutdown(wait=False)
 
     rows.sort(key=lambda r: r["날짜"])
     return rows
@@ -491,12 +555,21 @@ def fetch_sector_ranking():
         return None
         
     rows = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        futures = [executor.submit(get_data, n, c) for n, c in sector_etfs]
-        for future in concurrent.futures.as_completed(futures):
-            res = future.result()
-            if res: rows.append(res)
-            
+    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+    try:
+        futures = [_executor.submit(get_data, n, c) for n, c in sector_etfs]
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=15):
+                try:
+                    res = future.result(timeout=6)
+                    if res: rows.append(res)
+                except Exception:
+                    continue
+        except concurrent.futures.TimeoutError:
+            pass
+    finally:
+        _executor.shutdown(wait=False)
+
     if not rows: return pd.DataFrame()
     return pd.DataFrame(rows).sort_values("등락률_num", ascending=False).reset_index(drop=True)
 
@@ -536,12 +609,21 @@ def fetch_dividend_ranking():
         max_page = min(max_page, 15)
 
         all_pages = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {executor.submit(fetch_page, p): p for p in range(1, max_page + 1)}
-            for future in concurrent.futures.as_completed(futures):
-                result = future.result()
-                if result is not None:
-                    all_pages.append(result)
+        _executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+        try:
+            futures = {_executor.submit(fetch_page, p): p for p in range(1, max_page + 1)}
+            try:
+                for future in concurrent.futures.as_completed(futures, timeout=25):
+                    try:
+                        result = future.result(timeout=10)
+                        if result is not None:
+                            all_pages.append(result)
+                    except Exception:
+                        continue
+            except concurrent.futures.TimeoutError:
+                pass
+        finally:
+            _executor.shutdown(wait=False)
 
         if not all_pages:
             return pd.DataFrame()
@@ -720,7 +802,7 @@ def fetch_company_info_fnguide(code):
     except Exception as e:
         name_debug["exception"] = f"{type(e).__name__}: {e}"
 
-    st.session_state[f"_fnname_debug_{code}"] = name_debug
+    _DEBUG_STORE[f"_fnname_debug_{code}"] = name_debug
 
     # ①-2 기업개요(상세): navercomp.wisereport.co.kr의 <div class="cmp_comment"> 블록에서
     #    실제 FnGuide 기업개요 불릿 설명을 가져와 네이버 요약(짧은 1~2문장)보다
@@ -858,7 +940,7 @@ def fetch_investor_trend_by_code(code, days=20):
                 break
 
         if not collected:
-            st.session_state[f"_trend_debug_{code}"] = debug
+            _DEBUG_STORE[f"_trend_debug_{code}"] = debug
             return result_df
 
         merged = pd.concat(collected, ignore_index=True)
@@ -866,7 +948,7 @@ def fetch_investor_trend_by_code(code, days=20):
         col_inst = _find_investor_col(merged.columns, '기관', '순매매')
         col_frgn = _find_investor_col(merged.columns, '외국인', '순매매')
         if not (col_date is not None and col_inst is not None and col_frgn is not None):
-            st.session_state[f"_trend_debug_{code}"] = debug
+            _DEBUG_STORE[f"_trend_debug_{code}"] = debug
             return result_df
 
         merged = merged.drop_duplicates(subset=[col_date]).head(days)
@@ -879,7 +961,7 @@ def fetch_investor_trend_by_code(code, days=20):
         result_df = out.reset_index(drop=True)
     except Exception as e:
         debug["exception"] = f"{type(e).__name__}: {e}"
-        st.session_state[f"_trend_debug_{code}"] = debug
+        _DEBUG_STORE[f"_trend_debug_{code}"] = debug
 
     return result_df
 
@@ -1053,7 +1135,7 @@ def fetch_fnguide_data(code):
         # 차단(삼성전자 고정) 여부 확인
         debug["code_in_html"] = (code in html)
         if code not in html:
-            st.session_state[f"_fnguide_debug_{code}"] = debug
+            _DEBUG_STORE[f"_fnguide_debug_{code}"] = debug
             return df_annual, df_quarter, df_dividend
 
         dfs = pd.read_html(io.StringIO(html))
@@ -1089,7 +1171,7 @@ def fetch_fnguide_data(code):
         # 문서상 등장 순서 기준: 첫 번째 = 연간(연결), 두 번째 = 분기(연결)
         if len(income_candidates) < 2 or len(balance_candidates) < 2 or not valuation_candidates:
             debug["exception"] = "필요한 재무 표를 찾지 못함 (항목명 매칭 실패 - FnGuide 페이지 구조 변경 가능성)"
-            st.session_state[f"_fnguide_debug_{code}"] = debug
+            _DEBUG_STORE[f"_fnguide_debug_{code}"] = debug
             return df_annual, df_quarter, df_dividend
 
         income_a = income_candidates[0]
@@ -1120,7 +1202,7 @@ def fetch_fnguide_data(code):
             debug["dividend_rows_found"] = len(df_dividend)
         except Exception as e:
             debug["dividend_exception"] = f"{type(e).__name__}: {e}"
-        st.session_state[f"_fnguide_debug_{code}"] = debug
+        _DEBUG_STORE[f"_fnguide_debug_{code}"] = debug
 
         value_cols = [c for c in df_annual.columns if c != '연도/분기']
         all_nan = bool(df_annual.empty) or bool(df_annual[value_cols].isna().all().all())
@@ -1146,11 +1228,11 @@ def fetch_fnguide_data(code):
             debug["sample_lookup_exception"] = f"{type(e).__name__}: {e}"
 
         if (df_annual.empty and df_quarter.empty) or all_nan:
-            st.session_state[f"_fnguide_debug_{code}"] = debug
+            _DEBUG_STORE[f"_fnguide_debug_{code}"] = debug
 
     except Exception as e:
         debug["exception"] = f"{type(e).__name__}: {e}"
-        st.session_state[f"_fnguide_debug_{code}"] = debug
+        _DEBUG_STORE[f"_fnguide_debug_{code}"] = debug
 
     return df_annual, df_quarter, df_dividend
 
@@ -1361,18 +1443,32 @@ def fetch_screener_data_generator():
     completed = 0
     failed_pages = []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        future_to_url = {executor.submit(fetch_page_data, s, p, headers, cookies): (s, p) for s, p in urls}
-        for future in concurrent.futures.as_completed(future_to_url):
-            completed += 1
-            progress_pct = 10 + int((completed / total_pages) * 70)
-            yield f"⚡ 스텔스 모드 스캔 중... ({completed}/{total_pages} 페이지)", progress_pct
-            s, p = future_to_url[future]
-            df = future.result()
-            if df is not None and not df.empty:
-                all_data.append(df)
-            else:
-                failed_pages.append((s, p))
+    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+    processed = set()
+    try:
+        future_to_url = {_executor.submit(fetch_page_data, s, p, headers, cookies): (s, p) for s, p in urls}
+        try:
+            for future in concurrent.futures.as_completed(future_to_url, timeout=90):
+                completed += 1
+                progress_pct = 10 + int((completed / total_pages) * 70)
+                yield f"⚡ 스텔스 모드 스캔 중... ({completed}/{total_pages} 페이지)", progress_pct
+                s, p = future_to_url[future]
+                processed.add((s, p))
+                try:
+                    df = future.result(timeout=15)
+                except Exception:
+                    df = None
+                if df is not None and not df.empty:
+                    all_data.append(df)
+                else:
+                    failed_pages.append((s, p))
+        except concurrent.futures.TimeoutError:
+            # 전체 상한(90초) 초과 → 아직 결과가 안 온 나머지 페이지는 실패로 간주하고 재시도 라운드로 넘김
+            for s, p in urls:
+                if (s, p) not in processed:
+                    failed_pages.append((s, p))
+    finally:
+        _executor.shutdown(wait=False)
 
     # ── 실패한 페이지 재시도 (네이버 측 레이트리밋으로 뒷부분 페이지들이 몰려서 실패하는 경우 대응) ──
     # 동시 요청 수를 점점 줄이고, 대기 시간을 늘려가며 최대 3라운드까지 재시도한다.
@@ -1383,15 +1479,28 @@ def fetch_screener_data_generator():
         yield f"⚠️ {len(failed_pages)}개 페이지 재시도 중... ({retry_round + 1}/3 라운드, {backoff_seconds[retry_round]}초 대기)", 82 + retry_round * 3
         time.sleep(backoff_seconds[retry_round])
         still_failed = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=retry_workers[retry_round]) as executor:
-            future_to_url = {executor.submit(fetch_page_data, s, p, headers, cookies): (s, p) for s, p in failed_pages}
-            for future in concurrent.futures.as_completed(future_to_url):
-                s, p = future_to_url[future]
-                df = future.result()
-                if df is not None and not df.empty:
-                    all_data.append(df)
-                else:
-                    still_failed.append((s, p))
+        _retry_processed = set()
+        _retry_executor = concurrent.futures.ThreadPoolExecutor(max_workers=retry_workers[retry_round])
+        try:
+            future_to_url = {_retry_executor.submit(fetch_page_data, s, p, headers, cookies): (s, p) for s, p in failed_pages}
+            try:
+                for future in concurrent.futures.as_completed(future_to_url, timeout=45):
+                    s, p = future_to_url[future]
+                    _retry_processed.add((s, p))
+                    try:
+                        df = future.result(timeout=15)
+                    except Exception:
+                        df = None
+                    if df is not None and not df.empty:
+                        all_data.append(df)
+                    else:
+                        still_failed.append((s, p))
+            except concurrent.futures.TimeoutError:
+                for s, p in failed_pages:
+                    if (s, p) not in _retry_processed:
+                        still_failed.append((s, p))
+        finally:
+            _retry_executor.shutdown(wait=False)
         failed_pages = still_failed
         retry_round += 1
 
@@ -1540,8 +1649,17 @@ def _safe_save_screener_df(new_df, path="saved_screener_data.csv"):
 
 def load_screener_df():
     save_path = "saved_screener_data.csv"
-    if 'shared_screener_df' in st.session_state and not st.session_state['shared_screener_df'].empty:
+    try:
+        _has_session_df = 'shared_screener_df' in st.session_state and not st.session_state['shared_screener_df'].empty
+    except Exception:
+        _has_session_df = False  # 백그라운드 스레드 등에서 session_state 접근이 안 되는 경우
+    if _has_session_df:
         df = st.session_state['shared_screener_df']
+        df = df.dropna(subset=['종목코드'])
+        df = df[~df['종목코드'].astype(str).str.lower().str.contains('nan')]
+        return df
+    if _SCREENER_DF_CACHE["df"] is not None and not _SCREENER_DF_CACHE["df"].empty:
+        df = _SCREENER_DF_CACHE["df"]
         df = df.dropna(subset=['종목코드'])
         df = df[~df['종목코드'].astype(str).str.lower().str.contains('nan')]
         return df
@@ -1552,7 +1670,7 @@ def load_screener_df():
             df = df[~df['종목코드'].astype(str).str.lower().str.contains('nan')]
             df['종목코드'] = df['종목코드'].str.replace('.0','', regex=False).str.zfill(6)
             df = merge_high52(df)  
-            st.session_state['shared_screener_df'] = df
+            _set_shared_screener_df(df)
             return df
         except: return pd.DataFrame()
     return pd.DataFrame()
@@ -1694,7 +1812,7 @@ def run_unified_market_scan():
     # 2단계: 52주 고점 매칭 → 추천 종목 후보 산출
     load_high52_map.clear()
     high52_map = load_high52_map()
-    scan_workers = 4 if high52_map else 3
+    scan_workers = 8 if high52_map else 5
 
     df = screener_df.copy()
     finance_keywords = '금융|은행|증권|보험|캐피탈|지주|투자|저축'
@@ -1721,13 +1839,22 @@ def run_unified_market_scan():
     progress_text = "⚡ CSV 고점 데이터 매칭 중..." if high52_map else "⚡ 네이버 실시간 API 스캔 중..."
     completed = 0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=scan_workers) as executor:
-        futures = {executor.submit(check_naver_52w_robust, r): r for r in dict_records}
-        for future in concurrent.futures.as_completed(futures):
-            completed += 1
-            pb.progress(int((completed / total) * 100), text=f"[2/2] {progress_text} ({completed}/{total})")
-            res = future.result()
-            if res: rows.append(res)
+    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=scan_workers)
+    try:
+        futures = {_executor.submit(check_naver_52w_robust, r): r for r in dict_records}
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=60):
+                completed += 1
+                pb.progress(int((completed / total) * 100), text=f"[2/2] {progress_text} ({completed}/{total})")
+                try:
+                    res = future.result(timeout=12)
+                except Exception:
+                    res = None
+                if res: rows.append(res)
+        except concurrent.futures.TimeoutError:
+            pass  # 전체 상한(60초) 초과 → 지금까지 모인 결과로 계속 진행
+    finally:
+        _executor.shutdown(wait=False)
 
     pb.progress(100, text="✨ 스캔 완료! (스크리너 + 추천 종목 데이터가 함께 갱신되었습니다)")
     time.sleep(0.4)
@@ -2082,7 +2209,7 @@ def draw_fnguide_details(code):
                 st.dataframe(styled_trend, use_container_width=True, hide_index=True)
         else:
             st.caption("ℹ️ 최근 수급 데이터를 불러오지 못했습니다. (거래정지 종목이거나 일시적 통신 오류일 수 있습니다)")
-            _dbg = st.session_state.get(f"_trend_debug_{code}")
+            _dbg = _DEBUG_STORE.get(f"_trend_debug_{code}")
             if _dbg:
                 with st.expander("🔧 디버그 정보 (실패 원인 확인용)"):
                     st.json(_dbg)
@@ -2091,7 +2218,7 @@ def draw_fnguide_details(code):
             _value_cols = [c for c in df_annual.columns if c != '연도/분기']
             if df_annual[_value_cols].isna().all().all():
                 st.warning("⚠️ 기간(연도/분기)은 인식됐지만 실적 수치를 하나도 못 읽어왔어요. FnGuide 표의 항목명(행 이름)이 바뀐 것으로 보입니다.")
-                _fdbg3 = st.session_state.get(f"_fnguide_debug_{code}")
+                _fdbg3 = _DEBUG_STORE.get(f"_fnguide_debug_{code}")
                 if _fdbg3:
                     with st.expander("🔧 디버그 정보 (항목명 매칭 실패 원인 확인용)"):
                         st.json(_fdbg3)
@@ -2202,7 +2329,7 @@ def draw_fnguide_details(code):
                     )
                 else:
                     st.info("해당 종목의 배당 데이터가 제공되지 않습니다. (무배당 종목이거나 데이터 수집에 실패했을 수 있습니다)")
-                    _fdbg_div = st.session_state.get(f"_fnguide_debug_{code}")
+                    _fdbg_div = _DEBUG_STORE.get(f"_fnguide_debug_{code}")
                     if _fdbg_div and _fdbg_div.get("valuation_a_index"):
                         with st.expander("🔧 디버그 정보 (배당 데이터 실패 원인 확인용)"):
                             st.json({
@@ -2214,7 +2341,7 @@ def draw_fnguide_details(code):
                 render_disclosure_tab(code)
         else:
             st.caption("ℹ️ 연간/분기 실적 데이터를 불러오지 못했습니다.")
-            _fdbg = st.session_state.get(f"_fnguide_debug_{code}")
+            _fdbg = _DEBUG_STORE.get(f"_fnguide_debug_{code}")
             if _fdbg:
                 with st.expander("🔧 디버그 정보 (실적 데이터 실패 원인 확인용)"):
                     st.json(_fdbg)
@@ -2227,8 +2354,8 @@ def draw_fnguide_details(code):
             """, unsafe_allow_html=True)
     else:
         st.error("해당 종목의 기업 및 재무 정보를 찾을 수 없습니다.")
-        _ndbg = st.session_state.get(f"_fnname_debug_{code}")
-        _fdbg2 = st.session_state.get(f"_fnguide_debug_{code}")
+        _ndbg = _DEBUG_STORE.get(f"_fnname_debug_{code}")
+        _fdbg2 = _DEBUG_STORE.get(f"_fnguide_debug_{code}")
         with st.expander("🔧 디버그 정보 (종목명/실적 조회 실패 원인 확인용)"):
             st.write("종목명 조회(네이버금융 main.naver):")
             st.json(_ndbg or {"info": "호출 안 됨"})
@@ -2560,12 +2687,21 @@ def render_watchlist_portfolio_summary(df):
 
     codes = holdings["종목코드"].tolist()
     current_prices = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(fetch_live_price_change, code): code for code in codes}
-        for future in concurrent.futures.as_completed(futures):
-            code = futures[future]
-            price, _pct, _diff = future.result()
-            current_prices[code] = price
+    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=6)
+    try:
+        futures = {_executor.submit(fetch_live_price_change, code): code for code in codes}
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=20):
+                code = futures[future]
+                try:
+                    price, _pct, _diff = future.result(timeout=8)
+                except Exception:
+                    price = None
+                current_prices[code] = price
+        except concurrent.futures.TimeoutError:
+            pass
+    finally:
+        _executor.shutdown(wait=False)
 
     total_buy = 0.0
     total_eval = 0.0
@@ -2769,7 +2905,7 @@ def render_watchlist():
         market = _wl_market_map.get(code)
         price_info = fetch_live_price_change(code)
         spark = fetch_watchlist_sparkline_prices(code, market)
-        ai_score = get_ai_total_score(code)
+        ai_score = get_ai_total_score(code, screener_df=screener_df)
         return code, price_info, spark, ai_score
 
     if _wl_codes:
@@ -2780,7 +2916,7 @@ def render_watchlist():
         # executor.shutdown(wait=False)로 종료해서, 아직 안 끝난 스레드가 있어도
         # 여기서 더 이상 기다리지 않고 즉시 다음 로직으로 넘어간다.
         with st.spinner(f"🔄 관심종목 {len(_wl_codes)}건 시세 조회 중..."):
-            _wl_executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+            _wl_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
             try:
                 _wl_futures = {_wl_executor.submit(_wl_prefetch_one, c): c for c in _wl_codes}
                 try:
@@ -4284,11 +4420,13 @@ def calc_ai_scores(per, pbr, roe, debt, drop_pct, div):
         "dividend": int(dividend),
     }
 
-def get_ai_total_score(code):
-    """관심종목 카드 등에서 재사용: 종목코드만으로 AI 종합점수(0~100)를 계산. 실패 시 None."""
+def get_ai_total_score(code, screener_df=None):
+    """관심종목 카드 등에서 재사용: 종목코드만으로 AI 종합점수(0~100)를 계산. 실패 시 None.
+    screener_df를 미리 전달하면(예: 관심종목 병렬조회) 백그라운드 스레드에서 다시
+    load_screener_df()를 호출하지 않아도 되어 session_state 접근을 피할 수 있다."""
     try:
         df_annual_ai, _, _ = fetch_fnguide_data(code)
-        per_ai, pbr_ai, roe_ai, debt_ai, drop_pct_ai, div_ai = get_ai_diagnosis_inputs(code, df_annual_ai)
+        per_ai, pbr_ai, roe_ai, debt_ai, drop_pct_ai, div_ai = get_ai_diagnosis_inputs(code, df_annual_ai, screener_df=screener_df)
         return calc_ai_scores(per_ai, pbr_ai, roe_ai, debt_ai, drop_pct_ai, div_ai)["total"]
     except Exception:
         return None
@@ -5205,7 +5343,7 @@ def _to_float_safe(val):
     except Exception:
         return 0.0
 
-def get_ai_diagnosis_inputs(code, df_annual):
+def get_ai_diagnosis_inputs(code, df_annual, screener_df=None):
     code = normalize_kr_code(code)
     per, pbr, roe, debt, div, drop_pct = 0.0, 0.0, -999.0, -1.0, 0.0, 0.0
 
@@ -5226,7 +5364,8 @@ def get_ai_diagnosis_inputs(code, df_annual):
                 debt = _to_float_safe(raw)  
 
     try:
-        screener_df = load_screener_df()
+        if screener_df is None:
+            screener_df = load_screener_df()
         if screener_df is not None and not screener_df.empty:
             matched = screener_df[screener_df['종목코드'].astype(str).str.zfill(6) == code]
             if not matched.empty:
