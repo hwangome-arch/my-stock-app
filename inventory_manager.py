@@ -104,7 +104,7 @@ def fetch_market_index_table():
     def get_yfinance(key, meta):
         try:
             import yfinance as yf
-            df = yf.Ticker(meta["symbol"]).history(period="2d", interval="1m")
+            df = yf.Ticker(meta["symbol"]).history(period="2d", interval="1m", timeout=8)
             if df.empty:
                 raise ValueError("empty")
             price = float(df["Close"].dropna().iloc[-1])
@@ -157,7 +157,7 @@ def fetch_sparkline_data():
     def get_history(key, symbol):
         try:
             import yfinance as yf
-            df = yf.Ticker(symbol).history(period="180d", interval="1d")
+            df = yf.Ticker(symbol).history(period="180d", interval="1d", timeout=8)
             if df.empty or "Close" not in df.columns:
                 return key, []
             closes = df["Close"].dropna().tolist()
@@ -1780,7 +1780,7 @@ def estimate_target_hit_probability(stock_code, market_hint, target_price, horiz
         hist = pd.DataFrame()
         for suf in suffix_order:
             try:
-                hist = yf.Ticker(f"{stock_code}{suf}").history(period="1y", interval="1d")
+                hist = yf.Ticker(f"{stock_code}{suf}").history(period="1y", interval="1d", timeout=8)
             except Exception:
                 hist = pd.DataFrame()
             if not hist.empty:
@@ -2494,7 +2494,7 @@ def fetch_watchlist_sparkline_prices(stock_code, market=None, days=30):
 
         def _fetch(suffix):
             try:
-                df = yf.Ticker(f"{stock_code}{suffix}").history(period="60d", interval="1d")
+                df = yf.Ticker(f"{stock_code}{suffix}").history(period="60d", interval="1d", timeout=8)
                 return df["Close"].dropna().tolist() if not df.empty else []
             except Exception:
                 return []
@@ -2773,16 +2773,30 @@ def render_watchlist():
         return code, price_info, spark, ai_score
 
     if _wl_codes:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as _wl_executor:
-            _wl_futures = [_wl_executor.submit(_wl_prefetch_one, c) for c in _wl_codes]
-            for _wl_future in concurrent.futures.as_completed(_wl_futures):
+        # 개별 yfinance/네이버 호출에 timeout을 걸어뒀지만, 만에 하나 그래도 응답이
+        # 없는 경우를 대비해 전체 조회에도 상한선(종목당 최대 12초, 전체 최대 40초)을
+        # 둔다. 이 상한을 넘기면 남은 종목은 이번 렌더링에서는 건너뛰고(다음 새로고침 때
+        # 캐시가 채워지며 자연히 보임) 페이지가 무한정 멈추는 것을 방지한다.
+        # executor.shutdown(wait=False)로 종료해서, 아직 안 끝난 스레드가 있어도
+        # 여기서 더 이상 기다리지 않고 즉시 다음 로직으로 넘어간다.
+        with st.spinner(f"🔄 관심종목 {len(_wl_codes)}건 시세 조회 중..."):
+            _wl_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+            try:
+                _wl_futures = {_wl_executor.submit(_wl_prefetch_one, c): c for c in _wl_codes}
                 try:
-                    _code, _price_info, _spark, _ai_score = _wl_future.result()
-                except Exception:
-                    continue
-                wl_price_cache[_code] = _price_info
-                sparkline_cache[_code] = _spark
-                ai_score_cache[_code] = _ai_score
+                    _wl_done_iter = concurrent.futures.as_completed(_wl_futures, timeout=40)
+                    for _wl_future in _wl_done_iter:
+                        try:
+                            _code, _price_info, _spark, _ai_score = _wl_future.result(timeout=12)
+                        except Exception:
+                            continue
+                        wl_price_cache[_code] = _price_info
+                        sparkline_cache[_code] = _spark
+                        ai_score_cache[_code] = _ai_score
+                except concurrent.futures.TimeoutError:
+                    pass  # 일부 종목 조회가 40초를 넘김 → 나머지는 건너뛰고 계속 진행
+            finally:
+                _wl_executor.shutdown(wait=False)
 
     reached_summary = []  # [(종목명, 종목코드, 도달차수, 진입가, 현재가), ...]
     for _, _row in watchlist_df.iterrows():
@@ -5601,10 +5615,10 @@ def render_fnguide():
                 try:
                     import yfinance as yf
                     ticker = f"{stock_code}.KS"
-                    df_ma = yf.Ticker(ticker).history(period="90d", interval="1d")
+                    df_ma = yf.Ticker(ticker).history(period="90d", interval="1d", timeout=8)
                     if df_ma.empty:
                         ticker = f"{stock_code}.KQ"
-                        df_ma = yf.Ticker(ticker).history(period="90d", interval="1d")
+                        df_ma = yf.Ticker(ticker).history(period="90d", interval="1d", timeout=8)
                     closes = df_ma["Close"].dropna()
                     ma20 = round(closes.tail(20).mean()) if len(closes) >= 20 else 0
                     ma60 = round(closes.tail(60).mean()) if len(closes) >= 60 else 0
