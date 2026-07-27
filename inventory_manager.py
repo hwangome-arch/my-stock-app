@@ -1,4 +1,5 @@
 import os
+import socket
 import concurrent.futures
 import random
 import time
@@ -11,6 +12,16 @@ import hmac
 import base64
 import difflib
 import numpy as np
+
+# ── 전역 소켓 기본 타임아웃 ──────────────────────────────────────────────
+# gspread(Google Sheets API)처럼 자체적으로 timeout 파라미터를 노출하지 않는
+# 라이브러리가 있어서, requests/yfinance 호출마다 timeout=을 넣는 것만으로는
+# 모든 네트워크 호출을 다 방어할 수 없었다. Python 소켓 레벨에서 기본 타임아웃을
+# 걸어두면, 코드에서 개별적으로 timeout을 안 준 소켓 통신도(= 위 라이브러리들 포함)
+# 이 값을 넘기면 예외를 던지고 빠져나온다. 각 함수는 이미 try/except로
+# 감싸져 있어서, 이 타임아웃이 걸려도 앱이 멈추는 대신 "빈 결과"로 정상 진행된다.
+socket.setdefaulttimeout(20)
+# ────────────────────────────────────────────────────────────────────────
 
 # ── 백그라운드 스레드(ThreadPoolExecutor)에서도 안전하게 쓸 수 있는 디버그 정보 저장소 ──
 # st.session_state는 스크립트를 실행하는 메인 스레드 밖(예: 관심종목 페이지의 병렬 조회
@@ -2437,9 +2448,14 @@ def save_user(username, password, email):
         username, pwd_hash, salt, email,
         datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
     ]
-    ws = _get_worksheet("users")
-    ws.append_row(new_row, value_input_option="RAW")
-    load_users.clear()  # 캐시 무효화
+    try:
+        ws = _get_worksheet("users")
+        ws.append_row(new_row, value_input_option="RAW")
+        load_users.clear()  # 캐시 무효화
+        return True
+    except Exception:
+        st.error("일시적인 통신 오류로 가입 처리에 실패했습니다. 잠시 후 다시 시도해주세요.")
+        return False
 
 def authenticate_user(username, password):
     users = load_users()
@@ -2495,20 +2511,24 @@ def verify_user_email(username, email):
 
 def update_user_password(username, new_password):
     """해당 사용자의 비밀번호 해시/salt를 새 값으로 갱신."""
-    ws = _get_worksheet("users")
-    records = ws.get_all_records(numericise_ignore=['all'])
-    row_idx = None
-    for i, rec in enumerate(records):
-        if str(rec.get("아이디", "")) == username:
-            row_idx = i + 2  # 헤더가 1행이므로 데이터는 2행부터 시작
-            break
-    if row_idx is None:
+    try:
+        ws = _get_worksheet("users")
+        records = ws.get_all_records(numericise_ignore=['all'])
+        row_idx = None
+        for i, rec in enumerate(records):
+            if str(rec.get("아이디", "")) == username:
+                row_idx = i + 2  # 헤더가 1행이므로 데이터는 2행부터 시작
+                break
+        if row_idx is None:
+            return False
+        pwd_hash, salt = _hash_password(new_password)
+        ws.update_cell(row_idx, _USER_COLUMNS.index("비밀번호해시") + 1, pwd_hash)
+        ws.update_cell(row_idx, _USER_COLUMNS.index("salt") + 1, salt)
+        load_users.clear()
+        return True
+    except Exception:
+        st.error("일시적인 통신 오류로 비밀번호 변경에 실패했습니다. 잠시 후 다시 시도해주세요.")
         return False
-    pwd_hash, salt = _hash_password(new_password)
-    ws.update_cell(row_idx, _USER_COLUMNS.index("비밀번호해시") + 1, pwd_hash)
-    ws.update_cell(row_idx, _USER_COLUMNS.index("salt") + 1, salt)
-    load_users.clear()
-    return True
 
 
 # =========================
@@ -2552,10 +2572,14 @@ def add_to_watchlist(username, code, name):
         datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
         "", "", "", "", "", "",
     ]
-    ws = _get_worksheet("watchlist")
-    ws.append_row(new_row, value_input_option="RAW")
-    _load_all_watchlist.clear()
-    return True
+    try:
+        ws = _get_worksheet("watchlist")
+        ws.append_row(new_row, value_input_option="RAW")
+        _load_all_watchlist.clear()
+        return True
+    except Exception:
+        st.error("일시적인 통신 오류로 관심종목 추가에 실패했습니다. 잠시 후 다시 시도해주세요.")
+        return False
 
 def _find_watchlist_row_indices(ws, username, code):
     """해당 사용자+종목코드에 해당하는 시트 상의 실제 행 번호(1-base, 헤더 포함)를 반환."""
@@ -2568,53 +2592,65 @@ def _find_watchlist_row_indices(ws, username, code):
 
 def remove_from_watchlist(username, code):
     code = normalize_kr_code(code)
-    ws = _get_worksheet("watchlist")
-    row_indices = _find_watchlist_row_indices(ws, username, code)
-    if not row_indices:
-        st.warning(f"삭제할 항목을 시트에서 찾지 못했습니다. (종목코드 {code})")
-        return
-    for row_idx in sorted(row_indices, reverse=True):
-        ws.delete_rows(row_idx)
-    _load_all_watchlist.clear()
+    try:
+        ws = _get_worksheet("watchlist")
+        row_indices = _find_watchlist_row_indices(ws, username, code)
+        if not row_indices:
+            st.warning(f"삭제할 항목을 시트에서 찾지 못했습니다. (종목코드 {code})")
+            return
+        for row_idx in sorted(row_indices, reverse=True):
+            ws.delete_rows(row_idx)
+        _load_all_watchlist.clear()
+    except Exception:
+        st.error("일시적인 통신 오류로 관심종목 삭제에 실패했습니다. 잠시 후 다시 시도해주세요.")
 
 def update_watchlist_holding(username, code, buy_price, qty):
     """관심종목 항목에 매수가/수량(보유 정보)을 저장."""
     code = normalize_kr_code(code)
-    ws = _get_worksheet("watchlist")
-    row_indices = _find_watchlist_row_indices(ws, username, code)
-    for row_idx in row_indices:
-        ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("매수가") + 1, str(buy_price) if buy_price else "")
-        ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("수량") + 1, str(qty) if qty else "")
-    _load_all_watchlist.clear()
+    try:
+        ws = _get_worksheet("watchlist")
+        row_indices = _find_watchlist_row_indices(ws, username, code)
+        for row_idx in row_indices:
+            ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("매수가") + 1, str(buy_price) if buy_price else "")
+            ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("수량") + 1, str(qty) if qty else "")
+        _load_all_watchlist.clear()
+    except Exception:
+        st.error("일시적인 통신 오류로 보유 정보 저장에 실패했습니다. 잠시 후 다시 시도해주세요.")
 
 def update_watchlist_entries(username, code, entry1, entry2, entry3):
     """관심종목 항목에 1차/2차/3차 매수 진입가를 저장."""
     code = normalize_kr_code(code)
-    ws = _get_worksheet("watchlist")
-    row_indices = _find_watchlist_row_indices(ws, username, code)
-    for row_idx in row_indices:
-        ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("1차진입가") + 1, str(entry1) if entry1 else "")
-        ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("2차진입가") + 1, str(entry2) if entry2 else "")
-        ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("3차진입가") + 1, str(entry3) if entry3 else "")
-    _load_all_watchlist.clear()
+    try:
+        ws = _get_worksheet("watchlist")
+        row_indices = _find_watchlist_row_indices(ws, username, code)
+        for row_idx in row_indices:
+            ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("1차진입가") + 1, str(entry1) if entry1 else "")
+            ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("2차진입가") + 1, str(entry2) if entry2 else "")
+            ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("3차진입가") + 1, str(entry3) if entry3 else "")
+        _load_all_watchlist.clear()
+    except Exception:
+        st.error("일시적인 통신 오류로 진입가 저장에 실패했습니다. 잠시 후 다시 시도해주세요.")
 
 def toggle_watchlist_pin(username, code):
     """관심종목 항목의 상단 고정 상태를 토글."""
     code = normalize_kr_code(code)
-    wl = load_watchlist(username)
     is_pinned = False
+    wl = load_watchlist(username)
     if not wl.empty:
         match = wl[wl["종목코드"] == code]
         if not match.empty:
             is_pinned = (match.iloc[0]["고정"] == "Y")
-    ws = _get_worksheet("watchlist")
-    row_indices = _find_watchlist_row_indices(ws, username, code)
-    if not row_indices:
-        st.warning(f"항목을 시트에서 찾지 못해 고정 상태를 변경하지 못했습니다. (종목코드 {code})")
-        return
-    for row_idx in row_indices:
-        ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("고정") + 1, "" if is_pinned else "Y")
-    _load_all_watchlist.clear()
+    try:
+        ws = _get_worksheet("watchlist")
+        row_indices = _find_watchlist_row_indices(ws, username, code)
+        if not row_indices:
+            st.warning(f"항목을 시트에서 찾지 못해 고정 상태를 변경하지 못했습니다. (종목코드 {code})")
+            return
+        for row_idx in row_indices:
+            ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("고정") + 1, "" if is_pinned else "Y")
+        _load_all_watchlist.clear()
+    except Exception:
+        st.error("일시적인 통신 오류로 고정 상태 변경에 실패했습니다. 잠시 후 다시 시도해주세요.")
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
