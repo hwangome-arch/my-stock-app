@@ -12,6 +12,25 @@ import base64
 import difflib
 import numpy as np
 
+# ── 백그라운드 스레드(ThreadPoolExecutor)에서도 안전하게 쓸 수 있는 디버그 정보 저장소 ──
+# st.session_state는 스크립트를 실행하는 메인 스레드 밖(예: 관심종목 페이지의 병렬 조회
+# 워커 스레드)에서 접근하면 Streamlit 공식 문서상 지원되지 않으며, 실제로 이로 인해
+# 스크립트 실행이 멈춰버리는(무한 로딩) 문제가 발생했다. 단순 dict 대입/조회는 CPython의
+# GIL 덕분에 스레드에서 안전하므로, 디버그용 정보는 여기로 옮겨서 저장한다.
+_DEBUG_STORE = {}
+
+# 스크리너 데이터도 관심종목 병렬조회(백그라운드 스레드)에서 읽히므로, session_state와
+# 별개로 여기에도 항상 최신값을 미러링해두고 스레드에서는 이쪽만 사용한다.
+_SCREENER_DF_CACHE = {"df": None}
+
+def _set_shared_screener_df(df):
+    """스크리너 결과 df를 session_state(메인 스레드용)와 모듈 캐시(백그라운드 스레드용)에 동시 반영."""
+    _SCREENER_DF_CACHE["df"] = df
+    try:
+        st.session_state['shared_screener_df'] = df
+    except Exception:
+        pass  # 백그라운드 스레드 등 session_state 접근이 불가능한 상황이면 모듈 캐시만 사용
+
 # ==== 🚀 [테마 강제 고정 로직] ====
 try:
     config_dir = ".streamlit"
@@ -720,7 +739,7 @@ def fetch_company_info_fnguide(code):
     except Exception as e:
         name_debug["exception"] = f"{type(e).__name__}: {e}"
 
-    st.session_state[f"_fnname_debug_{code}"] = name_debug
+    _DEBUG_STORE[f"_fnname_debug_{code}"] = name_debug
 
     # ①-2 기업개요(상세): navercomp.wisereport.co.kr의 <div class="cmp_comment"> 블록에서
     #    실제 FnGuide 기업개요 불릿 설명을 가져와 네이버 요약(짧은 1~2문장)보다
@@ -858,7 +877,7 @@ def fetch_investor_trend_by_code(code, days=20):
                 break
 
         if not collected:
-            st.session_state[f"_trend_debug_{code}"] = debug
+            _DEBUG_STORE[f"_trend_debug_{code}"] = debug
             return result_df
 
         merged = pd.concat(collected, ignore_index=True)
@@ -866,7 +885,7 @@ def fetch_investor_trend_by_code(code, days=20):
         col_inst = _find_investor_col(merged.columns, '기관', '순매매')
         col_frgn = _find_investor_col(merged.columns, '외국인', '순매매')
         if not (col_date is not None and col_inst is not None and col_frgn is not None):
-            st.session_state[f"_trend_debug_{code}"] = debug
+            _DEBUG_STORE[f"_trend_debug_{code}"] = debug
             return result_df
 
         merged = merged.drop_duplicates(subset=[col_date]).head(days)
@@ -879,7 +898,7 @@ def fetch_investor_trend_by_code(code, days=20):
         result_df = out.reset_index(drop=True)
     except Exception as e:
         debug["exception"] = f"{type(e).__name__}: {e}"
-        st.session_state[f"_trend_debug_{code}"] = debug
+        _DEBUG_STORE[f"_trend_debug_{code}"] = debug
 
     return result_df
 
@@ -1053,7 +1072,7 @@ def fetch_fnguide_data(code):
         # 차단(삼성전자 고정) 여부 확인
         debug["code_in_html"] = (code in html)
         if code not in html:
-            st.session_state[f"_fnguide_debug_{code}"] = debug
+            _DEBUG_STORE[f"_fnguide_debug_{code}"] = debug
             return df_annual, df_quarter, df_dividend
 
         dfs = pd.read_html(io.StringIO(html))
@@ -1089,7 +1108,7 @@ def fetch_fnguide_data(code):
         # 문서상 등장 순서 기준: 첫 번째 = 연간(연결), 두 번째 = 분기(연결)
         if len(income_candidates) < 2 or len(balance_candidates) < 2 or not valuation_candidates:
             debug["exception"] = "필요한 재무 표를 찾지 못함 (항목명 매칭 실패 - FnGuide 페이지 구조 변경 가능성)"
-            st.session_state[f"_fnguide_debug_{code}"] = debug
+            _DEBUG_STORE[f"_fnguide_debug_{code}"] = debug
             return df_annual, df_quarter, df_dividend
 
         income_a = income_candidates[0]
@@ -1120,7 +1139,7 @@ def fetch_fnguide_data(code):
             debug["dividend_rows_found"] = len(df_dividend)
         except Exception as e:
             debug["dividend_exception"] = f"{type(e).__name__}: {e}"
-        st.session_state[f"_fnguide_debug_{code}"] = debug
+        _DEBUG_STORE[f"_fnguide_debug_{code}"] = debug
 
         value_cols = [c for c in df_annual.columns if c != '연도/분기']
         all_nan = bool(df_annual.empty) or bool(df_annual[value_cols].isna().all().all())
@@ -1146,11 +1165,11 @@ def fetch_fnguide_data(code):
             debug["sample_lookup_exception"] = f"{type(e).__name__}: {e}"
 
         if (df_annual.empty and df_quarter.empty) or all_nan:
-            st.session_state[f"_fnguide_debug_{code}"] = debug
+            _DEBUG_STORE[f"_fnguide_debug_{code}"] = debug
 
     except Exception as e:
         debug["exception"] = f"{type(e).__name__}: {e}"
-        st.session_state[f"_fnguide_debug_{code}"] = debug
+        _DEBUG_STORE[f"_fnguide_debug_{code}"] = debug
 
     return df_annual, df_quarter, df_dividend
 
@@ -1540,8 +1559,17 @@ def _safe_save_screener_df(new_df, path="saved_screener_data.csv"):
 
 def load_screener_df():
     save_path = "saved_screener_data.csv"
-    if 'shared_screener_df' in st.session_state and not st.session_state['shared_screener_df'].empty:
+    try:
+        _has_session_df = 'shared_screener_df' in st.session_state and not st.session_state['shared_screener_df'].empty
+    except Exception:
+        _has_session_df = False  # 백그라운드 스레드 등에서 session_state 접근이 안 되는 경우
+    if _has_session_df:
         df = st.session_state['shared_screener_df']
+        df = df.dropna(subset=['종목코드'])
+        df = df[~df['종목코드'].astype(str).str.lower().str.contains('nan')]
+        return df
+    if _SCREENER_DF_CACHE["df"] is not None and not _SCREENER_DF_CACHE["df"].empty:
+        df = _SCREENER_DF_CACHE["df"]
         df = df.dropna(subset=['종목코드'])
         df = df[~df['종목코드'].astype(str).str.lower().str.contains('nan')]
         return df
@@ -1552,7 +1580,7 @@ def load_screener_df():
             df = df[~df['종목코드'].astype(str).str.lower().str.contains('nan')]
             df['종목코드'] = df['종목코드'].str.replace('.0','', regex=False).str.zfill(6)
             df = merge_high52(df)  
-            st.session_state['shared_screener_df'] = df
+            _set_shared_screener_df(df)
             return df
         except: return pd.DataFrame()
     return pd.DataFrame()
@@ -2082,7 +2110,7 @@ def draw_fnguide_details(code):
                 st.dataframe(styled_trend, use_container_width=True, hide_index=True)
         else:
             st.caption("ℹ️ 최근 수급 데이터를 불러오지 못했습니다. (거래정지 종목이거나 일시적 통신 오류일 수 있습니다)")
-            _dbg = st.session_state.get(f"_trend_debug_{code}")
+            _dbg = _DEBUG_STORE.get(f"_trend_debug_{code}")
             if _dbg:
                 with st.expander("🔧 디버그 정보 (실패 원인 확인용)"):
                     st.json(_dbg)
@@ -2091,7 +2119,7 @@ def draw_fnguide_details(code):
             _value_cols = [c for c in df_annual.columns if c != '연도/분기']
             if df_annual[_value_cols].isna().all().all():
                 st.warning("⚠️ 기간(연도/분기)은 인식됐지만 실적 수치를 하나도 못 읽어왔어요. FnGuide 표의 항목명(행 이름)이 바뀐 것으로 보입니다.")
-                _fdbg3 = st.session_state.get(f"_fnguide_debug_{code}")
+                _fdbg3 = _DEBUG_STORE.get(f"_fnguide_debug_{code}")
                 if _fdbg3:
                     with st.expander("🔧 디버그 정보 (항목명 매칭 실패 원인 확인용)"):
                         st.json(_fdbg3)
@@ -2202,7 +2230,7 @@ def draw_fnguide_details(code):
                     )
                 else:
                     st.info("해당 종목의 배당 데이터가 제공되지 않습니다. (무배당 종목이거나 데이터 수집에 실패했을 수 있습니다)")
-                    _fdbg_div = st.session_state.get(f"_fnguide_debug_{code}")
+                    _fdbg_div = _DEBUG_STORE.get(f"_fnguide_debug_{code}")
                     if _fdbg_div and _fdbg_div.get("valuation_a_index"):
                         with st.expander("🔧 디버그 정보 (배당 데이터 실패 원인 확인용)"):
                             st.json({
@@ -2214,7 +2242,7 @@ def draw_fnguide_details(code):
                 render_disclosure_tab(code)
         else:
             st.caption("ℹ️ 연간/분기 실적 데이터를 불러오지 못했습니다.")
-            _fdbg = st.session_state.get(f"_fnguide_debug_{code}")
+            _fdbg = _DEBUG_STORE.get(f"_fnguide_debug_{code}")
             if _fdbg:
                 with st.expander("🔧 디버그 정보 (실적 데이터 실패 원인 확인용)"):
                     st.json(_fdbg)
@@ -2227,8 +2255,8 @@ def draw_fnguide_details(code):
             """, unsafe_allow_html=True)
     else:
         st.error("해당 종목의 기업 및 재무 정보를 찾을 수 없습니다.")
-        _ndbg = st.session_state.get(f"_fnname_debug_{code}")
-        _fdbg2 = st.session_state.get(f"_fnguide_debug_{code}")
+        _ndbg = _DEBUG_STORE.get(f"_fnname_debug_{code}")
+        _fdbg2 = _DEBUG_STORE.get(f"_fnguide_debug_{code}")
         with st.expander("🔧 디버그 정보 (종목명/실적 조회 실패 원인 확인용)"):
             st.write("종목명 조회(네이버금융 main.naver):")
             st.json(_ndbg or {"info": "호출 안 됨"})
@@ -2769,7 +2797,7 @@ def render_watchlist():
         market = _wl_market_map.get(code)
         price_info = fetch_live_price_change(code)
         spark = fetch_watchlist_sparkline_prices(code, market)
-        ai_score = get_ai_total_score(code)
+        ai_score = get_ai_total_score(code, screener_df=screener_df)
         return code, price_info, spark, ai_score
 
     if _wl_codes:
@@ -4284,11 +4312,13 @@ def calc_ai_scores(per, pbr, roe, debt, drop_pct, div):
         "dividend": int(dividend),
     }
 
-def get_ai_total_score(code):
-    """관심종목 카드 등에서 재사용: 종목코드만으로 AI 종합점수(0~100)를 계산. 실패 시 None."""
+def get_ai_total_score(code, screener_df=None):
+    """관심종목 카드 등에서 재사용: 종목코드만으로 AI 종합점수(0~100)를 계산. 실패 시 None.
+    screener_df를 미리 전달하면(예: 관심종목 병렬조회) 백그라운드 스레드에서 다시
+    load_screener_df()를 호출하지 않아도 되어 session_state 접근을 피할 수 있다."""
     try:
         df_annual_ai, _, _ = fetch_fnguide_data(code)
-        per_ai, pbr_ai, roe_ai, debt_ai, drop_pct_ai, div_ai = get_ai_diagnosis_inputs(code, df_annual_ai)
+        per_ai, pbr_ai, roe_ai, debt_ai, drop_pct_ai, div_ai = get_ai_diagnosis_inputs(code, df_annual_ai, screener_df=screener_df)
         return calc_ai_scores(per_ai, pbr_ai, roe_ai, debt_ai, drop_pct_ai, div_ai)["total"]
     except Exception:
         return None
@@ -5205,7 +5235,7 @@ def _to_float_safe(val):
     except Exception:
         return 0.0
 
-def get_ai_diagnosis_inputs(code, df_annual):
+def get_ai_diagnosis_inputs(code, df_annual, screener_df=None):
     code = normalize_kr_code(code)
     per, pbr, roe, debt, div, drop_pct = 0.0, 0.0, -999.0, -1.0, 0.0, 0.0
 
@@ -5226,7 +5256,8 @@ def get_ai_diagnosis_inputs(code, df_annual):
                 debt = _to_float_safe(raw)  
 
     try:
-        screener_df = load_screener_df()
+        if screener_df is None:
+            screener_df = load_screener_df()
         if screener_df is not None and not screener_df.empty:
             matched = screener_df[screener_df['종목코드'].astype(str).str.zfill(6) == code]
             if not matched.empty:
