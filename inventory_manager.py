@@ -1557,6 +1557,25 @@ def load_screener_df():
         except: return pd.DataFrame()
     return pd.DataFrame()
 
+RECO_PATH = "saved_reco_data.csv"
+
+def load_reco_df():
+    """추천 종목(2단계 산출물)을 반환. 세션에 있으면 그대로, 없으면 이전 스캔에서 저장해둔
+    CSV에서 불러온다 (screener_df와 같은 방식). 앱 재시작·세션 초기화로 메모리가 비워져도
+    '대시보드/종목스크리너에서 이미 스캔했는데 추천종목 탭에서 또 스캔해야 하는' 상황을 방지한다."""
+    if 'reco_raw_data' in st.session_state and not st.session_state['reco_raw_data'].empty:
+        return st.session_state['reco_raw_data']
+    if os.path.exists(RECO_PATH):
+        try:
+            df = pd.read_csv(RECO_PATH, dtype={'종목코드': str})
+            if not df.empty:
+                df['종목코드'] = df['종목코드'].astype(str).str.zfill(6)
+                st.session_state['reco_raw_data'] = df
+                return df
+        except Exception:
+            pass
+    return pd.DataFrame()
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_high52_map():
     if not os.path.exists(HIGH52_PATH):
@@ -1715,9 +1734,19 @@ def run_unified_market_scan():
     pb.empty()
 
     if rows:
-        st.session_state['reco_raw_data'] = pd.DataFrame(rows)
+        reco_df = pd.DataFrame(rows)
+        st.session_state['reco_raw_data'] = reco_df
+        try:
+            reco_df.to_csv(RECO_PATH, index=False, encoding='utf-8-sig')
+        except Exception:
+            pass
     else:
         st.session_state.pop('reco_raw_data', None)
+        if os.path.exists(RECO_PATH):
+            try:
+                os.remove(RECO_PATH)
+            except Exception:
+                pass
         st.warning("분석 결과 고점 대비 유의미하게 하락한 종목이 없습니다.")
 
     return True
@@ -4714,6 +4743,8 @@ def render_recommendations():
     warn_text = None
     if screener_df.empty:
         warn_text = "저장된 전체 시장 데이터가 없습니다. 스캔 버튼 클릭 시 '전체 시장 스캔'이 1단계로 자동 진행됩니다. (약 15초 추가 소요)"
+    elif not load_reco_df().empty:
+        warn_text = "✅ 이전 스캔 결과를 그대로 불러왔습니다. 최신 시세로 다시 확인하려면 [스캔 실행]을 눌러주세요."
 
     with st.container(key="quant_card_box"):
         st.markdown("""
@@ -4767,7 +4798,8 @@ def render_recommendations():
     if btn_scan:
         run_unified_market_scan()
 
-    if 'reco_raw_data' in st.session_state and not st.session_state['reco_raw_data'].empty:
+    _reco_df = load_reco_df()
+    if not _reco_df.empty:
         st.markdown("<hr style='margin: 25px 0 20px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
         st.markdown("<h4 style='font-size: 16px; margin-bottom:15px;'>🎛️ 추천 종목 제어판 (실시간 필터링)</h4>", unsafe_allow_html=True)
         
@@ -4807,7 +4839,7 @@ def render_recommendations():
                 return "👀 D급 관심 종목"
             return None
 
-        display_df = st.session_state['reco_raw_data'].copy()
+        display_df = _reco_df.copy()
         display_df['등급'] = display_df.apply(lambda row: assign_grade(row, strict_debt), axis=1)
         display_df = display_df.dropna(subset=['등급']) 
 
@@ -5088,6 +5120,11 @@ KRX 정보데이터시스템의 **[12004] 종목 시세 추이(월/연도)** 화
                     load_high52_map.clear()
                     if 'reco_raw_data' in st.session_state:
                         del st.session_state['reco_raw_data']
+                    if os.path.exists(RECO_PATH):
+                        try:
+                            os.remove(RECO_PATH)
+                        except Exception:
+                            pass
                 
                     matched = int(mask_h.sum())
                     markets_done = " + ".join(maps.keys())
