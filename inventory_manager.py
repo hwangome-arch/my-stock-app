@@ -9,6 +9,7 @@ import html as html_lib
 import hashlib
 import hmac
 import base64
+import difflib
 import numpy as np
 
 # ==== 🚀 [테마 강제 고정 로직] ====
@@ -5188,12 +5189,50 @@ def search_naver_stock_by_name(query):
     except Exception:
         return []
 
+# 영문 표기와 실제 종목명이 크게 다른 경우를 위한 별칭 사전.
+# key는 정규화(공백/하이픈/대소문자 제거) 상태로 비교되므로 그대로 적당히 적으면 됨.
+# 필요한 종목이 있으면 이 딕셔너리에 계속 추가하면 됨.
+_STOCK_NAME_ALIASES = {
+    "LGCNS": "LG씨엔에스",
+    "LGCNSC": "LG씨엔에스",
+    "SKT": "SK텔레콤",
+    "SKHYNIX": "SK하이닉스",
+    "SKINNOVATION": "SK이노베이션",
+    "SKSQUARE": "SK스퀘어",
+    "LGUPLUS": "LG유플러스",
+    "LGU": "LG유플러스",
+    "LGCHEM": "LG화학",
+    "LGELECTRONICS": "LG전자",
+    "LGENERGYSOLUTION": "LG에너지솔루션",
+    "LGENSOL": "LG에너지솔루션",
+    "SAMSUNGELECTRONICS": "삼성전자",
+    "SAMSUNGSDI": "삼성SDI",
+    "SAMSUNGBIOLOGICS": "삼성바이오로직스",
+    "HYUNDAIMOTOR": "현대차",
+    "HYUNDAIMOBIS": "현대모비스",
+    "KIA": "기아",
+    "POSCOHOLDINGS": "POSCO홀딩스",
+    "NAVER": "NAVER",
+    "KAKAO": "카카오",
+    "KT&G": "KT&G",
+    "KTNG": "KT&G",
+    "HANWHAAEROSPACE": "한화에어로스페이스",
+    "CELLTRION": "셀트리온",
+}
+
+def _normalize_for_match(s):
+    """비교용 정규화: 공백/하이픈/언더바/마침표 제거 + 대문자 통일."""
+    return re.sub(r"[\s\-_.·]", "", str(s)).upper()
+
 def resolve_stock_query(query):
     """
     입력값이 6자리 종목코드인지, '삼성전자' / '엑셈' 같은 종목명인지 자동 판별.
     - 코드로 특정되면 (code, name, [])
     - 이름 후보가 여럿이면 (None, None, candidates)
     - 아무것도 못 찾으면 (None, None, [])
+
+    영문 약칭(LGCNS 등)이나 오타가 섞여도 최대한 후보를 찾아주도록
+    별칭 사전 → 정규화 매칭 → 유사도 기반 추천 순으로 단계적으로 시도한다.
     """
     query = str(query).strip()
     if not query:
@@ -5204,31 +5243,58 @@ def resolve_stock_query(query):
     if digits_only and len(digits_only) >= max(len(query) - 1, 1):
         return normalize_kr_code(query), None, []
 
+    norm_query = _normalize_for_match(query)
+    # 별칭 사전에 있으면 실제 종목명으로 치환해서 이후 검색에 사용
+    alias_target = _STOCK_NAME_ALIASES.get(norm_query)
+
     screener_df = load_screener_df()
     if screener_df is not None and not screener_df.empty and '종목명' in screener_df.columns:
         names = screener_df['종목명'].astype(str).str.strip()
 
-        exact = screener_df[names == query]
-        if not exact.empty:
-            row = exact.iloc[0]
-            return normalize_kr_code(row['종목코드']), row['종목명'], []
-
-        partial = screener_df[names.str.contains(query, case=False, na=False)]
-        if len(partial) == 1:
-            row = partial.iloc[0]
-            return normalize_kr_code(row['종목코드']), row['종목명'], []
-        if len(partial) > 1:
+        def _build_candidates(mask):
             candidates = []
-            for _, row in partial.head(10).iterrows():
+            for _, row in screener_df[mask].head(10).iterrows():
                 candidates.append({
                     "code": normalize_kr_code(row['종목코드']),
                     "name": row['종목명'],
                     "market": row['시장'] if '시장' in row.index and pd.notna(row['시장']) else "-",
                 })
-            return None, None, candidates
+            return candidates
 
-    # 스크리너 캐시에서 못 찾았으면 네이버 실시간 검색으로 대체
-    live_candidates = search_naver_stock_by_name(query)
+        # 1) 별칭 사전 매칭 우선
+        if alias_target:
+            exact_alias = screener_df[names == alias_target]
+            if not exact_alias.empty:
+                row = exact_alias.iloc[0]
+                return normalize_kr_code(row['종목코드']), row['종목명'], []
+
+        # 2) 정확히 일치
+        exact = screener_df[names == query]
+        if not exact.empty:
+            row = exact.iloc[0]
+            return normalize_kr_code(row['종목코드']), row['종목명'], []
+
+        # 3) 일반 부분 문자열 포함 (기존 로직)
+        partial = screener_df[names.str.contains(query, case=False, na=False, regex=False)]
+
+        # 4) 공백/하이픈/대소문자를 무시한 정규화 부분 문자열 포함 (예: "LG 씨엔에스" ↔ "LGCNS" 계열 표기 차이 보완)
+        if partial.empty:
+            norm_names = names.map(_normalize_for_match)
+            partial = screener_df[norm_names.str.contains(norm_query, na=False, regex=False)]
+
+        if len(partial) == 1:
+            row = partial.iloc[0]
+            return normalize_kr_code(row['종목코드']), row['종목명'], []
+        if len(partial) > 1:
+            return None, None, _build_candidates(screener_df.index.isin(partial.index))
+
+        # 5) 그래도 못 찾으면 철자가 비슷한 종목명을 유사도 기반으로 추천
+        close = difflib.get_close_matches(query, names.tolist(), n=8, cutoff=0.55)
+        if close:
+            return None, None, _build_candidates(names.isin(close))
+
+    # 스크리너 캐시에서 못 찾았으면 네이버 실시간 검색으로 대체 (별칭이 있으면 실제 이름으로 검색)
+    live_candidates = search_naver_stock_by_name(alias_target or query)
     if len(live_candidates) == 1:
         return live_candidates[0]["code"], live_candidates[0]["name"], []
     if len(live_candidates) > 1:
