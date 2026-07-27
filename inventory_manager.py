@@ -7,6 +7,9 @@ import re
 import io
 import html as html_lib
 import hashlib
+import hmac
+import base64
+import numpy as np
 
 # ==== 🚀 [테마 강제 고정 로직] ====
 try:
@@ -31,6 +34,8 @@ except Exception:
 import streamlit as st
 import pandas as pd
 import requests
+import gspread
+from google.oauth2.service_account import Credentials
 
 # =========================
 # ⚙️ 페이지 설정
@@ -1633,6 +1638,177 @@ def check_naver_52w_robust(row_dict):
             }
     return None
 
+def run_unified_market_scan():
+    """전체 시장 스크리너 스캔 + 52주 고점 매칭(추천 종목 후보 산출)을 한 번에 실행.
+    대시보드 / 추천 종목 / 종목 스크리너, 어디서 버튼을 눌러도 이 함수 하나로
+    'shared_screener_df'와 'reco_raw_data'가 함께 갱신되어 세 화면 모두 같은 데이터를 공유한다."""
+    pb = st.progress(0, text="[1/2] 전체 시장 데이터 스캔 준비 중...")
+
+    # 1단계: 전체 시장 스캔 (종목 스크리너 데이터)
+    try:
+        fetch_and_cache_screener_data.clear()
+        temp_df = pd.DataFrame()
+        for status_msg, pct in fetch_screener_data_generator():
+            if isinstance(status_msg, str):
+                pb.progress(pct, text=f"[1/2] 전체 시장 스캔 중: {status_msg}")
+            else:
+                temp_df = status_msg
+
+        if temp_df.empty:
+            pb.empty()
+            st.error("통신 지연으로 시장 스캔에 실패했습니다. 다시 시도해주세요.")
+            return False
+
+        temp_df = _safe_save_screener_df(temp_df, "saved_screener_data.csv")
+        st.session_state['shared_screener_df'] = temp_df
+        screener_df = temp_df
+
+        if st.session_state.get("_screener_missing_pages"):
+            st.warning(f"⚠️ 이번 스캔에서 끝내 실패한 페이지 (시장구분, 페이지번호): {st.session_state['_screener_missing_pages']}")
+            st.session_state["_screener_missing_pages"] = []
+    except Exception as e:
+        pb.empty()
+        st.error(f"스캔 실패: {e}")
+        return False
+
+    # 2단계: 52주 고점 매칭 → 추천 종목 후보 산출
+    load_high52_map.clear()
+    high52_map = load_high52_map()
+    scan_workers = 8 if high52_map else 5
+
+    df = screener_df.copy()
+    finance_keywords = '금융|은행|증권|보험|캐피탈|지주|투자|저축'
+    cond = (
+        (df['PER'] > 0) & (df['PER'] <= 40) &
+        (df['PBR'] > 0) & (df['PBR'] <= 4.0) &
+        (df['ROE'] >= 0) &
+        (df['부채비율'] >= 0) & (df['부채비율'] <= 300) &
+        (~df['종목명'].astype(str).str.contains(finance_keywords, regex=True, na=False))
+    )
+    val_df = df[cond].copy()
+
+    if val_df.empty:
+        pb.progress(100, text="✨ 시장 스캔 완료!")
+        time.sleep(0.3)
+        pb.empty()
+        st.warning("현재 시장 데이터 기준, 최소 요건(D급)을 통과한 종목조차 없습니다. 추천 종목 후보 산출은 건너뜁니다.")
+        return True
+
+    val_df = val_df.sort_values('ROE', ascending=False).head(150)
+    rows = []
+    dict_records = val_df.to_dict('records')
+    total = len(dict_records)
+    progress_text = "⚡ CSV 고점 데이터 매칭 중..." if high52_map else "⚡ 네이버 실시간 API 스캔 중..."
+    completed = 0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=scan_workers) as executor:
+        futures = {executor.submit(check_naver_52w_robust, r): r for r in dict_records}
+        for future in concurrent.futures.as_completed(futures):
+            completed += 1
+            pb.progress(int((completed / total) * 100), text=f"[2/2] {progress_text} ({completed}/{total})")
+            res = future.result()
+            if res: rows.append(res)
+
+    pb.progress(100, text="✨ 스캔 완료! (스크리너 + 추천 종목 데이터가 함께 갱신되었습니다)")
+    time.sleep(0.4)
+    pb.empty()
+
+    if rows:
+        st.session_state['reco_raw_data'] = pd.DataFrame(rows)
+    else:
+        st.session_state.pop('reco_raw_data', None)
+        st.warning("분석 결과 고점 대비 유의미하게 하락한 종목이 없습니다.")
+
+    return True
+
+def estimate_simple_target_price(current_price, per=None, pbr=None):
+    """PER 15배 환산 → PBR 1.3배 환산 → 현재가 +25% 순으로 간이 목표가를 추정.
+    '전략 계산'에서 이미 쓰는 방식과 동일한 우선순위를 따른다 (일관성 유지 목적)."""
+    if not current_price or current_price <= 0:
+        return 0, ""
+    if per and per > 0:
+        return round(current_price * (15.0 / per)), "PER 15× 추정"
+    if pbr and pbr > 0:
+        return round(current_price * (1.3 / pbr)), "PBR 1.3× 추정"
+    return round(current_price * 1.25), "현재가 +25% 추정"
+
+@st.cache_data(ttl=3600 * 6, show_spinner=False)
+def estimate_target_hit_probability(stock_code, market_hint, target_price, horizons=(30, 90, 180), n_sims=3000):
+    """최근 1년 일별 종가의 변동성을 이용한 몬테카를로 시뮬레이션으로,
+    각 기간(일)이 '끝나는 시점(종가 기준)'에 목표가 이상(또는 이하)에 있을 확률을 추정한다.
+    (기간 중 잠깐이라도 스치는 '터치 확률'이 아니라, 만기 시점 가격 기준의 더 보수적인 확률이다.)
+
+    ⚠️ 방향성(드리프트)은 과거 수익률로 미래 상승/하락을 예단하지 않기 위해
+    보수적으로 0(무추세, 랜덤워크)으로 가정한다. 즉 순수하게 '가격이 그동안
+    얼마나 넓게 흔들려왔는가(변동성)'만으로 도달 가능성을 계산한 참고용 통계치이며,
+    재무제표·실적·공시 내용을 반영한 예측이 아니다."""
+    if target_price is None or target_price <= 0:
+        return None
+    try:
+        import yfinance as yf
+        suffix_order = [".KQ", ".KS"] if market_hint == "코스닥" else [".KS", ".KQ"]
+        hist = pd.DataFrame()
+        for suf in suffix_order:
+            try:
+                hist = yf.Ticker(f"{stock_code}{suf}").history(period="1y", interval="1d")
+            except Exception:
+                hist = pd.DataFrame()
+            if not hist.empty:
+                break
+
+        if hist.empty or "Close" not in hist.columns:
+            return None
+        closes = hist["Close"].dropna()
+        if len(closes) < 40:
+            return None
+
+        current_price = float(closes.iloc[-1])
+        if current_price <= 0:
+            return None
+
+        log_returns = np.log(closes / closes.shift(1)).dropna().values
+        sigma_daily = float(np.std(log_returns))
+        if sigma_daily <= 0:
+            return None
+
+        max_h = max(horizons)
+        rng = np.random.default_rng(7)
+        # 드리프트 0 가정(보수적 기본값) : E[가격] = 현재가로 유지되도록 -0.5*sigma^2 보정
+        shocks = rng.normal(loc=-0.5 * sigma_daily ** 2, scale=sigma_daily, size=(n_sims, max_h))
+        log_paths = np.cumsum(shocks, axis=1)
+        price_paths = current_price * np.exp(log_paths)
+
+        probs = {}
+        for h in horizons:
+            terminal_prices = price_paths[:, h - 1]  # 해당 기간이 끝나는 시점(종가 기준)의 가격
+            if target_price >= current_price:
+                hit = terminal_prices >= target_price
+            else:
+                hit = terminal_prices <= target_price
+            probs[h] = round(float(np.mean(hit)) * 100, 1)
+
+        return {"current_price": current_price, "sigma_daily_pct": round(sigma_daily * 100, 2), "probs": probs}
+    except Exception:
+        return None
+
+def render_hit_probability_badge(stock_code, market_hint, target_price, target_src="목표가"):
+    """estimate_target_hit_probability 결과를 카드용 인라인 HTML 배지로 렌더링."""
+    if not target_price or target_price <= 0:
+        return ""
+    result = estimate_target_hit_probability(stock_code, market_hint, target_price)
+    if not result:
+        return ""
+
+    probs = result["probs"]
+    p30, p90, p180 = probs.get(30, 0), probs.get(90, 0), probs.get(180, 0)
+
+    return (
+        f"<div style='margin-top:8px; padding:9px 12px; background:#F5F3FF; border:1px solid #DDD6FE; border-radius:8px;'>"
+        f"<div style='font-size:11px; color:#6D28D9; font-weight:700; margin-bottom:3px;'>🎲 {target_price:,}원({target_src}) 도달 확률 · 종가 기준 통계 추정</div>"
+        f"<div style='font-size:13px; color:#4C1D95;'>30일 <b>{p30:.0f}%</b> &nbsp;·&nbsp; 90일 <b>{p90:.0f}%</b> &nbsp;·&nbsp; 180일 <b>{p180:.0f}%</b></div>"
+        f"</div>"
+    )
+
 def find_col(df: pd.DataFrame, candidates: list) -> str | None:
     for c in candidates:
         if c in df.columns: return c
@@ -2034,10 +2210,27 @@ def draw_fnguide_details(code):
 # =========================
 
 # =========================
-# 🔐 로그인 / 회원가입 (로컬 CSV 저장)
+# 🔐 로그인 / 회원가입 (Google Sheets 저장)
 # =========================
-USERS_CSV_PATH = "users.csv"
 _USER_COLUMNS = ["아이디", "비밀번호해시", "salt", "이메일", "가입일"]
+
+@st.cache_resource(show_spinner=False)
+def _get_gsheet_client():
+    """구글 서비스 계정 인증 및 gspread 클라이언트 생성 (앱 실행 중 1회만 수행)."""
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
+    )
+    return gspread.authorize(creds)
+
+def _get_worksheet(sheet_tab_name):
+    """지정한 탭(worksheet) 객체를 반환."""
+    client = _get_gsheet_client()
+    spreadsheet = client.open(st.secrets["gsheet"]["sheet_name"])
+    return spreadsheet.worksheet(sheet_tab_name)
 
 def _hash_password(password, salt=None):
     """비밀번호를 salt와 함께 PBKDF2-SHA256으로 해싱. 평문은 절대 저장하지 않음."""
@@ -2048,17 +2241,19 @@ def _hash_password(password, salt=None):
     ).hex()
     return pwd_hash, salt
 
+@st.cache_data(ttl=30, show_spinner=False)
 def load_users():
-    if os.path.exists(USERS_CSV_PATH):
-        try:
-            df = pd.read_csv(USERS_CSV_PATH, dtype=str).fillna("")
-            for col in _USER_COLUMNS:
-                if col not in df.columns:
-                    df[col] = ""
-            return df[_USER_COLUMNS]
-        except Exception:
-            return pd.DataFrame(columns=_USER_COLUMNS)
-    return pd.DataFrame(columns=_USER_COLUMNS)
+    """users 시트의 모든 사용자 정보를 DataFrame으로 반환 (30초 캐시)."""
+    try:
+        ws = _get_worksheet("users")
+        records = ws.get_all_records(numericise_ignore=['all'])
+        df = pd.DataFrame(records, dtype=str).fillna("")
+        for col in _USER_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        return df[_USER_COLUMNS]
+    except Exception:
+        return pd.DataFrame(columns=_USER_COLUMNS)
 
 def username_exists(username):
     users = load_users()
@@ -2073,17 +2268,15 @@ def email_exists(email):
     return (users["이메일"].astype(str).str.lower() == email.lower()).any()
 
 def save_user(username, password, email):
-    users = load_users()
+    """새 사용자를 users 시트에 한 행 추가."""
     pwd_hash, salt = _hash_password(password)
-    new_row = {
-        "아이디": username,
-        "비밀번호해시": pwd_hash,
-        "salt": salt,
-        "이메일": email,
-        "가입일": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-    }
-    users = pd.concat([users, pd.DataFrame([new_row])], ignore_index=True)
-    users.to_csv(USERS_CSV_PATH, index=False)
+    new_row = [
+        username, pwd_hash, salt, email,
+        datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+    ]
+    ws = _get_worksheet("users")
+    ws.append_row(new_row, value_input_option="RAW")
+    load_users.clear()  # 캐시 무효화
 
 def authenticate_user(username, password):
     users = load_users()
@@ -2096,26 +2289,90 @@ def authenticate_user(username, password):
     check_hash, _ = _hash_password(password, salt=row["salt"])
     return check_hash == row["비밀번호해시"]
 
+# ── F5 새로고침에도 로그인이 풀리지 않도록: 서명된 세션 토큰을 URL에 저장 ──
+# (Streamlit은 브라우저를 새로고침하면 session_state가 초기화되므로,
+#  URL의 쿼리파라미터에 위변조 불가능한 토큰을 넣어두고 새로고침 시 이를 검증해 로그인 상태를 복원한다.)
+def _get_session_secret():
+    try:
+        return str(st.secrets["SESSION_SECRET"])
+    except Exception:
+        return os.environ.get("SESSION_SECRET", "insecure-default-please-set-SESSION_SECRET")
+
+def make_session_token(username, ttl_days=7):
+    """로그인 성공 시 호출: username과 만료시각을 HMAC으로 서명한 토큰 문자열을 생성."""
+    expire_at = int(time.time()) + ttl_days * 86400
+    payload = f"{username}:{expire_at}"
+    sig = hmac.new(_get_session_secret().encode(), payload.encode(), hashlib.sha256).hexdigest()
+    raw = f"{payload}:{sig}"
+    return base64.urlsafe_b64encode(raw.encode()).decode()
+
+def verify_session_token(token):
+    """URL에 있는 토큰을 검증해 유효하면 username을, 아니면 None을 반환."""
+    try:
+        raw = base64.urlsafe_b64decode(token.encode()).decode()
+        username, expire_at, sig = raw.rsplit(":", 2)
+        if int(expire_at) < time.time():
+            return None
+        expected_sig = hmac.new(_get_session_secret().encode(), f"{username}:{expire_at}".encode(), hashlib.sha256).hexdigest()
+        if hmac.compare_digest(sig, expected_sig):
+            return username
+    except Exception:
+        pass
+    return None
+
+def verify_user_email(username, email):
+    """비밀번호 재설정 전 본인확인용: 아이디와 이메일이 실제로 일치하는지 확인."""
+    users = load_users()
+    if users.empty:
+        return False
+    matched = users[users["아이디"].astype(str) == username]
+    if matched.empty:
+        return False
+    return str(matched.iloc[0]["이메일"]).strip().lower() == email.strip().lower()
+
+def update_user_password(username, new_password):
+    """해당 사용자의 비밀번호 해시/salt를 새 값으로 갱신."""
+    ws = _get_worksheet("users")
+    records = ws.get_all_records(numericise_ignore=['all'])
+    row_idx = None
+    for i, rec in enumerate(records):
+        if str(rec.get("아이디", "")) == username:
+            row_idx = i + 2  # 헤더가 1행이므로 데이터는 2행부터 시작
+            break
+    if row_idx is None:
+        return False
+    pwd_hash, salt = _hash_password(new_password)
+    ws.update_cell(row_idx, _USER_COLUMNS.index("비밀번호해시") + 1, pwd_hash)
+    ws.update_cell(row_idx, _USER_COLUMNS.index("salt") + 1, salt)
+    load_users.clear()
+    return True
+
 
 # =========================
-# ⭐ 관심종목 (마이페이지, 로컬 CSV 저장)
+# ⭐ 관심종목 (마이페이지, Google Sheets 저장)
 # =========================
-WATCHLIST_CSV_PATH = "watchlist.csv"
 _WATCHLIST_COLUMNS = ["아이디", "종목코드", "종목명", "추가일", "매수가", "수량", "1차진입가", "2차진입가", "3차진입가", "고정"]
 
-def load_watchlist(username):
-    """현재 로그인한 사용자의 관심종목만 반환."""
-    if not os.path.exists(WATCHLIST_CSV_PATH):
-        return pd.DataFrame(columns=_WATCHLIST_COLUMNS)
+@st.cache_data(ttl=30, show_spinner=False)
+def _load_all_watchlist():
+    """watchlist 시트 전체를 DataFrame으로 반환 (30초 캐시, 내부용)."""
     try:
-        df = pd.read_csv(WATCHLIST_CSV_PATH, dtype=str).fillna("")
+        ws = _get_worksheet("watchlist")
+        records = ws.get_all_records(numericise_ignore=['all'])
+        df = pd.DataFrame(records, dtype=str).fillna("")
         for col in _WATCHLIST_COLUMNS:
             if col not in df.columns:
                 df[col] = ""
-        df = df[_WATCHLIST_COLUMNS]
-        return df[df["아이디"] == username].reset_index(drop=True)
+        return df[_WATCHLIST_COLUMNS]
     except Exception:
         return pd.DataFrame(columns=_WATCHLIST_COLUMNS)
+
+def load_watchlist(username):
+    """현재 로그인한 사용자의 관심종목만 반환."""
+    df = _load_all_watchlist()
+    if df.empty:
+        return df
+    return df[df["아이디"] == username].reset_index(drop=True)
 
 def is_in_watchlist(username, code):
     wl = load_watchlist(username)
@@ -2127,94 +2384,74 @@ def add_to_watchlist(username, code, name):
     code = normalize_kr_code(code)
     if is_in_watchlist(username, code):
         return False  # 이미 있음
-    if os.path.exists(WATCHLIST_CSV_PATH):
-        try:
-            all_df = pd.read_csv(WATCHLIST_CSV_PATH, dtype=str).fillna("")
-        except Exception:
-            all_df = pd.DataFrame(columns=_WATCHLIST_COLUMNS)
-    else:
-        all_df = pd.DataFrame(columns=_WATCHLIST_COLUMNS)
-    for col in _WATCHLIST_COLUMNS:
-        if col not in all_df.columns:
-            all_df[col] = ""
-    new_row = {
-        "아이디": username, "종목코드": code, "종목명": name,
-        "추가일": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "매수가": "", "수량": "",
-        "1차진입가": "", "2차진입가": "", "3차진입가": "",
-        "고정": "",
-    }
-    all_df = pd.concat([all_df[_WATCHLIST_COLUMNS], pd.DataFrame([new_row])], ignore_index=True)
-    all_df.to_csv(WATCHLIST_CSV_PATH, index=False)
+    new_row = [
+        username, code, name,
+        datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "", "", "", "", "", "",
+    ]
+    ws = _get_worksheet("watchlist")
+    ws.append_row(new_row, value_input_option="RAW")
+    _load_all_watchlist.clear()
     return True
+
+def _find_watchlist_row_indices(ws, username, code):
+    """해당 사용자+종목코드에 해당하는 시트 상의 실제 행 번호(1-base, 헤더 포함)를 반환."""
+    records = ws.get_all_records(numericise_ignore=['all'])
+    indices = []
+    for i, rec in enumerate(records):
+        if str(rec.get("아이디", "")) == username and str(rec.get("종목코드", "")) == code:
+            indices.append(i + 2)  # 헤더가 1행이므로 데이터는 2행부터 시작
+    return indices
 
 def remove_from_watchlist(username, code):
     code = normalize_kr_code(code)
-    if not os.path.exists(WATCHLIST_CSV_PATH):
+    ws = _get_worksheet("watchlist")
+    row_indices = _find_watchlist_row_indices(ws, username, code)
+    if not row_indices:
+        st.warning(f"삭제할 항목을 시트에서 찾지 못했습니다. (종목코드 {code})")
         return
-    try:
-        all_df = pd.read_csv(WATCHLIST_CSV_PATH, dtype=str).fillna("")
-    except Exception:
-        return
-    for col in _WATCHLIST_COLUMNS:
-        if col not in all_df.columns:
-            all_df[col] = ""
-    keep = ~((all_df["아이디"] == username) & (all_df["종목코드"] == code))
-    all_df[keep][_WATCHLIST_COLUMNS].to_csv(WATCHLIST_CSV_PATH, index=False)
+    for row_idx in sorted(row_indices, reverse=True):
+        ws.delete_rows(row_idx)
+    _load_all_watchlist.clear()
 
 def update_watchlist_holding(username, code, buy_price, qty):
     """관심종목 항목에 매수가/수량(보유 정보)을 저장."""
     code = normalize_kr_code(code)
-    if not os.path.exists(WATCHLIST_CSV_PATH):
-        return
-    try:
-        all_df = pd.read_csv(WATCHLIST_CSV_PATH, dtype=str).fillna("")
-    except Exception:
-        return
-    for col in _WATCHLIST_COLUMNS:
-        if col not in all_df.columns:
-            all_df[col] = ""
-    mask = (all_df["아이디"] == username) & (all_df["종목코드"] == code)
-    all_df.loc[mask, "매수가"] = str(buy_price) if buy_price else ""
-    all_df.loc[mask, "수량"] = str(qty) if qty else ""
-    all_df[_WATCHLIST_COLUMNS].to_csv(WATCHLIST_CSV_PATH, index=False)
-
+    ws = _get_worksheet("watchlist")
+    row_indices = _find_watchlist_row_indices(ws, username, code)
+    for row_idx in row_indices:
+        ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("매수가") + 1, str(buy_price) if buy_price else "")
+        ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("수량") + 1, str(qty) if qty else "")
+    _load_all_watchlist.clear()
 
 def update_watchlist_entries(username, code, entry1, entry2, entry3):
     """관심종목 항목에 1차/2차/3차 매수 진입가를 저장."""
     code = normalize_kr_code(code)
-    if not os.path.exists(WATCHLIST_CSV_PATH):
-        return
-    try:
-        all_df = pd.read_csv(WATCHLIST_CSV_PATH, dtype=str).fillna("")
-    except Exception:
-        return
-    for col in _WATCHLIST_COLUMNS:
-        if col not in all_df.columns:
-            all_df[col] = ""
-    mask = (all_df["아이디"] == username) & (all_df["종목코드"] == code)
-    all_df.loc[mask, "1차진입가"] = str(entry1) if entry1 else ""
-    all_df.loc[mask, "2차진입가"] = str(entry2) if entry2 else ""
-    all_df.loc[mask, "3차진입가"] = str(entry3) if entry3 else ""
-    all_df[_WATCHLIST_COLUMNS].to_csv(WATCHLIST_CSV_PATH, index=False)
-
+    ws = _get_worksheet("watchlist")
+    row_indices = _find_watchlist_row_indices(ws, username, code)
+    for row_idx in row_indices:
+        ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("1차진입가") + 1, str(entry1) if entry1 else "")
+        ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("2차진입가") + 1, str(entry2) if entry2 else "")
+        ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("3차진입가") + 1, str(entry3) if entry3 else "")
+    _load_all_watchlist.clear()
 
 def toggle_watchlist_pin(username, code):
     """관심종목 항목의 상단 고정 상태를 토글."""
     code = normalize_kr_code(code)
-    if not os.path.exists(WATCHLIST_CSV_PATH):
+    wl = load_watchlist(username)
+    is_pinned = False
+    if not wl.empty:
+        match = wl[wl["종목코드"] == code]
+        if not match.empty:
+            is_pinned = (match.iloc[0]["고정"] == "Y")
+    ws = _get_worksheet("watchlist")
+    row_indices = _find_watchlist_row_indices(ws, username, code)
+    if not row_indices:
+        st.warning(f"항목을 시트에서 찾지 못해 고정 상태를 변경하지 못했습니다. (종목코드 {code})")
         return
-    try:
-        all_df = pd.read_csv(WATCHLIST_CSV_PATH, dtype=str).fillna("")
-    except Exception:
-        return
-    for col in _WATCHLIST_COLUMNS:
-        if col not in all_df.columns:
-            all_df[col] = ""
-    mask = (all_df["아이디"] == username) & (all_df["종목코드"] == code)
-    is_pinned = (all_df.loc[mask, "고정"] == "Y").any()
-    all_df.loc[mask, "고정"] = "" if is_pinned else "Y"
-    all_df[_WATCHLIST_COLUMNS].to_csv(WATCHLIST_CSV_PATH, index=False)
+    for row_idx in row_indices:
+        ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("고정") + 1, "" if is_pinned else "Y")
+    _load_all_watchlist.clear()
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -2870,6 +3107,28 @@ def render_watchlist():
                                 remove_from_watchlist(username, code)
                                 st.rerun()
 
+            _custom_tgt_raw = re.sub(r"[^\d]", "", str(st.session_state.get(f"wl_target_{code}", "")))
+            _custom_tgt = int(_custom_tgt_raw) if _custom_tgt_raw else 0
+
+            if _custom_tgt > 0:
+                _tgt_price, _tgt_src = _custom_tgt, "직접 입력"
+                _market_hint = live.get('시장') if live is not None else None
+                _prob_html = render_hit_probability_badge(code, _market_hint, _tgt_price, _tgt_src)
+                if _prob_html:
+                    st.markdown(_prob_html, unsafe_allow_html=True)
+            elif live is not None:
+                _base_price = live.get('현재가')
+                _per_v = live.get('PER')
+                _pbr_v = live.get('PBR')
+                _base_price = float(_base_price) if pd.notna(_base_price) and _base_price else 0.0
+                _per_v = float(_per_v) if pd.notna(_per_v) and _per_v else None
+                _pbr_v = float(_pbr_v) if pd.notna(_pbr_v) and _pbr_v else None
+                _tgt_price, _tgt_src = estimate_simple_target_price(_base_price, _per_v, _pbr_v)
+                if _tgt_price:
+                    _prob_html = render_hit_probability_badge(code, live.get('시장'), _tgt_price, _tgt_src)
+                    if _prob_html:
+                        st.markdown(_prob_html, unsafe_allow_html=True)
+
             wl_buy_raw, wl_qty_raw = row.get('매수가', ''), row.get('수량', '')
             try:
                 wl_buy_val = float(wl_buy_raw) if str(wl_buy_raw).strip() not in ("", "nan") else 0.0
@@ -2979,6 +3238,29 @@ def render_watchlist():
                                     update_watchlist_entries(username, code, 0, 0, 0)
                                     st.rerun()
 
+                st.markdown("<hr style='margin: 10px 0; border-color: #EEF0F3;'>", unsafe_allow_html=True)
+
+                with st.container(key=f"wl_target_row_{code}"):
+                    tg1, tg2 = st.columns([1, 2.3])
+                    with tg1:
+                        _tgt_key = f"wl_target_{code}"
+                        if _tgt_key not in st.session_state:
+                            st.session_state[_tgt_key] = ""
+
+                        def _fmt_target(k=_tgt_key):
+                            digits = re.sub(r"[^\d]", "", str(st.session_state.get(k, "")))
+                            st.session_state[k] = f"{int(digits):,}" if digits else ""
+
+                        st.text_input("목표가 직접 입력 (원)", key=_tgt_key, on_change=_fmt_target, placeholder="예: 150,000")
+                    with tg2:
+                        st.markdown(
+                            "<div style='padding-top:28px; font-size:11px; color:#94A3B8;'>"
+                            "입력하면 위 도달 확률 배지가 이 금액 기준으로 즉시 갱신됩니다. "
+                            "단, 이 값은 <b>현재 세션에서만</b> 유지되며 새로고침·재로그인 시 초기화됩니다."
+                            "</div>",
+                            unsafe_allow_html=True,
+                        )
+
 def render_login_page():
     st.markdown("""
         <style>
@@ -3034,28 +3316,33 @@ def render_login_page():
             section[data-testid="stMain"] .stTextInput input::placeholder {
                 color: #9CA3AF !important;
             }
-            /* 비밀번호 눈(👁) 아이콘 버튼이 검정 배경으로 보이던 문제 수정 */
-            section[data-testid="stMain"] .stTextInput button {
-                background-color: transparent !important;
-                border: none !important;
-            }
-            section[data-testid="stMain"] .stTextInput button svg {
-                fill: #6B7280 !important;
+            /* 비밀번호 표시/숨기기(눈 모양) 아이콘 버튼 완전히 숨김 */
+            section[data-testid="stMain"] .stTextInput button[aria-label="Show password"],
+            section[data-testid="stMain"] .stTextInput button[aria-label="Hide password"] {
+                display: none !important;
             }
 
-            /* 로그인/회원가입 제출 버튼: 크고 둥글게 */
-            section[data-testid="stMain"] .stButton > button {
+            /* 로그인/회원가입 제출 버튼: 크고 둥글게 (st.button, st.form_submit_button 둘 다 적용) */
+            section[data-testid="stMain"] .stButton > button,
+            section[data-testid="stMain"] .stFormSubmitButton > button {
                 background-color: #5A4EE5 !important;
                 border: none !important;
                 border-radius: 10px !important;
                 padding: 12px 0 !important;
                 font-weight: 700 !important;
             }
-            section[data-testid="stMain"] .stButton > button p {
+            section[data-testid="stMain"] .stButton > button p,
+            section[data-testid="stMain"] .stFormSubmitButton > button p {
                 color: #FFFFFF !important; font-weight: 700 !important;
             }
-            section[data-testid="stMain"] .stButton > button:hover {
+            section[data-testid="stMain"] .stButton > button:hover,
+            section[data-testid="stMain"] .stFormSubmitButton > button:hover {
                 background-color: #4C41C3 !important;
+            }
+            /* st.form의 기본 테두리 제거 - 카드 안에 이중 박스 안생기게 */
+            section[data-testid="stMain"] div[data-testid="stForm"] {
+                border: none !important;
+                padding: 0 !important;
             }
 
             section[data-testid="stMain"] .stTabs [data-baseweb="tab"] p {
@@ -3068,9 +3355,21 @@ def render_login_page():
     with mid:
         with st.container(border=False, key="auth_box"):
             st.markdown("<div class='auth-title'>Inventory Manager</div>", unsafe_allow_html=True)
-            tab_login, tab_signup = st.tabs(["로그인", "회원가입"])
+
+            # 회원가입 성공 직후에는 탭 위젯이 만들어지기 전에 먼저 값을 세팅해야
+            # "위젯 생성 후에는 session_state를 못 바꾼다"는 예외를 피할 수 있음
+            if st.session_state.pop("_force_login_tab", False):
+                st.session_state["auth_tabs"] = "로그인"
+
+            tab_login, tab_signup = st.tabs(
+                ["로그인", "회원가입"],
+                key="auth_tabs",
+                on_change="rerun",
+            )
 
             with tab_login:
+                if st.session_state.get("signup_success_msg"):
+                    st.success(st.session_state.pop("signup_success_msg"))
                 login_id = st.text_input("아이디", key="login_id", placeholder="아이디")
                 login_pw = st.text_input("비밀번호", type="password", key="login_pw", placeholder="비밀번호")
                 if st.button("로그인", use_container_width=True, key="login_btn"):
@@ -3078,16 +3377,51 @@ def render_login_page():
                         st.warning("아이디와 비밀번호를 모두 입력해주세요.")
                     elif authenticate_user(login_id.strip(), login_pw):
                         st.session_state.auth_user = login_id.strip()
+                        st.query_params["session_token"] = make_session_token(login_id.strip())
                         st.rerun()
                     else:
                         st.error("아이디 또는 비밀번호가 올바르지 않습니다.")
 
+                with st.expander("비밀번호를 잊으셨나요?"):
+                    if st.session_state.get("reset_success_msg"):
+                        st.success(st.session_state.pop("reset_success_msg"))
+                    with st.form("reset_pw_form", clear_on_submit=False):
+                        rs_id = st.text_input("아이디", key="reset_id", placeholder="아이디")
+                        rs_email = st.text_input("가입 시 등록한 이메일", key="reset_email", placeholder="example@email.com")
+                        rs_pw = st.text_input("새 비밀번호", type="password", key="reset_pw", placeholder="4자 이상")
+                        rs_pw2 = st.text_input("새 비밀번호 확인", type="password", key="reset_pw2", placeholder="비밀번호 다시 입력")
+                        reset_submitted = st.form_submit_button("비밀번호 재설정", use_container_width=True)
+
+                    if reset_submitted:
+                        rs_id_clean = (rs_id or "").strip()
+                        rs_email_clean = (rs_email or "").strip()
+                        reset_errors = []
+                        if not rs_id_clean or not rs_email_clean:
+                            reset_errors.append("아이디와 이메일을 모두 입력해주세요.")
+                        elif not verify_user_email(rs_id_clean, rs_email_clean):
+                            reset_errors.append("아이디와 이메일이 일치하는 계정을 찾을 수 없습니다.")
+                        if not rs_pw or len(rs_pw) < 4:
+                            reset_errors.append("새 비밀번호는 4자 이상 입력해주세요.")
+                        elif rs_pw != rs_pw2:
+                            reset_errors.append("새 비밀번호가 서로 일치하지 않습니다.")
+
+                        if reset_errors:
+                            for e in reset_errors:
+                                st.error(e)
+                        else:
+                            update_user_password(rs_id_clean, rs_pw)
+                            st.session_state["reset_success_msg"] = "비밀번호가 재설정되었습니다. 새 비밀번호로 로그인해주세요."
+                            st.rerun()
+
             with tab_signup:
-                su_id = st.text_input("아이디", key="signup_id", placeholder="3자 이상")
-                su_email = st.text_input("이메일", key="signup_email", placeholder="example@email.com")
-                su_pw = st.text_input("비밀번호", type="password", key="signup_pw", placeholder="4자 이상")
-                su_pw2 = st.text_input("비밀번호 확인", type="password", key="signup_pw2", placeholder="비밀번호 다시 입력")
-                if st.button("회원가입", use_container_width=True, key="signup_btn"):
+                with st.form("signup_form", clear_on_submit=False):
+                    su_id = st.text_input("아이디", key="signup_id", placeholder="3자 이상")
+                    su_email = st.text_input("이메일", key="signup_email", placeholder="example@email.com")
+                    su_pw = st.text_input("비밀번호", type="password", key="signup_pw", placeholder="4자 이상")
+                    su_pw2 = st.text_input("비밀번호 확인", type="password", key="signup_pw2", placeholder="비밀번호 다시 입력")
+                    submitted = st.form_submit_button("회원가입", use_container_width=True)
+
+                if submitted:
                     su_id_clean = (su_id or "").strip()
                     su_email_clean = (su_email or "").strip()
                     errors = []
@@ -3111,11 +3445,59 @@ def render_login_page():
                             st.error(e)
                     else:
                         save_user(su_id_clean, su_pw, su_email_clean)
-                        st.success("회원가입이 완료되었습니다! '로그인' 탭에서 로그인해주세요.")
+                        st.session_state["_force_login_tab"] = True
+                        st.session_state["signup_success_msg"] = f"회원가입이 완료되었습니다! 아이디 '{su_id_clean}'로 로그인해주세요."
+                        st.rerun()
+
+def render_change_password():
+    st.header(
+        "비밀번호 변경",
+        help="현재 비밀번호를 확인한 뒤 새 비밀번호로 변경합니다."
+    )
+    st.markdown("<hr style='margin: 10px 0 25px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
+
+    _, mid, _ = st.columns([1, 1.5, 1])
+    with mid:
+        with st.form("change_pw_form", clear_on_submit=True):
+            cur_pw = st.text_input("현재 비밀번호", type="password", key="change_pw_cur", placeholder="현재 비밀번호")
+            new_pw = st.text_input("새 비밀번호", type="password", key="change_pw_new", placeholder="4자 이상")
+            new_pw2 = st.text_input("새 비밀번호 확인", type="password", key="change_pw_new2", placeholder="새 비밀번호 다시 입력")
+            submitted = st.form_submit_button("비밀번호 변경", use_container_width=True)
+
+        if submitted:
+            username = st.session_state.auth_user
+            errors = []
+            if not cur_pw:
+                errors.append("현재 비밀번호를 입력해주세요.")
+            elif not authenticate_user(username, cur_pw):
+                errors.append("현재 비밀번호가 올바르지 않습니다.")
+
+            if not new_pw or len(new_pw) < 4:
+                errors.append("새 비밀번호는 4자 이상 입력해주세요.")
+            elif new_pw != new_pw2:
+                errors.append("새 비밀번호가 서로 일치하지 않습니다.")
+            elif cur_pw and new_pw == cur_pw:
+                errors.append("현재 비밀번호와 다른 비밀번호를 입력해주세요.")
+
+            if errors:
+                for e in errors:
+                    st.error(e)
+            else:
+                update_user_password(username, new_pw)
+                st.success("비밀번호가 변경되었습니다.")
 
 def main():
     if 'auth_user' not in st.session_state:
         st.session_state.auth_user = None
+
+    # 🔁 F5 새로고침 대응: session_state는 새로고침 시 초기화되지만
+    # URL 쿼리파라미터는 유지되므로, 그 안의 서명 토큰으로 로그인 상태를 복원한다.
+    if not st.session_state.auth_user:
+        _token = st.query_params.get("session_token")
+        if _token:
+            _restored_user = verify_session_token(_token)
+            if _restored_user:
+                st.session_state.auth_user = _restored_user
 
     # 🛠️ 개발용 로그인 우회: 터미널에서 DEV_SKIP_LOGIN=admin 으로 실행할 때만 적용됨.
     # (환경변수를 설정하지 않고 배포하면 다른 사용자는 평소처럼 로그인해야 함)
@@ -3146,6 +3528,8 @@ def main():
             
             section[data-testid="stMain"] h1, section[data-testid="stMain"] h2, section[data-testid="stMain"] p { color: #111827 !important; }
             .stTextInput input, .stNumberInput input, .stSelectbox > div > div { background-color: #FFFFFF !important; color: #111827 !important; border: 1px solid #D1D5DB !important; border-radius: 6px !important; }
+            .stTextInput button[aria-label="Show password"],
+            .stTextInput button[aria-label="Hide password"] { display: none !important; }
             
             button[data-testid="stNumberInputStepUp"], button[data-testid="stNumberInputStepDown"] { color: #5A4EE5 !important; background-color: #F8FAFC !important; }
             button[data-testid="stNumberInputStepUp"] svg, button[data-testid="stNumberInputStepDown"] svg { fill: #5A4EE5 !important; }
@@ -3291,6 +3675,8 @@ def main():
             )
             if st.button("로그아웃", key="logout_btn"):
                 st.session_state.auth_user = None
+                if "session_token" in st.query_params:
+                    del st.query_params["session_token"]
                 st.rerun()
 
     SIDEBAR_GROUPS = [
@@ -3307,6 +3693,7 @@ def main():
         ]),
         ("MY PAGE", [
             ("관심종목", ":material/bookmark:"),
+            ("비밀번호 변경", ":material/lock:"),
         ]),
     ]
 
@@ -3407,6 +3794,7 @@ def main():
     elif selected == "기업 재무 분석":   render_fnguide()
     elif selected == "실시간 배당 순위": render_dividend()
     elif selected == "관심종목":         render_watchlist()
+    elif selected == "비밀번호 변경":     render_change_password()
 
 def render_rate_strip():
     """기준금리 현황을 한 줄짜리 컴팩트 형태로 우측 정렬 표시."""
@@ -3460,9 +3848,9 @@ def render_dashboard():
         )
     st.markdown("<hr style='margin: 10px 0 25px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
 
-    col_refresh, col_rate_strip = st.columns([1.3, 4.7])
+    col_refresh, col_scan, col_rate_strip = st.columns([1.5, 1.5, 4.0])
     with col_refresh:
-        if st.button("데이터 새로고침"):
+        if st.button("데이터 새로고침", use_container_width=True):
             fetch_market_index_table.clear()
             fetch_investor_trend.clear()
             fetch_investor_trend_monthly.clear()
@@ -3471,8 +3859,20 @@ def render_dashboard():
             fetch_fed_rate_data.clear()
             fetch_bok_rate_data.clear()
             st.rerun()
+    with col_scan:
+        if st.button("종목 스캔 (스크리너+추천)", use_container_width=True, key="dash_unified_scan_btn"):
+            run_unified_market_scan()
+            st.rerun()
     with col_rate_strip:
         render_rate_strip()
+
+    if load_screener_df().empty:
+        st.markdown(
+            "<div style='font-size:12.5px; color:#B45309; margin: -6px 0 10px 0;'>"
+            "⚠️ 아직 스캔된 시장 데이터가 없습니다. 위 [종목 스캔] 버튼을 눌러 스크리너·추천 종목 데이터를 한 번에 받아오세요. (약 15~20초 소요)"
+            "</div>",
+            unsafe_allow_html=True,
+        )
 
     st.markdown("<div class='dash-section-title'>📈 시장 지수</div>", unsafe_allow_html=True)
     indices    = run_with_progress("시장 지수를 불러오는 중...", fetch_market_index_table)
@@ -4332,81 +4732,7 @@ def render_recommendations():
             st.markdown(f"<div style='font-size:12.5px; color:#B45309; line-height:1.5; margin-top:2px;'>{warn_text}</div>", unsafe_allow_html=True)
 
     if btn_scan:
-        if screener_df.empty:
-            pb_init = st.progress(0, text="[1/2] 전체 시장 데이터 스캔 준비 중...")
-            try:
-                fetch_and_cache_screener_data.clear()
-                temp_df = pd.DataFrame()
-                for status_msg, pct in fetch_screener_data_generator():
-                    if isinstance(status_msg, str): 
-                        pb_init.progress(pct, text=f"[1/2] 전체 시장 스캔 중: {status_msg}")
-                    else: 
-                        temp_df = status_msg
-                
-                pb_init.empty()
-                if not temp_df.empty:
-                    temp_df = _safe_save_screener_df(temp_df, "saved_screener_data.csv")
-                    st.session_state['shared_screener_df'] = temp_df
-                    screener_df = temp_df
-                    if st.session_state.get("_screener_missing_pages"):
-                        st.warning(f"⚠️ 이번 스캔에서 끝내 실패한 페이지 (시장구분, 페이지번호): {st.session_state['_screener_missing_pages']}")
-                        st.session_state["_screener_missing_pages"] = []
-                else:
-                    st.error("통신 지연으로 시장 스캔에 실패했습니다. 다시 시도해주세요.")
-                    st.stop()
-            except Exception as e:
-                pb_init.empty()
-                st.error(f"스캔 실패: {e}")
-                st.stop()
-
-        load_high52_map.clear()  
-        high52_map = load_high52_map()
-
-        df = screener_df.copy()
-        finance_keywords = '금융|은행|증권|보험|캐피탈|지주|투자|저축'
-        
-        cond = (
-            (df['PER'] > 0) & (df['PER'] <= 40) & 
-            (df['PBR'] > 0) & (df['PBR'] <= 4.0) &
-            (df['ROE'] >= 0) &
-            (df['부채비율'] >= 0) & (df['부채비율'] <= 300) &
-            (~df['종목명'].astype(str).str.contains(finance_keywords, regex=True, na=False))
-        )
-        val_df = df[cond].copy()
-        
-        if val_df.empty:
-            st.warning("현재 시장 데이터 기준, 최소 요건(D급)을 통과한 종목조차 없습니다. 스크리너 데이터를 갱신해주세요.")
-        else:
-            val_df = val_df.sort_values('ROE', ascending=False).head(150)
-            
-            rows = []
-            dict_records = val_df.to_dict('records')
-            total = len(dict_records)
-
-            if high52_map:
-                progress_text = "⚡ CSV 고점 데이터 매칭 중..." if not screener_df.empty else "[2/2] ⚡ CSV 고점 데이터 매칭 중..."
-            else:
-                progress_text = "⚡ 네이버 실시간 API 스캔 중..." if not screener_df.empty else "[2/2] ⚡ 네이버 실시간 API 스캔 중..."
-
-            pb = st.progress(0, text=progress_text)
-            completed = 0
-            
-            with concurrent.futures.ThreadPoolExecutor(max_workers=scan_workers) as executor:
-                futures = {executor.submit(check_naver_52w_robust, r): r for r in dict_records}
-                for future in concurrent.futures.as_completed(futures):
-                    completed += 1
-                    pb.progress(int((completed/total)*100), text=f"{progress_text} ({completed}/{total})")
-                    res = future.result()
-                    if res: rows.append(res)
-                
-            pb.progress(100, text="✨ 추천 종목 발굴 완료!")
-            time.sleep(0.5)
-            pb.empty()
-            
-            if rows:
-                st.session_state['reco_raw_data'] = pd.DataFrame(rows)
-            else:
-                st.warning("분석 결과 고점 대비 유의미하게 하락한 종목이 없습니다.")
+        run_unified_market_scan()
 
     if 'reco_raw_data' in st.session_state and not st.session_state['reco_raw_data'].empty:
         st.markdown("<hr style='margin: 25px 0 20px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
@@ -4631,28 +4957,7 @@ def render_screener():
     """, unsafe_allow_html=True)
 
     if st.button("실시간 데이터 ⚡초고속 스캔 실행"):
-        pb = st.progress(0, text="데이터 검색 준비 중...")
-        try:
-            fetch_and_cache_screener_data.clear()
-            temp_df = pd.DataFrame()
-            for status_msg, pct in fetch_screener_data_generator():
-                if isinstance(status_msg, str): pb.progress(pct, text=f"{status_msg}")
-                else: temp_df = status_msg
-            pb.progress(100, text="분석 완료!")
-            time.sleep(0.5)
-            pb.empty()
-            
-            if not temp_df.empty:
-                temp_df = _safe_save_screener_df(temp_df, save_path)
-                st.session_state['shared_screener_df'] = temp_df
-                if st.session_state.get("_screener_missing_pages"):
-                    st.warning(f"⚠️ 이번 스캔에서 끝내 실패한 페이지 (시장구분, 페이지번호): {st.session_state['_screener_missing_pages']}")
-                    st.session_state["_screener_missing_pages"] = []
-                else:
-                    st.info("✅ 이번 스캔은 페이지 누락 없이 전부 성공했습니다.")
-        except Exception as e:
-            pb.empty()
-            st.error(f"데이터를 가져오는데 실패했습니다: {e}")
+        run_unified_market_scan()
 
     col_h52_title, col_h52_help = st.columns([9, 1])
     with col_h52_title:
@@ -5303,6 +5608,10 @@ def render_fnguide():
               </div>
             </div>
             """, unsafe_allow_html=True)
+
+            _prob_html2 = render_hit_probability_badge(code, None, target_price, target_src)
+            if _prob_html2:
+                st.markdown(_prob_html2, unsafe_allow_html=True)
 
 
 def render_dividend():
