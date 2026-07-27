@@ -150,7 +150,7 @@ def fetch_market_index_table():
         [(get_naver, k, m) for k, m in naver_targets.items()] +
         [(get_yfinance, k, m) for k, m in yf_targets.items()]
     )
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
         futures = {executor.submit(fn, k, m): k for fn, k, m in all_tasks}
         for future in concurrent.futures.as_completed(futures):
             k, entry = future.result()
@@ -185,7 +185,7 @@ def fetch_sparkline_data():
             return key, []
 
     result = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
         futures = {executor.submit(get_history, k, s): k for k, s in targets.items()}
         for future in concurrent.futures.as_completed(futures):
             k, closes = future.result()
@@ -326,7 +326,7 @@ def fetch_investor_trend_monthly(sosok):
             return None
 
     rows = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(fetch_one, d): d for d in business_days}
         for future in concurrent.futures.as_completed(futures):
             res = future.result()
@@ -510,7 +510,7 @@ def fetch_sector_ranking():
         return None
         
     rows = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(get_data, n, c) for n, c in sector_etfs]
         for future in concurrent.futures.as_completed(futures):
             res = future.result()
@@ -555,7 +555,7 @@ def fetch_dividend_ranking():
         max_page = min(max_page, 15)
 
         all_pages = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             futures = {executor.submit(fetch_page, p): p for p in range(1, max_page + 1)}
             for future in concurrent.futures.as_completed(futures):
                 result = future.result()
@@ -1380,7 +1380,7 @@ def fetch_screener_data_generator():
     completed = 0
     failed_pages = []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         future_to_url = {executor.submit(fetch_page_data, s, p, headers, cookies): (s, p) for s, p in urls}
         for future in concurrent.futures.as_completed(future_to_url):
             completed += 1
@@ -1722,7 +1722,7 @@ def run_unified_market_scan():
     # 2단계: 52주 고점 매칭 → 추천 종목 후보 산출
     load_high52_map.clear()
     high52_map = load_high52_map()
-    scan_workers = 4 if high52_map else 3
+    scan_workers = 8 if high52_map else 5
 
     df = screener_df.copy()
     finance_keywords = '금융|은행|증권|보험|캐피탈|지주|투자|저축'
@@ -2588,7 +2588,7 @@ def render_watchlist_portfolio_summary(df):
 
     codes = holdings["종목코드"].tolist()
     current_prices = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
         futures = {executor.submit(fetch_live_price_change, code): code for code in codes}
         for future in concurrent.futures.as_completed(futures):
             code = futures[future]
@@ -2808,7 +2808,7 @@ def render_watchlist():
         # executor.shutdown(wait=False)로 종료해서, 아직 안 끝난 스레드가 있어도
         # 여기서 더 이상 기다리지 않고 즉시 다음 로직으로 넘어간다.
         with st.spinner(f"🔄 관심종목 {len(_wl_codes)}건 시세 조회 중..."):
-            _wl_executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+            _wl_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
             try:
                 _wl_futures = {_wl_executor.submit(_wl_prefetch_one, c): c for c in _wl_codes}
                 try:
