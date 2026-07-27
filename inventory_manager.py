@@ -1430,11 +1430,17 @@ def fetch_screener_data_generator():
     }
     yield "보안 세션 접속 및 쿠키 발급 중...", 5
     
-    session.get("https://finance.naver.com/sise/sise_market_sum.naver", headers=headers)
+    try:
+        session.get("https://finance.naver.com/sise/sise_market_sum.naver", headers=headers, timeout=10)
+    except Exception:
+        pass  # 세션 워밍업 실패해도 쿠키 없이 계속 진행 (뒤에서 페이지별로 재시도됨)
     time.sleep(0.5)
-    
+
     field_url = "https://finance.naver.com/sise/field_submit.naver?menu=market_sum&returnUrl=https%3A%2F%2Ffinance.naver.com%2Fsise%2Fsise_market_sum.naver&fieldIds=per&fieldIds=pbr&fieldIds=roe&fieldIds=dividend&fieldIds=property_total&fieldIds=debt_total&fieldIds=high52"
-    session.get(field_url, headers=headers)
+    try:
+        session.get(field_url, headers=headers, timeout=10)
+    except Exception:
+        pass
     cookies = session.cookies.get_dict()
     
     all_data = []
