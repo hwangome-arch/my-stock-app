@@ -96,6 +96,25 @@ def normalize_kr_code(code):
 @st.cache_resource(show_spinner=False)
 def get_shared_executor():
     return concurrent.futures.ThreadPoolExecutor(max_workers=20)
+
+# ── 메인 스레드 직접 호출 보호용 헬퍼 ──────────────────────────────────────
+# 문제: yfinance(내부적으로 curl_cffi 사용)에 timeout=8을 넘겨도, 클라우드 환경에서
+# 상대 서버(야후 파이낸스)가 소켓을 붙잡아두는 경우 그 timeout이 실제로 지켜지지
+# 않고 호출이 무한정 멈출 수 있다. 이런 호출이 메인 스크립트 실행 스레드에서 직접
+# 일어나면, 스레드풀 보호와 무관하게 앱 전체가 그 자리에서 완전히 멈춰버린다
+# (탭을 몇 번 안 눌렀는데 바로 먹통이 되는 현상은 대부분 이 패턴).
+# 해결: 메인 스레드에서 직접 호출하는 대신 항상 공유 스레드풀에서 실행시키고,
+# 결과를 기다리는 시간 자체에 메인 스레드 쪽에서 강제 상한을 건다. 라이브러리의
+# 자체 timeout을 못 믿는 상황에 대한 이중 안전장치이며, 상한을 넘기면 그 스레드는
+# 백그라운드에 남겨둔 채(cancel 시도만 하고) 메인 스레드는 즉시 다음 로직으로 넘어간다.
+def call_with_timeout(fn, timeout=10):
+    future = get_shared_executor().submit(fn)
+    try:
+        return future.result(timeout=timeout)
+    except Exception:
+        future.cancel()
+        return None
+# ────────────────────────────────────────────────────────────────────────
 # ────────────────────────────────────────────────────────────────────────
 
 # ── 병렬 조회용 안전 실행 헬퍼 ──────────────────────────────────────────────
@@ -1961,9 +1980,11 @@ def estimate_target_hit_probability(stock_code, market_hint, target_price, horiz
         suffix_order = [".KQ", ".KS"] if market_hint == "코스닥" else [".KS", ".KQ"]
         hist = pd.DataFrame()
         for suf in suffix_order:
-            try:
-                hist = yf.Ticker(f"{stock_code}{suf}").history(period="1y", interval="1d", timeout=8)
-            except Exception:
+            hist = call_with_timeout(
+                lambda s=suf: yf.Ticker(f"{stock_code}{s}").history(period="1y", interval="1d", timeout=8),
+                timeout=10,
+            )
+            if hist is None:
                 hist = pd.DataFrame()
             if not hist.empty:
                 break
@@ -5872,11 +5893,17 @@ def render_fnguide():
             def _fetch_ma(stock_code):
                 try:
                     import yfinance as yf
-                    ticker = f"{stock_code}.KS"
-                    df_ma = yf.Ticker(ticker).history(period="90d", interval="1d", timeout=8)
-                    if df_ma.empty:
-                        ticker = f"{stock_code}.KQ"
-                        df_ma = yf.Ticker(ticker).history(period="90d", interval="1d", timeout=8)
+                    df_ma = call_with_timeout(
+                        lambda: yf.Ticker(f"{stock_code}.KS").history(period="90d", interval="1d", timeout=8),
+                        timeout=10,
+                    )
+                    if df_ma is None or df_ma.empty:
+                        df_ma = call_with_timeout(
+                            lambda: yf.Ticker(f"{stock_code}.KQ").history(period="90d", interval="1d", timeout=8),
+                            timeout=10,
+                        )
+                    if df_ma is None or df_ma.empty:
+                        return 0, 0
                     closes = df_ma["Close"].dropna()
                     ma20 = round(closes.tail(20).mean()) if len(closes) >= 20 else 0
                     ma60 = round(closes.tail(60).mean()) if len(closes) >= 60 else 0
