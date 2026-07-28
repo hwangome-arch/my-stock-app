@@ -591,19 +591,24 @@ def fetch_sector_ranking():
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_dividend_ranking():
+    _dbg = lambda msg: print(f"[DEBUG {datetime.datetime.now().strftime('%H:%M:%S')}] [배당] {msg}", file=sys.stderr, flush=True)
+    _dbg("함수 시작")
     base_url = "https://finance.naver.com/sise/dividend_list.naver"
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 
     def fetch_page(page):
         try:
+            _dbg(f"페이지 {page} 요청 시작")
             res = requests.get(f"{base_url}?page={page}", headers=headers, timeout=10)
             res.encoding = res.apparent_encoding or 'euc-kr'
-            
+            _dbg(f"페이지 {page} 응답 수신, read_html 파싱 시작")
+
             # ✅ 정규식으로 href 속성에서 종목코드 추출 후 딕셔너리에 저장
             code_matches = re.findall(r'href="/item/main\.naver\?code=(\d+)"[^>]*>(.*?)</a>', res.text)
             name_to_code = {re.sub(r'<[^>]+>', '', name).strip(): code for code, name in code_matches}
 
             dfs = pd.read_html(io.StringIO(res.text))
+            _dbg(f"페이지 {page} read_html 파싱 완료 ({len(dfs)}개 테이블)")
             for df in dfs:
                 if any('종목명' in str(c) for c in df.columns.to_flat_index()):
                     name_col = next((c for c in df.columns if '종목명' in str(c)), None)
@@ -612,17 +617,20 @@ def fetch_dividend_ranking():
                         if not page_df.empty:
                             page_df['종목코드'] = page_df[name_col].map(name_to_code)
                             return page_df
-        except:
-            pass
+        except Exception as e:
+            _dbg(f"페이지 {page} 실패: {e}")
         return None
 
     try:
         import re as _re
+        _dbg("첫 페이지(전체 페이지 수 파악) 요청 시작")
         res0 = requests.get(base_url, headers=headers, timeout=10)
         res0.encoding = res0.apparent_encoding or 'euc-kr'
+        _dbg("첫 페이지 응답 수신")
         page_nums = [int(p) for p in _re.findall(r'[?&]page=(\d+)', res0.text)]
         max_page = max(page_nums) if page_nums else 10
         max_page = min(max_page, 15)
+        _dbg(f"총 {max_page}페이지 병렬 조회 시작")
 
         all_pages = []
         _executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
@@ -637,16 +645,19 @@ def fetch_dividend_ranking():
                     except Exception:
                         continue
             except concurrent.futures.TimeoutError:
-                pass
+                _dbg("전체 25초 상한 초과 (일부 페이지 스킵)")
         finally:
             _executor.shutdown(wait=False)
 
+        _dbg(f"병렬 조회 종료, {len(all_pages)}개 페이지 확보, concat 시작")
         if not all_pages:
             return pd.DataFrame()
         result = pd.concat(all_pages, ignore_index=True)
         result = result.drop_duplicates()
+        _dbg("함수 종료 (성공)")
         return result
-    except:
+    except Exception as e:
+        _dbg(f"함수 종료 (예외): {e}")
         return pd.DataFrame()
 
 # =========================
