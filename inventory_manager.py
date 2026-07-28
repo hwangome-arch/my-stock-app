@@ -1,6 +1,7 @@
 import os
 import sys
 import socket
+import threading
 import concurrent.futures
 import psutil
 import random
@@ -2577,10 +2578,22 @@ def _hash_password(password, salt=None):
 
 @st.cache_data(ttl=30, show_spinner=False)
 def load_users():
-    """users 시트의 모든 사용자 정보를 DataFrame으로 반환 (30초 캐시)."""
-    try:
+    """users 시트의 모든 사용자 정보를 DataFrame으로 반환 (30초 캐시).
+
+    [탭 멈춤 대응] gspread(requests 기반)는 timeout=을 명시하지 않으면
+    응답이 없어도 절대 스스로 끊기지 않는다. socket.setdefaulttimeout()도
+    이 경로엔 적용되지 않아서, 메인 스레드에서 직접 부르면 구글 API가
+    느려질 때 앱 전체가 무한정 멈출 수 있었다. call_with_timeout으로
+    별도 스레드에서 실행하고 메인 스레드 쪽에서 상한을 강제한다.
+    """
+    def _fetch():
         ws = _get_worksheet("users")
-        records = ws.get_all_records(numericise_ignore=['all'])
+        return ws.get_all_records(numericise_ignore=['all'])
+
+    records = call_with_timeout(_fetch, timeout=10)
+    if records is None:
+        return pd.DataFrame(columns=_USER_COLUMNS)
+    try:
         df = pd.DataFrame(records, dtype=str).fillna("")
         for col in _USER_COLUMNS:
             if col not in df.columns:
@@ -2608,14 +2621,17 @@ def save_user(username, password, email):
         username, pwd_hash, salt, email,
         datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
     ]
-    try:
+    def _write():
         ws = _get_worksheet("users")
         ws.append_row(new_row, value_input_option="RAW")
+        return True
+
+    ok = call_with_timeout(_write, timeout=10)
+    if ok:
         load_users.clear()  # 캐시 무효화
         return True
-    except Exception:
-        st.error("일시적인 통신 오류로 가입 처리에 실패했습니다. 잠시 후 다시 시도해주세요.")
-        return False
+    st.error("일시적인 통신 오류로 가입 처리에 실패했습니다. 잠시 후 다시 시도해주세요.")
+    return False
 
 def authenticate_user(username, password):
     users = load_users()
@@ -2671,7 +2687,7 @@ def verify_user_email(username, email):
 
 def update_user_password(username, new_password):
     """해당 사용자의 비밀번호 해시/salt를 새 값으로 갱신."""
-    try:
+    def _do():
         ws = _get_worksheet("users")
         records = ws.get_all_records(numericise_ignore=['all'])
         row_idx = None
@@ -2680,15 +2696,20 @@ def update_user_password(username, new_password):
                 row_idx = i + 2  # 헤더가 1행이므로 데이터는 2행부터 시작
                 break
         if row_idx is None:
-            return False
+            return "not_found"
         pwd_hash, salt = _hash_password(new_password)
         ws.update_cell(row_idx, _USER_COLUMNS.index("비밀번호해시") + 1, pwd_hash)
         ws.update_cell(row_idx, _USER_COLUMNS.index("salt") + 1, salt)
+        return True
+
+    result = call_with_timeout(_do, timeout=12)
+    if result is True:
         load_users.clear()
         return True
-    except Exception:
-        st.error("일시적인 통신 오류로 비밀번호 변경에 실패했습니다. 잠시 후 다시 시도해주세요.")
+    if result == "not_found":
         return False
+    st.error("일시적인 통신 오류로 비밀번호 변경에 실패했습니다. 잠시 후 다시 시도해주세요.")
+    return False
 
 
 # =========================
@@ -2699,9 +2720,14 @@ _WATCHLIST_COLUMNS = ["아이디", "종목코드", "종목명", "추가일", "�
 @st.cache_data(ttl=30, show_spinner=False)
 def _load_all_watchlist():
     """watchlist 시트 전체를 DataFrame으로 반환 (30초 캐시, 내부용)."""
-    try:
+    def _fetch():
         ws = _get_worksheet("watchlist")
-        records = ws.get_all_records(numericise_ignore=['all'])
+        return ws.get_all_records(numericise_ignore=['all'])
+
+    records = call_with_timeout(_fetch, timeout=10)
+    if records is None:
+        return pd.DataFrame(columns=_WATCHLIST_COLUMNS)
+    try:
         df = pd.DataFrame(records, dtype=str).fillna("")
         for col in _WATCHLIST_COLUMNS:
             if col not in df.columns:
@@ -2732,14 +2758,17 @@ def add_to_watchlist(username, code, name):
         datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
         "", "", "", "", "", "",
     ]
-    try:
+    def _write():
         ws = _get_worksheet("watchlist")
         ws.append_row(new_row, value_input_option="RAW")
+        return True
+
+    ok = call_with_timeout(_write, timeout=10)
+    if ok:
         _load_all_watchlist.clear()
         return True
-    except Exception:
-        st.error("일시적인 통신 오류로 관심종목 추가에 실패했습니다. 잠시 후 다시 시도해주세요.")
-        return False
+    st.error("일시적인 통신 오류로 관심종목 추가에 실패했습니다. 잠시 후 다시 시도해주세요.")
+    return False
 
 def _find_watchlist_row_indices(ws, username, code):
     """해당 사용자+종목코드에 해당하는 시트 상의 실제 행 번호(1-base, 헤더 포함)를 반환."""
@@ -2752,44 +2781,60 @@ def _find_watchlist_row_indices(ws, username, code):
 
 def remove_from_watchlist(username, code):
     code = normalize_kr_code(code)
-    try:
+
+    def _do():
         ws = _get_worksheet("watchlist")
         row_indices = _find_watchlist_row_indices(ws, username, code)
         if not row_indices:
-            st.warning(f"삭제할 항목을 시트에서 찾지 못했습니다. (종목코드 {code})")
-            return
+            return "not_found"
         for row_idx in sorted(row_indices, reverse=True):
             ws.delete_rows(row_idx)
+        return True
+
+    result = call_with_timeout(_do, timeout=12)
+    if result is True:
         _load_all_watchlist.clear()
-    except Exception:
+    elif result == "not_found":
+        st.warning(f"삭제할 항목을 시트에서 찾지 못했습니다. (종목코드 {code})")
+    else:
         st.error("일시적인 통신 오류로 관심종목 삭제에 실패했습니다. 잠시 후 다시 시도해주세요.")
 
 def update_watchlist_holding(username, code, buy_price, qty):
     """관심종목 항목에 매수가/수량(보유 정보)을 저장."""
     code = normalize_kr_code(code)
-    try:
+
+    def _do():
         ws = _get_worksheet("watchlist")
         row_indices = _find_watchlist_row_indices(ws, username, code)
         for row_idx in row_indices:
             ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("매수가") + 1, str(buy_price) if buy_price else "")
             ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("수량") + 1, str(qty) if qty else "")
+        return True
+
+    ok = call_with_timeout(_do, timeout=12)
+    if ok:
         _load_all_watchlist.clear()
-    except Exception:
+    else:
         st.error("일시적인 통신 오류로 보유 정보 저장에 실패했습니다. 잠시 후 다시 시도해주세요.")
 
 def update_watchlist_entries(username, code, entry1, entry2, entry3):
     """관심종목 항목에 1차/2차/3차 매수 진입가를 저장."""
     code = normalize_kr_code(code)
-    try:
+
+    def _do():
         ws = _get_worksheet("watchlist")
         row_indices = _find_watchlist_row_indices(ws, username, code)
         for row_idx in row_indices:
             ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("1차진입가") + 1, str(entry1) if entry1 else "")
             ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("2차진입가") + 1, str(entry2) if entry2 else "")
             ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("3차진입가") + 1, str(entry3) if entry3 else "")
-        _load_all_watchlist.clear()
-    except Exception:
+        return True
+
+    ok = call_with_timeout(_do, timeout=12)
+    if not ok:
         st.error("일시적인 통신 오류로 진입가 저장에 실패했습니다. 잠시 후 다시 시도해주세요.")
+    else:
+        _load_all_watchlist.clear()
 
 def toggle_watchlist_pin(username, code):
     """관심종목 항목의 상단 고정 상태를 토글."""
@@ -2800,16 +2845,21 @@ def toggle_watchlist_pin(username, code):
         match = wl[wl["종목코드"] == code]
         if not match.empty:
             is_pinned = (match.iloc[0]["고정"] == "Y")
-    try:
+    def _do():
         ws = _get_worksheet("watchlist")
         row_indices = _find_watchlist_row_indices(ws, username, code)
         if not row_indices:
-            st.warning(f"항목을 시트에서 찾지 못해 고정 상태를 변경하지 못했습니다. (종목코드 {code})")
-            return
+            return "not_found"
         for row_idx in row_indices:
             ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("고정") + 1, "" if is_pinned else "Y")
+        return True
+
+    result = call_with_timeout(_do, timeout=12)
+    if result is True:
         _load_all_watchlist.clear()
-    except Exception:
+    elif result == "not_found":
+        st.warning(f"항목을 시트에서 찾지 못해 고정 상태를 변경하지 못했습니다. (종목코드 {code})")
+    else:
         st.error("일시적인 통신 오류로 고정 상태 변경에 실패했습니다. 잠시 후 다시 시도해주세요.")
 
 
@@ -3954,12 +4004,44 @@ def _show_debug_memory():
         else:
             color = "#64748B"   # 정상
 
+        # ── [원인 진단용] 스레드/큐 상태 ─────────────────────────────────────
+        # Streamlit Community Cloud는 앱 전체가 프로세스 하나를 여러 사용자가
+        # 공유한다. get_shared_executor / get_orchestration_executor /
+        # get_yf_safety_executor 도 @st.cache_resource라서 전 사용자가 같은
+        # 스레드풀 하나씩을 공유한다. 즉 "나 혼자 여러 탭을 왔다갔다" 뿐 아니라
+        # "다른 접속자가 동시에 쓰는 상황"도 이 숫자에 같이 반영된다.
+        # active_threads가 시간이 지나도 안 줄고 계속 우상향하거나, 아래 큐
+        # 대기(pending) 숫자가 0이 아닌 채로 한동안 유지된다면 → 어딘가에서
+        # 스레드가 끝나지 않고 계속 쌓이는 중이라는 뜻이고, 그 풀에 새로 던져진
+        # 작업은 일꾼이 없어 대기하다가(=timeout 설정이 없는 코드 경로라면
+        # 영원히) "실행 중" 스피너만 도는 멈춤으로 보이게 된다.
+        active_threads = threading.active_count()
+        pool_info = []
+        for _name, _getter in (
+            ("공유", get_shared_executor),
+            ("오케스트레이션", get_orchestration_executor),
+            ("yf안전", get_yf_safety_executor),
+        ):
+            try:
+                _ex = _getter()
+                _queued = _ex._work_queue.qsize()
+                _spawned = len(_ex._threads)
+                pool_info.append(f"{_name} {_spawned}/{_ex._max_workers}(대기{_queued})")
+            except Exception:
+                pass
+
+        thread_color = "#DC2626" if active_threads >= 150 else ("#D97706" if active_threads >= 80 else "#64748B")
         st.markdown(
             f'<div style="padding: 14px 14px 10px 14px; margin-top: 10px; '
             f'border-top: 1px solid rgba(255,255,255,0.08);">'
             f'<span style="font-size: 11px; color: {color}; font-weight: 600;">'
             f'🧠 메모리 {mem_mb:,.0f} MB / {total_mb:,.0f} MB'
-            f'</span></div>',
+            f'</span><br>'
+            f'<span style="font-size: 11px; color: {thread_color}; font-weight: 600;">'
+            f'🧵 전체 스레드 {active_threads}개'
+            f'</span><br>'
+            f'<span style="font-size: 10px; color: #94A3B8;">{" · ".join(pool_info)}</span>'
+            f'</div>',
             unsafe_allow_html=True,
         )
     except Exception:
