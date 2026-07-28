@@ -1,6 +1,7 @@
 import os
 import socket
 import concurrent.futures
+import psutil
 import random
 import time
 import datetime
@@ -3742,6 +3743,38 @@ def render_change_password():
                 update_user_password(username, new_pw)
                 st.success("비밀번호가 변경되었습니다.")
 
+def _show_debug_memory():
+    """사이드바 하단에 현재 프로세스의 실시간 메모리 사용량을 표시한다.
+
+    탭 이동을 반복할 때 이 숫자가 계속 우상향하기만 하고 안 떨어진다면
+    메모리 누수(스레드/캐시 누적 등)를 의심할 수 있다.
+    """
+    try:
+        process = psutil.Process(os.getpid())
+        mem_mb = process.memory_info().rss / 1024 / 1024
+        vmem = psutil.virtual_memory()
+        total_mb = vmem.total / 1024 / 1024
+
+        if mem_mb >= total_mb * 0.85:
+            color = "#DC2626"   # 위험
+        elif mem_mb >= total_mb * 0.6:
+            color = "#D97706"   # 주의
+        else:
+            color = "#64748B"   # 정상
+
+        st.markdown(
+            f'<div style="padding: 14px 14px 10px 14px; margin-top: 10px; '
+            f'border-top: 1px solid rgba(255,255,255,0.08);">'
+            f'<span style="font-size: 11px; color: {color}; font-weight: 600;">'
+            f'🧠 메모리 {mem_mb:,.0f} MB / {total_mb:,.0f} MB'
+            f'</span></div>',
+            unsafe_allow_html=True,
+        )
+    except Exception:
+        # 모니터링 실패는 앱 동작에 영향을 주면 안 되므로 조용히 무시한다.
+        pass
+
+
 def main():
     if 'auth_user' not in st.session_state:
         st.session_state.auth_user = None
@@ -4041,6 +4074,8 @@ def main():
                     if st.session_state.current_page != label:
                         st.session_state.current_page = label
                         st.rerun()
+
+        _show_debug_memory()
 
     selected = st.session_state.current_page
 
