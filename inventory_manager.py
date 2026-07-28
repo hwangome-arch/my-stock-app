@@ -128,6 +128,20 @@ def call_with_timeout(fn, timeout=10):
 # ────────────────────────────────────────────────────────────────────────
 # ────────────────────────────────────────────────────────────────────────
 
+# ── "겉 함수" 병렬 오케스트레이션 전용 풀 ──────────────────────────────────
+# fetch_market_index_table/fetch_sparkline_data/fetch_investor_trend/
+# fetch_sector_ranking 같은 함수들은 전부 내부적으로 run_parallel_safe를 통해
+# get_shared_executor()에 또 작업을 던지고 기다린다. 이런 함수들 자체를 "여러 개
+# 동시에" 실행하고 싶을 때(예: 대시보드가 4개를 한 번에 병렬로 미리 가져오기),
+# 절대 그 겉 함수들도 get_shared_executor()에 던지면 안 된다 — 그러면 겉 작업이
+# 공유 풀의 워커 하나를 차지한 채로 같은 풀에 안쪽 작업을 또 던지고 기다리게 되어,
+# 관심종목 프리페치에서 겪었던 것과 똑같은 자기 자신을 기다리는 교착상태가 생길 수
+# 있다. 그래서 이렇게 "안에서 공유 풀을 쓰는 함수를 여러 개 동시에 돌리는" 바깥쪽
+# 오케스트레이션은 완전히 별도의 풀을 쓴다.
+@st.cache_resource(show_spinner=False)
+def get_orchestration_executor():
+    return concurrent.futures.ThreadPoolExecutor(max_workers=8)
+
 # ── 병렬 조회용 안전 실행 헬퍼 ──────────────────────────────────────────────
 # 문제: concurrent.futures.as_completed(futures)를 타임아웃 없이 쓰면, 스레드
 # 하나라도 응답이 안 오는 상태(클라우드 배포 환경에서 외부 API가 datacenter IP를
@@ -4286,8 +4300,41 @@ def render_dashboard():
         )
 
     st.markdown("<div class='dash-section-title'>📈 시장 지수</div>", unsafe_allow_html=True)
-    indices    = run_with_progress("시장 지수를 불러오는 중...", fetch_market_index_table)
-    sparklines = fetch_sparkline_data()
+
+    # ── 대시보드에 필요한 4가지 데이터(시장지수/스파크라인/수급동향/섹터순위)를 하나씩
+    # 순서대로 부르는 대신 한꺼번에 병렬로 미리 가져온다. 예전처럼 순차 호출하면, 캐시가
+    # 비어있는 상태(앱을 막 새로 시작했거나, 이전 방문이 완료되기 전에 다른 페이지로
+    # 넘어가서 캐시가 못 채워진 경우)에서는 4개 각각 최대 12~15초씩 걸릴 수 있어서
+    # 다 더하면 이 페이지 하나에서 최악 50초 넘게 메인 스크립트가 붙잡혀 있을 수
+    # 있었다. 이 시간 동안은 Streamlit이 사용자의 새 클릭(재실행 요청)을 전혀 처리할
+    # 수 없고, 브라우저 쪽에서도 "Connection timed out"으로 보일 만큼 길어질 수 있다.
+    # 그래서 네 가지를 동시에 병렬 실행하고, 전체에 단 하나의 상한(15초)만 건다.
+    with st.spinner("🔄 대시보드 데이터를 불러오는 중..."):
+        _dash_executor = get_orchestration_executor()
+        _dash_futures = {
+            _dash_executor.submit(fetch_market_index_table): "indices",
+            _dash_executor.submit(fetch_sparkline_data): "sparklines",
+            _dash_executor.submit(fetch_investor_trend): "trend",
+            _dash_executor.submit(fetch_sector_ranking): "df_sector",
+        }
+        _dash_results = {"indices": {}, "sparklines": {}, "trend": {}, "df_sector": pd.DataFrame()}
+        try:
+            for _dash_future in concurrent.futures.as_completed(_dash_futures, timeout=15):
+                _dash_key = _dash_futures[_dash_future]
+                try:
+                    _dash_results[_dash_key] = _dash_future.result(timeout=6)
+                except Exception:
+                    pass
+        except concurrent.futures.TimeoutError:
+            pass  # 전체 상한 초과 → 못 받은 데이터는 기본값(빈 상태)으로 표시
+        finally:
+            for f in _dash_futures:
+                f.cancel()
+
+    indices = _dash_results["indices"] or {}
+    sparklines = _dash_results["sparklines"] or {}
+    trend = _dash_results["trend"] or {}
+    df_sector = _dash_results["df_sector"] if _dash_results["df_sector"] is not None else pd.DataFrame()
 
     def index_color_class(status):
         if status == "up":   return "index-card-up"
@@ -4372,7 +4419,7 @@ def render_dashboard():
         "<span style='font-size:11px; color:#94A3B8; font-weight:500;'>(최근 거래일 순매수, 억원)</span></div>",
         unsafe_allow_html=True
     )
-    trend = run_with_progress("수급 데이터를 불러오는 중...", fetch_investor_trend)
+    # trend는 위에서 이미 병렬로 미리 가져왔음 (여기서 다시 부르지 않음)
 
     def investor_value_html(val):
         if val is None:
@@ -4507,7 +4554,7 @@ def render_dashboard():
 
     st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
     st.markdown("<div class='dash-section-title'>🔥 오늘의 핫 섹터 TOP 10</div>", unsafe_allow_html=True)
-    df_sector = run_with_progress("업종 데이터를 분석 중...", fetch_sector_ranking)
+    # df_sector도 위에서 이미 병렬로 미리 가져왔음 (여기서 다시 부르지 않음)
 
     if not df_sector.empty:
         max_abs = df_sector["등락률_num"].abs().max() or 1
