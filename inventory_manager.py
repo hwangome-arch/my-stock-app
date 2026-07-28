@@ -3752,8 +3752,11 @@ def _show_debug_memory():
     try:
         process = psutil.Process(os.getpid())
         mem_mb = process.memory_info().rss / 1024 / 1024
-        vmem = psutil.virtual_memory()
-        total_mb = vmem.total / 1024 / 1024
+
+        # psutil.virtual_memory()는 컨테이너 환경에서 호스트 전체 메모리를
+        # 반환해버려서(예: 128GB) 실제 컨테이너 한도와 무관하게 부정확하다.
+        # Streamlit Community Cloud의 실제 메모리 한도(약 2.7GB)를 기준으로 삼는다.
+        total_mb = 2700
 
         if mem_mb >= total_mb * 0.85:
             color = "#DC2626"   # 위험
