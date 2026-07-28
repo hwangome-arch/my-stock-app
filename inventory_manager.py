@@ -4153,10 +4153,18 @@ def render_dashboard():
             fetch_fed_rate_data.clear()
             fetch_bok_rate_data.clear()
             st.rerun()
-    with col_scan:
-        if st.button("종목 스캔 (스크리너+추천)", use_container_width=True, key="dash_unified_scan_btn"):
-            run_unified_market_scan()
-            st.rerun()
+    # ── [임시 비활성화 - 원인 진단용] ──────────────────────────────────
+    # 대시보드에 이 버튼을 추가한 이후로 탭 이동 중 멈춤 현상이 시작된 것 같아
+    # 원인 확인을 위해 잠시 꺼둔다. 이 버튼(200개+ 네이버 요청을 동시에 쏘는
+    # run_unified_market_scan)이 원인이 맞다면, 이걸 꺼놓은 상태에서는
+    # 탭을 반복 이동해도 멈춤 현상이 재현되지 않아야 한다.
+    # 원인이 확정되면 스레드/재시도 규모를 줄여서 다시 켜면 된다.
+    #
+    # with col_scan:
+    #     if st.button("종목 스캔 (스크리너+추천)", use_container_width=True, key="dash_unified_scan_btn"):
+    #         run_unified_market_scan()
+    #         st.rerun()
+    # ─────────────────────────────────────────────────────────────────
     with col_rate_strip:
         render_rate_strip()
 
