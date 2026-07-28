@@ -2024,23 +2024,32 @@ def estimate_target_hit_probability(stock_code, market_hint, target_price, horiz
     except Exception:
         return None
 
-def render_hit_probability_badge(stock_code, market_hint, target_price, target_src="목표가"):
-    """estimate_target_hit_probability 결과를 카드용 인라인 HTML 배지로 렌더링."""
-    if not target_price or target_price <= 0:
+def _format_hit_probability_badge(result, target_price, target_src="목표가"):
+    """estimate_target_hit_probability의 결과를 카드용 인라인 HTML 배지로 포맷팅만 담당.
+    (네트워크 호출 없음 — 이미 계산된 result를 넘겨받는다.)"""
+    if not result or not target_price or target_price <= 0:
         return ""
-    result = estimate_target_hit_probability(stock_code, market_hint, target_price)
-    if not result:
-        return ""
-
     probs = result["probs"]
     p30, p90, p180 = probs.get(30, 0), probs.get(90, 0), probs.get(180, 0)
-
     return (
         f"<div style='margin-top:8px; padding:9px 12px; background:#F5F3FF; border:1px solid #DDD6FE; border-radius:8px;'>"
         f"<div style='font-size:11px; color:#6D28D9; font-weight:700; margin-bottom:3px;'>🎲 {target_price:,}원({target_src}) 도달 확률 · 종가 기준 통계 추정</div>"
         f"<div style='font-size:13px; color:#4C1D95;'>30일 <b>{p30:.0f}%</b> &nbsp;·&nbsp; 90일 <b>{p90:.0f}%</b> &nbsp;·&nbsp; 180일 <b>{p180:.0f}%</b></div>"
         f"</div>"
     )
+
+def render_hit_probability_badge(stock_code, market_hint, target_price, target_src="목표가"):
+    """estimate_target_hit_probability 결과를 카드용 인라인 HTML 배지로 렌더링.
+    ⚠️ 이 함수는 그 자리에서 바로 네트워크 호출(call_with_timeout)을 하므로, 여러 종목을
+    순차 for문에서 부르면 종목 수만큼 타임아웃이 차례로 쌓인다(예: 10종목 × 최대 10초
+    = 최악 100초, 사실상 멈춘 것처럼 보임). 여러 종목을 한 번에 렌더링하는 화면
+    (예: 관심종목 목록)에서는 이 함수를 직접 쓰지 말고, 미리 병렬로 한 번에 계산해서
+    _format_hit_probability_badge로 포맷팅만 하는 방식을 쓸 것 (render_watchlist 참고).
+    이 함수는 화면에 종목이 하나만 뜨는 페이지(재무 분석 상세 등)에서만 안전하다."""
+    if not target_price or target_price <= 0:
+        return ""
+    result = estimate_target_hit_probability(stock_code, market_hint, target_price)
+    return _format_hit_probability_badge(result, target_price, target_src)
 
 def find_col(df: pd.DataFrame, candidates: list) -> str | None:
     for c in candidates:
@@ -3036,6 +3045,63 @@ def render_watchlist():
                 for f in _wl_futures:
                     f.cancel()
 
+    # ── 목표가 도달 확률(yfinance 몬테카를로)도 여기서 한 번에 병렬로 미리 계산 ──
+    # 예전엔 카드 렌더링 루프 안에서 종목마다 estimate_target_hit_probability를 그
+    # 자리에서 순차 호출했다. 개별 호출에 안전장치(call_with_timeout)를 걸어놔도,
+    # 종목 수만큼 이게 차례로 쌓이면(관심종목 10개면 최악 10 × 10초 = 100초) 사실상
+    # 페이지가 멈춘 것처럼 보인다. 그래서 위 시세/스파크라인 프리페치와 똑같이,
+    # 여기서 전체 종목을 한 번에 병렬 실행하고 전체에 단 하나의 상한(20초)만 건다.
+    hit_prob_cache = {}
+    _hp_targets = {}  # code -> (market_hint, target_price, target_src)
+    for _, _hp_row in watchlist_df.iterrows():
+        _hp_code = _hp_row['종목코드']
+        if _hp_code in _hp_targets:
+            continue
+        _hp_live = None
+        if has_live_data:
+            _hp_match = screener_df[screener_df['종목코드'] == _hp_code]
+            if not _hp_match.empty:
+                _hp_live = _hp_match.iloc[0]
+        _hp_custom_raw = re.sub(r"[^\d]", "", str(st.session_state.get(f"wl_target_{_hp_code}", "")))
+        _hp_custom = int(_hp_custom_raw) if _hp_custom_raw else 0
+        if _hp_custom > 0:
+            _hp_tgt, _hp_src = _hp_custom, "직접 입력"
+            _hp_market = _hp_live.get('시장') if _hp_live is not None else None
+        elif _hp_live is not None:
+            _hp_base = _hp_live.get('현재가')
+            _hp_per = _hp_live.get('PER')
+            _hp_pbr = _hp_live.get('PBR')
+            _hp_base = float(_hp_base) if pd.notna(_hp_base) and _hp_base else 0.0
+            _hp_per = float(_hp_per) if pd.notna(_hp_per) and _hp_per else None
+            _hp_pbr = float(_hp_pbr) if pd.notna(_hp_pbr) and _hp_pbr else None
+            _hp_tgt, _hp_src = estimate_simple_target_price(_hp_base, _hp_per, _hp_pbr)
+            _hp_market = _hp_live.get('시장')
+        else:
+            _hp_tgt, _hp_src, _hp_market = 0, "", None
+        if _hp_tgt:
+            _hp_targets[_hp_code] = (_hp_market, _hp_tgt, _hp_src)
+
+    if _hp_targets:
+        _hp_executor = get_shared_executor()
+        _hp_futures = {
+            _hp_executor.submit(estimate_target_hit_probability, _c, _mh, _tp): (_c, _tp, _ts)
+            for _c, (_mh, _tp, _ts) in _hp_targets.items()
+        }
+        try:
+            for _hp_future in concurrent.futures.as_completed(_hp_futures, timeout=20):
+                _hp_c, _hp_tp, _hp_ts = _hp_futures[_hp_future]
+                try:
+                    _hp_res = _hp_future.result(timeout=10)
+                except Exception:
+                    _hp_res = None
+                if _hp_res:
+                    hit_prob_cache[_hp_c] = _format_hit_probability_badge(_hp_res, _hp_tp, _hp_ts)
+        except concurrent.futures.TimeoutError:
+            pass  # 전체 20초 상한 초과 → 나머지 종목은 이번 렌더링에서는 배지 없이 건너뜀
+        finally:
+            for f in _hp_futures:
+                f.cancel()
+
     reached_summary = []  # [(종목명, 종목코드, 도달차수, 진입가, 현재가), ...]
     for _, _row in watchlist_df.iterrows():
         _code = _row['종목코드']
@@ -3421,27 +3487,11 @@ def render_watchlist():
                                 remove_from_watchlist(username, code)
                                 st.rerun()
 
-            _custom_tgt_raw = re.sub(r"[^\d]", "", str(st.session_state.get(f"wl_target_{code}", "")))
-            _custom_tgt = int(_custom_tgt_raw) if _custom_tgt_raw else 0
-
-            if _custom_tgt > 0:
-                _tgt_price, _tgt_src = _custom_tgt, "직접 입력"
-                _market_hint = live.get('시장') if live is not None else None
-                _prob_html = render_hit_probability_badge(code, _market_hint, _tgt_price, _tgt_src)
-                if _prob_html:
-                    st.markdown(_prob_html, unsafe_allow_html=True)
-            elif live is not None:
-                _base_price = live.get('현재가')
-                _per_v = live.get('PER')
-                _pbr_v = live.get('PBR')
-                _base_price = float(_base_price) if pd.notna(_base_price) and _base_price else 0.0
-                _per_v = float(_per_v) if pd.notna(_per_v) and _per_v else None
-                _pbr_v = float(_pbr_v) if pd.notna(_pbr_v) and _pbr_v else None
-                _tgt_price, _tgt_src = estimate_simple_target_price(_base_price, _per_v, _pbr_v)
-                if _tgt_price:
-                    _prob_html = render_hit_probability_badge(code, live.get('시장'), _tgt_price, _tgt_src)
-                    if _prob_html:
-                        st.markdown(_prob_html, unsafe_allow_html=True)
+            # 도달 확률은 위에서 이미 전 종목 병렬 프리페치를 끝냈으므로, 여기서는
+            # 네트워크 호출 없이 캐시에서 꺼내 포맷팅만 한다(종목별 blocking 호출 금지).
+            _prob_html = hit_prob_cache.get(code, "")
+            if _prob_html:
+                st.markdown(_prob_html, unsafe_allow_html=True)
 
             wl_buy_raw, wl_qty_raw = row.get('매수가', ''), row.get('수량', '')
             try:
