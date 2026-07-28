@@ -197,7 +197,6 @@ def fetch_market_index_table():
             return key, None
 
     def get_yfinance(key, meta):
-        print(f"[DEBUG {datetime.datetime.now().strftime('%H:%M:%S')}] yfinance 호출 시작 ({key})", file=sys.stderr, flush=True)
         try:
             import yfinance as yf
             df = yf.Ticker(meta["symbol"]).history(period="2d", interval="1m", timeout=8)
@@ -211,7 +210,6 @@ def fetch_market_index_table():
             diff_pct = diff / prev * 100 if prev else 0
             sign = "+" if diff >= 0 else ""
             fmt = f"{price:,.1f}" if key == "usdkrw" else f"{price:,.2f}"
-            print(f"[DEBUG {datetime.datetime.now().strftime('%H:%M:%S')}] yfinance 호출 완료 ({key})", file=sys.stderr, flush=True)
             return key, {
                 "name": meta["name"], "subtitle": meta["subtitle"],
                 "value": fmt,
@@ -220,8 +218,7 @@ def fetch_market_index_table():
                 "status": "up" if diff > 0 else ("down" if diff < 0 else "neutral"),
                 "volume": "N/A",
             }
-        except Exception as e:
-            print(f"[DEBUG {datetime.datetime.now().strftime('%H:%M:%S')}] yfinance 호출 실패 ({key}): {e}", file=sys.stderr, flush=True)
+        except Exception:
             return key, None
 
     all_tasks = (
@@ -2443,13 +2440,9 @@ def _get_gsheet_client():
 
 def _get_worksheet(sheet_tab_name):
     """지정한 탭(worksheet) 객체를 반환."""
-    _t0 = datetime.datetime.now().strftime('%H:%M:%S')
-    print(f"[DEBUG {_t0}] 구글시트 호출 시작 ({sheet_tab_name})", file=sys.stderr, flush=True)
     client = _get_gsheet_client()
     spreadsheet = client.open(st.secrets["gsheet"]["sheet_name"])
     ws = spreadsheet.worksheet(sheet_tab_name)
-    _t1 = datetime.datetime.now().strftime('%H:%M:%S')
-    print(f"[DEBUG {_t1}] 구글시트 호출 완료 ({sheet_tab_name})", file=sys.stderr, flush=True)
     return ws
 
 def _hash_password(password, salt=None):
@@ -4127,12 +4120,6 @@ def main():
 
     selected = st.session_state.current_page
 
-    # ── [원인 진단용 임시 로그] ────────────────────────────────────────
-    # 화면이 멈췄을 때 Cloud 로그의 마지막 줄을 보면 어느 페이지 진입 직후
-    # 멈췄는지 바로 알 수 있다. 원인이 확정되면 이 로그는 지워도 된다.
-    print(f"[DEBUG {datetime.datetime.now().strftime('%H:%M:%S')}] 페이지 진입: {selected}", file=sys.stderr, flush=True)
-    # ─────────────────────────────────────────────────────────────────
-
     if   selected == "대시보드 홈":      render_dashboard()
     elif selected == "추천 종목":        render_recommendations()
     elif selected == "종목 스크리너":    render_screener()
@@ -4141,7 +4128,6 @@ def main():
     elif selected == "관심종목":         render_watchlist()
     elif selected == "비밀번호 변경":     render_change_password()
 
-    print(f"[DEBUG {datetime.datetime.now().strftime('%H:%M:%S')}] 페이지 렌더링 완료: {selected}", file=sys.stderr, flush=True)
 
 def render_rate_strip():
     """기준금리 현황을 한 줄짜리 컴팩트 형태로 우측 정렬 표시."""
@@ -4206,18 +4192,10 @@ def render_dashboard():
             fetch_fed_rate_data.clear()
             fetch_bok_rate_data.clear()
             st.rerun()
-    # ── [임시 비활성화 - 원인 진단용] ──────────────────────────────────
-    # 대시보드에 이 버튼을 추가한 이후로 탭 이동 중 멈춤 현상이 시작된 것 같아
-    # 원인 확인을 위해 잠시 꺼둔다. 이 버튼(200개+ 네이버 요청을 동시에 쏘는
-    # run_unified_market_scan)이 원인이 맞다면, 이걸 꺼놓은 상태에서는
-    # 탭을 반복 이동해도 멈춤 현상이 재현되지 않아야 한다.
-    # 원인이 확정되면 스레드/재시도 규모를 줄여서 다시 켜면 된다.
-    #
-    # with col_scan:
-    #     if st.button("종목 스캔 (스크리너+추천)", use_container_width=True, key="dash_unified_scan_btn"):
-    #         run_unified_market_scan()
-    #         st.rerun()
-    # ─────────────────────────────────────────────────────────────────
+    with col_scan:
+        if st.button("종목 스캔 (스크리너+추천)", use_container_width=True, key="dash_unified_scan_btn"):
+            run_unified_market_scan()
+            st.rerun()
     with col_rate_strip:
         render_rate_strip()
 
