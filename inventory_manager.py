@@ -95,7 +95,7 @@ def normalize_kr_code(code):
 # 대기했다가 순서대로 실행된다).
 @st.cache_resource(show_spinner=False)
 def get_shared_executor():
-    return concurrent.futures.ThreadPoolExecutor(max_workers=20)
+    return concurrent.futures.ThreadPoolExecutor(max_workers=32)
 
 # ── 메인 스레드 직접 호출 보호용 헬퍼 ──────────────────────────────────────
 # 문제: yfinance(내부적으로 curl_cffi 사용)에 timeout=8을 넘겨도, 클라우드 환경에서
@@ -129,7 +129,7 @@ def call_with_timeout(fn, timeout=10):
 # 않도록 한다. 상한을 넘긴 나머지 작업은 결과 없이 건너뛰고(다음 새로고침 때 캐시가
 # 채워지며 자연히 채워짐), 아직 안 끝난 스레드는 shutdown(wait=False)로 기다리지
 # 않고 그냥 백그라운드에 남겨둔 채 진행한다.
-def run_parallel_safe(task_fn, items, max_workers=5, overall_timeout=25, per_result_timeout=10):
+def run_parallel_safe(task_fn, items, max_workers=5, overall_timeout=15, per_result_timeout=8):
     """
     task_fn(item) -> (key, result) 형태의 함수를 items 각각에 대해 병렬 실행.
     반환: {key: result} dict (실패/타임아웃난 항목은 아예 키가 없음)
@@ -246,7 +246,7 @@ def fetch_market_index_table():
     )
     result = run_parallel_safe(
         lambda t: t[0](t[1], t[2]), all_tasks,
-        max_workers=6, overall_timeout=20, per_result_timeout=10,
+        max_workers=6, overall_timeout=12, per_result_timeout=6,
     )
 
     all_targets = {**naver_targets, **yf_targets}
@@ -278,7 +278,7 @@ def fetch_sparkline_data():
 
     result = run_parallel_safe(
         lambda kv: get_history(kv[0], kv[1]), list(targets.items()),
-        max_workers=6, overall_timeout=20, per_result_timeout=10,
+        max_workers=6, overall_timeout=12, per_result_timeout=6,
     )
     # 실패/타임아웃난 종목은 빈 리스트로 채워서 카드가 항상 렌더링되게 함
     for k in targets.keys():
@@ -422,9 +422,9 @@ def fetch_investor_trend_monthly(sosok):
     _executor = get_shared_executor()
     _futures = {_executor.submit(fetch_one, d): d for d in business_days}
     try:
-        for future in concurrent.futures.as_completed(_futures, timeout=20):
+        for future in concurrent.futures.as_completed(_futures, timeout=12):
             try:
-                res = future.result(timeout=8)
+                res = future.result(timeout=6)
                 if res:
                     rows.append(res)
             except Exception:
@@ -2801,10 +2801,10 @@ def render_watchlist_portfolio_summary(df):
     _executor = get_shared_executor()
     _futures = {_executor.submit(fetch_live_price_change, code): code for code in codes}
     try:
-        for future in concurrent.futures.as_completed(_futures, timeout=20):
+        for future in concurrent.futures.as_completed(_futures, timeout=12):
             code = _futures[future]
             try:
-                price, _pct, _diff = future.result(timeout=8)
+                price, _pct, _diff = future.result(timeout=6)
             except Exception:
                 price = None
             current_prices[code] = price
@@ -3003,55 +3003,20 @@ def render_watchlist():
         except Exception:
             return None
 
-    # ── 관심종목 전체의 현재가/스파크라인/AI점수를 병렬로 미리 조회 (캐시 예열) ──
-    # 예전엔 종목마다 순차적으로 여러 개의 네트워크 호출(현재가·차트·재무데이터)을 했었는데,
-    # 관심종목이 많으면 이게 다 더해져서 페이지 전환할 때마다 체감상 무한 로딩처럼 느껴졌음.
-    # ThreadPoolExecutor로 종목별 조회를 동시에 실행해서 전체 대기시간을 크게 줄임.
+    # ── 관심종목 전체의 현재가/스파크라인/AI점수/도달확률을 병렬로 미리 조회 (캐시 예열) ──
+    # 예전엔 종목마다 순차적으로 여러 개의 네트워크 호출(현재가·차트·재무데이터·도달확률)을
+    # 했었는데, 관심종목이 많으면 이게 다 더해져서 페이지 전환할 때마다 체감상 무한
+    # 로딩처럼 느껴졌음. ThreadPoolExecutor로 종목별 조회를 동시에 실행해서 전체
+    # 대기시간을 크게 줄임(종목당 작업 1개로 합쳐서 스레드풀 워커도 절반만 씀).
     wl_price_cache = {}
     ai_score_cache = {}
     sparkline_cache = {}
+    hit_prob_cache = {}
     _wl_codes = list(dict.fromkeys(watchlist_df['종목코드'].tolist()))
 
-    def _wl_prefetch_one(code):
-        market = _wl_market_map.get(code)
-        price_info = fetch_live_price_change(code)
-        spark = fetch_watchlist_sparkline_prices(code, market)
-        ai_score = get_ai_total_score(code, screener_df=screener_df)
-        return code, price_info, spark, ai_score
-
-    if _wl_codes:
-        # 개별 yfinance/네이버 호출에 timeout을 걸어뒀지만, 만에 하나 그래도 응답이
-        # 없는 경우를 대비해 전체 조회에도 상한선(종목당 최대 12초, 전체 최대 40초)을
-        # 둔다. 이 상한을 넘기면 남은 종목은 이번 렌더링에서는 건너뛰고(다음 새로고침 때
-        # 캐시가 채워지며 자연히 보임) 페이지가 무한정 멈추는 것을 방지한다.
-        # executor.shutdown(wait=False)로 종료해서, 아직 안 끝난 스레드가 있어도
-        # 여기서 더 이상 기다리지 않고 즉시 다음 로직으로 넘어간다.
-        with st.spinner(f"🔄 관심종목 {len(_wl_codes)}건 시세 조회 중..."):
-            _wl_executor = get_shared_executor()
-            _wl_futures = {_wl_executor.submit(_wl_prefetch_one, c): c for c in _wl_codes}
-            try:
-                _wl_done_iter = concurrent.futures.as_completed(_wl_futures, timeout=40)
-                for _wl_future in _wl_done_iter:
-                    try:
-                        _code, _price_info, _spark, _ai_score = _wl_future.result(timeout=12)
-                    except Exception:
-                        continue
-                    wl_price_cache[_code] = _price_info
-                    sparkline_cache[_code] = _spark
-                    ai_score_cache[_code] = _ai_score
-            except concurrent.futures.TimeoutError:
-                pass  # 일부 종목 조회가 40초를 넘김 → 나머지는 건너뛰고 계속 진행
-            finally:
-                for f in _wl_futures:
-                    f.cancel()
-
-    # ── 목표가 도달 확률(yfinance 몬테카를로)도 여기서 한 번에 병렬로 미리 계산 ──
-    # 예전엔 카드 렌더링 루프 안에서 종목마다 estimate_target_hit_probability를 그
-    # 자리에서 순차 호출했다. 개별 호출에 안전장치(call_with_timeout)를 걸어놔도,
-    # 종목 수만큼 이게 차례로 쌓이면(관심종목 10개면 최악 10 × 10초 = 100초) 사실상
-    # 페이지가 멈춘 것처럼 보인다. 그래서 위 시세/스파크라인 프리페치와 똑같이,
-    # 여기서 전체 종목을 한 번에 병렬 실행하고 전체에 단 하나의 상한(20초)만 건다.
-    hit_prob_cache = {}
+    # 목표가 도달확률 계산에 필요한 목표가는 네트워크 호출 없이(세션 상태 커스텀 값 또는
+    # 스크리너 PER/PBR만으로) 먼저 다 구해둔다. 그래야 아래 프리페치에서 종목당 작업을
+    # 딱 하나로 합칠 수 있다(시세+스파크라인+AI점수+도달확률을 한 스레드에서 순서대로).
     _hp_targets = {}  # code -> (market_hint, target_price, target_src)
     for _, _hp_row in watchlist_df.iterrows():
         _hp_code = _hp_row['종목코드']
@@ -3081,26 +3046,50 @@ def render_watchlist():
         if _hp_tgt:
             _hp_targets[_hp_code] = (_hp_market, _hp_tgt, _hp_src)
 
-    if _hp_targets:
-        _hp_executor = get_shared_executor()
-        _hp_futures = {
-            _hp_executor.submit(estimate_target_hit_probability, _c, _mh, _tp): (_c, _tp, _ts)
-            for _c, (_mh, _tp, _ts) in _hp_targets.items()
-        }
-        try:
-            for _hp_future in concurrent.futures.as_completed(_hp_futures, timeout=20):
-                _hp_c, _hp_tp, _hp_ts = _hp_futures[_hp_future]
-                try:
-                    _hp_res = _hp_future.result(timeout=10)
-                except Exception:
-                    _hp_res = None
-                if _hp_res:
-                    hit_prob_cache[_hp_c] = _format_hit_probability_badge(_hp_res, _hp_tp, _hp_ts)
-        except concurrent.futures.TimeoutError:
-            pass  # 전체 20초 상한 초과 → 나머지 종목은 이번 렌더링에서는 배지 없이 건너뜀
-        finally:
-            for f in _hp_futures:
-                f.cancel()
+    def _wl_prefetch_one(code):
+        market = _wl_market_map.get(code)
+        price_info = fetch_live_price_change(code)
+        spark = fetch_watchlist_sparkline_prices(code, market)
+        ai_score = get_ai_total_score(code, screener_df=screener_df)
+        hit_prob_html = ""
+        if code in _hp_targets:
+            _mh, _tp, _ts = _hp_targets[code]
+            _hp_res = estimate_target_hit_probability(code, _mh, _tp)
+            if _hp_res:
+                hit_prob_html = _format_hit_probability_badge(_hp_res, _tp, _ts)
+        return code, price_info, spark, ai_score, hit_prob_html
+
+    if _wl_codes:
+        # ⚠️ Streamlit은 새 탭 클릭(재실행 요청)이 와도, 지금 실행 중인 스크립트가
+        # 여기처럼 순수 파이썬 블로킹 호출(as_completed/future.result) 안에 있으면 그
+        # 자리에서 끼어들 수 없다. 사용자가 몇 초 안에 여러 번 연달아 탭을 누르면,
+        # 이전 실행이 아직 이 대기 구간에 갇혀 있는 채로 새 실행들이 밀리고, 그 새
+        # 실행들도 각자 같은 공유 스레드풀에 작업을 또 밀어넣어 워커가 금방 동나버려서
+        # 사실상 멈춘 것처럼 보이는 현상으로 이어진다. 그래서 상한을 짧게(15초/8초)
+        # 유지한다 — 상한을 넘기면 이번 렌더링에서는 일부 종목 데이터가 비어있는 채로
+        # 넘어가고(다음 새로고침 때 캐시가 채워지며 자연히 보임), 그 대신 Streamlit이
+        # 최대한 빨리 제어권을 되찾아서 대기 중인 새 클릭을 처리할 수 있게 하는 걸
+        # 더 우선한다.
+        with st.spinner(f"🔄 관심종목 {len(_wl_codes)}건 시세 조회 중..."):
+            _wl_executor = get_shared_executor()
+            _wl_futures = {_wl_executor.submit(_wl_prefetch_one, c): c for c in _wl_codes}
+            try:
+                for _wl_future in concurrent.futures.as_completed(_wl_futures, timeout=15):
+                    try:
+                        _code, _price_info, _spark, _ai_score, _hp_html = _wl_future.result(timeout=8)
+                    except Exception:
+                        continue
+                    wl_price_cache[_code] = _price_info
+                    sparkline_cache[_code] = _spark
+                    ai_score_cache[_code] = _ai_score
+                    if _hp_html:
+                        hit_prob_cache[_code] = _hp_html
+            except concurrent.futures.TimeoutError:
+                pass  # 전체 상한 초과 → 나머지는 건너뛰고 계속 진행
+            finally:
+                for f in _wl_futures:
+                    f.cancel()
+
 
     reached_summary = []  # [(종목명, 종목코드, 도달차수, 진입가, 현재가), ...]
     for _, _row in watchlist_df.iterrows():
