@@ -103,12 +103,23 @@ def get_shared_executor():
 # 않고 호출이 무한정 멈출 수 있다. 이런 호출이 메인 스크립트 실행 스레드에서 직접
 # 일어나면, 스레드풀 보호와 무관하게 앱 전체가 그 자리에서 완전히 멈춰버린다
 # (탭을 몇 번 안 눌렀는데 바로 먹통이 되는 현상은 대부분 이 패턴).
-# 해결: 메인 스레드에서 직접 호출하는 대신 항상 공유 스레드풀에서 실행시키고,
-# 결과를 기다리는 시간 자체에 메인 스레드 쪽에서 강제 상한을 건다. 라이브러리의
-# 자체 timeout을 못 믿는 상황에 대한 이중 안전장치이며, 상한을 넘기면 그 스레드는
+# 해결: 메인 스레드에서 직접 호출하는 대신 항상 스레드에서 실행시키고, 결과를
+# 기다리는 시간 자체에 메인 스레드 쪽에서 강제 상한을 건다. 라이브러리의 자체
+# timeout을 못 믿는 상황에 대한 이중 안전장치이며, 상한을 넘기면 그 스레드는
 # 백그라운드에 남겨둔 채(cancel 시도만 하고) 메인 스레드는 즉시 다음 로직으로 넘어간다.
+#
+# ⚠️ 절대 get_shared_executor()를 재사용하면 안 된다! 이 함수(estimate_target_hit_
+# probability 등)는 관심종목 프리페치처럼 "이미 공유 풀의 워커 스레드 안"에서 호출되는
+# 경우가 있다. 그 상태에서 같은 공유 풀에 또 작업을 던지고 기다리면, 공유 풀의 워커가
+# 전부 이런 식으로 서로를 기다리게 될 때 새로 던진 작업을 실행해 줄 워커가 하나도
+# 안 남는 자기 자신을 기다리는 교착상태(deadlock)가 생길 수 있다. 그래서 이 안전장치
+# 전용으로 완전히 분리된 별도의 작은 풀을 쓴다.
+@st.cache_resource(show_spinner=False)
+def get_yf_safety_executor():
+    return concurrent.futures.ThreadPoolExecutor(max_workers=16)
+
 def call_with_timeout(fn, timeout=10):
-    future = get_shared_executor().submit(fn)
+    future = get_yf_safety_executor().submit(fn)
     try:
         return future.result(timeout=timeout)
     except Exception:
@@ -4180,6 +4191,11 @@ def main():
 
     selected = st.session_state.current_page
 
+    # ── [원인 진단용 임시 로그] ────────────────────────────────────────
+    # 멈춤 현상이 완전히 해결됐다고 확신이 들 때까지만 남겨둔다. 로그의 마지막
+    # "진입"만 있고 "완료"가 없는 페이지가 바로 멈춘 지점이다.
+    print(f"[DEBUG {datetime.datetime.now().strftime('%H:%M:%S')}] 페이지 진입: {selected}", file=sys.stderr, flush=True)
+
     if   selected == "대시보드 홈":      render_dashboard()
     elif selected == "추천 종목":        render_recommendations()
     elif selected == "종목 스크리너":    render_screener()
@@ -4187,6 +4203,8 @@ def main():
     elif selected == "실시간 배당 순위": render_dividend()
     elif selected == "관심종목":         render_watchlist()
     elif selected == "비밀번호 변경":     render_change_password()
+
+    print(f"[DEBUG {datetime.datetime.now().strftime('%H:%M:%S')}] 페이지 렌더링 완료: {selected}", file=sys.stderr, flush=True)
 
 
 def render_rate_strip():
