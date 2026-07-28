@@ -199,6 +199,72 @@ def run_with_progress(text, func, *args, **kwargs):
     pb.empty()
     return res
 
+# ── 논블로킹 데이터 로딩 헬퍼 (탭 이동 멈춤 현상 대응) ───────────────────────
+# 문제: 기존 방식은 concurrent.futures.as_completed(futures, timeout=15) 처럼
+# 메인 스크립트 실행 스레드에서 최대 N초를 "한 번에 몰아서" 기다렸다. 이 N초
+# 동안은 Streamlit 서버가 브라우저에서 온 새 상호작용(예: 사이드바 탭 클릭 → 새
+# 스크립트 실행 요청)을 받아줄 수 없다. Streamlit은 스크립트가 st.* 호출 등으로
+# "숨 쉬는" 타이밍에만 새 실행 요청을 확인하는데, 파이썬 블로킹 호출 도중에는
+# 그 타이밍 자체가 오지 않기 때문이다. 그래서 사용자 입장에서는 "탭을 눌렀는데
+# 몇 초~십몇 초간 반응이 없다가 뒤늦게 바뀐다"는 멈춤 현상으로 보인다.
+#
+# 해결: 무거운 조회는 지금처럼 공유 스레드풀에 던져두되(get_shared_executor /
+# get_orchestration_executor는 그대로 재사용), 메인 스크립트는 그 결과를 절대
+# 한 번에 몰아서 기다리지 않는다. 대신 st.fragment(run_every=poll_interval)로
+# "다 됐는지"만 아주 짧은 간격(기본 0.4초)마다 확인하는 조각을 별도로 실행한다.
+# 이 프래그먼트가 쉬는 그 짧은 간격마다 Streamlit이 사용자의 새 클릭을 정상적으로
+# 받아 즉시 새 스크립트 실행으로 넘어갈 수 있다. 즉 탭 전환 시 최대 지연이
+# (기존) 최대 수십 초 → (개선) 대략 poll_interval 수준으로 줄어든다.
+# 작업(future)은 session_state에 보관되므로, 로딩 도중 다른 탭으로 갔다가 다시
+# 돌아와도 이미 던져둔 작업이 그대로 이어서 진행되며 처음부터 다시 조회하지 않는다.
+#
+# ⚠️ st.fragment(run_every=...)는 Streamlit 1.37 이상이 필요하다. 그보다 낮은
+# 버전이면 이 헬퍼 대신 기존 방식을 유지해야 한다 (streamlit --version으로 확인).
+def render_async_multi(job_key, submit_fn, collect_fn, default_result,
+                        spinner_text="데이터를 불러오는 중...",
+                        poll_interval=0.4, overall_timeout=20):
+    """
+    job_key     : 이 로딩 작업을 구분하는 고유 문자열 키 (페이지마다 겹치지 않게 지정)
+    submit_fn() : 인자 없이 호출하면 {"이름": future, ...} 형태의 dict를 반환해야 함
+                  (예: lambda: {"indices": executor.submit(fetch_market_index_table), ...})
+    collect_fn(futures_dict) : 완료된(또는 일부만 완료된) futures_dict를 받아
+                  실제 결과 dict로 변환하는 함수. future.done()이 False인 항목은
+                  건드리지 말고 default 값으로 채워서 반환할 것.
+    default_result : 아직 하나도 준비 안 됐을 때 렌더링에 쓸 기본값
+    반환값: (result, ready)
+      - ready=False  → 아직 로딩 중. 호출부는 이 시점에 바로 return 해서
+                        이후의 무거운 렌더링을 건너뛰어야 한다.
+      - ready=True   → 완료(또는 상한시간 초과). result를 바로 사용하면 된다.
+    """
+    jobs = st.session_state.setdefault("_bg_jobs", {})
+    job = jobs.get(job_key)
+    if job is None:
+        job = {"futures": submit_fn(), "started_at": time.time()}
+        jobs[job_key] = job
+
+    futures = job["futures"]
+    all_done = all(f.done() for f in futures.values())
+    timed_out = (time.time() - job["started_at"]) > overall_timeout
+
+    if not all_done and not timed_out:
+        @st.fragment(run_every=poll_interval)
+        def _poll():
+            if all(f.done() for f in futures.values()) or (time.time() - job["started_at"]) > overall_timeout:
+                st.rerun()  # 준비 완료 → 프래그먼트가 아니라 앱 전체를 다시 그려서 실제 데이터를 반영
+            else:
+                st.info(f"🔄 {spinner_text}")
+        _poll()
+        return default_result, False
+
+    # 다 끝났거나 상한 시간을 넘김 → 끝난 것만 회수, 안 끝난 항목은 collect_fn이
+    # 알아서 기본값으로 채우도록 한다.
+    result = collect_fn(futures)
+    for f in futures.values():
+        if not f.done():
+            f.cancel()  # 이미 실행 중이면 취소는 안 되지만, 큐 대기중이었다면 자리를 비워준다
+    jobs.pop(job_key, None)  # 다음 방문 때는 (캐시 TTL이 지났다면) 새로 조회
+    return result, True
+
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_market_index_table():
     """
@@ -4302,34 +4368,42 @@ def render_dashboard():
     st.markdown("<div class='dash-section-title'>📈 시장 지수</div>", unsafe_allow_html=True)
 
     # ── 대시보드에 필요한 4가지 데이터(시장지수/스파크라인/수급동향/섹터순위)를 하나씩
-    # 순서대로 부르는 대신 한꺼번에 병렬로 미리 가져온다. 예전처럼 순차 호출하면, 캐시가
-    # 비어있는 상태(앱을 막 새로 시작했거나, 이전 방문이 완료되기 전에 다른 페이지로
-    # 넘어가서 캐시가 못 채워진 경우)에서는 4개 각각 최대 12~15초씩 걸릴 수 있어서
-    # 다 더하면 이 페이지 하나에서 최악 50초 넘게 메인 스크립트가 붙잡혀 있을 수
-    # 있었다. 이 시간 동안은 Streamlit이 사용자의 새 클릭(재실행 요청)을 전혀 처리할
-    # 수 없고, 브라우저 쪽에서도 "Connection timed out"으로 보일 만큼 길어질 수 있다.
-    # 그래서 네 가지를 동시에 병렬 실행하고, 전체에 단 하나의 상한(15초)만 건다.
-    with st.spinner("🔄 대시보드 데이터를 불러오는 중..."):
+    # 순서대로 부르는 대신 한꺼번에 병렬로 미리 가져온다.
+    # [탭 이동 멈춤 대응] 예전에는 as_completed(timeout=15)로 메인 스크립트가 최대
+    # 15초를 한 번에 몰아서 기다렸다 — 그동안은 사이드바 탭 클릭 같은 새 상호작용을
+    # Streamlit이 전혀 받아줄 수 없어서 멈춘 것처럼 보였다. 지금은 render_async_multi로
+    # 0.4초 간격 폴링만 하고 그 사이사이에 새 클릭을 정상적으로 받아준다.
+    def _submit_dash_jobs():
         _dash_executor = get_orchestration_executor()
-        _dash_futures = {
-            _dash_executor.submit(fetch_market_index_table): "indices",
-            _dash_executor.submit(fetch_sparkline_data): "sparklines",
-            _dash_executor.submit(fetch_investor_trend): "trend",
-            _dash_executor.submit(fetch_sector_ranking): "df_sector",
+        return {
+            "indices":    _dash_executor.submit(fetch_market_index_table),
+            "sparklines": _dash_executor.submit(fetch_sparkline_data),
+            "trend":      _dash_executor.submit(fetch_investor_trend),
+            "df_sector":  _dash_executor.submit(fetch_sector_ranking),
         }
-        _dash_results = {"indices": {}, "sparklines": {}, "trend": {}, "df_sector": pd.DataFrame()}
-        try:
-            for _dash_future in concurrent.futures.as_completed(_dash_futures, timeout=15):
-                _dash_key = _dash_futures[_dash_future]
+
+    def _collect_dash_results(futures):
+        out = {"indices": {}, "sparklines": {}, "trend": {}, "df_sector": pd.DataFrame()}
+        for key, f in futures.items():
+            if f.done():
                 try:
-                    _dash_results[_dash_key] = _dash_future.result(timeout=6)
+                    val = f.result(timeout=0.1)
+                    if val is not None:
+                        out[key] = val
                 except Exception:
                     pass
-        except concurrent.futures.TimeoutError:
-            pass  # 전체 상한 초과 → 못 받은 데이터는 기본값(빈 상태)으로 표시
-        finally:
-            for f in _dash_futures:
-                f.cancel()
+        return out
+
+    _dash_results, _dash_ready = render_async_multi(
+        job_key="dashboard_main_data",
+        submit_fn=_submit_dash_jobs,
+        collect_fn=_collect_dash_results,
+        default_result={"indices": {}, "sparklines": {}, "trend": {}, "df_sector": pd.DataFrame()},
+        spinner_text="대시보드 데이터를 불러오는 중...",
+        overall_timeout=15,
+    )
+    if not _dash_ready:
+        return  # 아직 로딩 중 — 이후 렌더링은 건너뛰고, 폴링 프래그먼트가 알아서 이어간다
 
     indices = _dash_results["indices"] or {}
     sparklines = _dash_results["sparklines"] or {}
