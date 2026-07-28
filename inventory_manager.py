@@ -81,6 +81,23 @@ st.set_page_config(page_title="Inventory Manager", page_icon="📦", layout="wid
 def normalize_kr_code(code):
     return re.sub(r"\D", "", str(code)).zfill(6)[:6]
 
+# ── 앱 전역 공유 스레드풀 ──────────────────────────────────────────────────
+# 문제: 기존에는 대시보드/관심종목/스크리너 등에서 병렬조회가 필요할 때마다 매번
+# 새 ThreadPoolExecutor를 만들고 shutdown(wait=False)로 버렸다. shutdown(wait=False)는
+# "이 executor로 새 작업을 더 안 받겠다"는 뜻일 뿐, 이미 떠 있는 스레드가 실제로
+# 끝나기를 기다리지 않는다. 그래서 사용자가 짧은 시간 안에 무거운 페이지(특히 대시보드,
+# yfinance 4개 + 네이버 API)를 여러 번 왔다갔다 하면, 이전 방문에서 못 끝낸 스레드들이
+# 계속 쌓이다가 결국 클라우드 프로세스가 열 수 있는 스레드/소켓 상한에 몰려서 이후
+# 요청 자체를 못 받는(=탭 전환 시 멈춤) 상태가 됐다.
+# 해결: st.cache_resource로 프로세스당(=앱 전체) 스레드풀을 "딱 하나"만 만들어 공유한다.
+# max_workers를 고정해두면, 페이지를 아무리 빨리 왔다갔다 해도 동시에 살아있는 워커
+# 스레드 수가 이 상한을 절대 넘지 않는다(넘치는 작업은 새 스레드를 만드는 대신 큐에서
+# 대기했다가 순서대로 실행된다).
+@st.cache_resource(show_spinner=False)
+def get_shared_executor():
+    return concurrent.futures.ThreadPoolExecutor(max_workers=20)
+# ────────────────────────────────────────────────────────────────────────
+
 # ── 병렬 조회용 안전 실행 헬퍼 ──────────────────────────────────────────────
 # 문제: concurrent.futures.as_completed(futures)를 타임아웃 없이 쓰면, 스레드
 # 하나라도 응답이 안 오는 상태(클라우드 배포 환경에서 외부 API가 datacenter IP를
@@ -97,25 +114,33 @@ def run_parallel_safe(task_fn, items, max_workers=5, overall_timeout=25, per_res
     """
     task_fn(item) -> (key, result) 형태의 함수를 items 각각에 대해 병렬 실행.
     반환: {key: result} dict (실패/타임아웃난 항목은 아예 키가 없음)
+
+    ⚠️ max_workers는 더 이상 이 함수가 자체 executor를 만드는 데 쓰이지 않는다.
+    앱 전역 공유 스레드풀(get_shared_executor)을 사용해서, 이 함수를 얼마나 자주
+    호출하든 실제로 동시에 떠 있는 워커 스레드 수는 공유 풀의 max_workers(20)를
+    절대 넘지 않는다.
     """
     results = {}
     if not items:
         return results
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    executor = get_shared_executor()
+    futures = {executor.submit(task_fn, item): item for item in items}
     try:
-        futures = {executor.submit(task_fn, item): item for item in items}
-        try:
-            for future in concurrent.futures.as_completed(futures, timeout=overall_timeout):
-                try:
-                    k, entry = future.result(timeout=per_result_timeout)
-                    if entry is not None:
-                        results[k] = entry
-                except Exception:
-                    continue
-        except concurrent.futures.TimeoutError:
-            pass  # 전체 상한 초과 → 나머지는 건너뛰고 계속 진행
+        for future in concurrent.futures.as_completed(futures, timeout=overall_timeout):
+            try:
+                k, entry = future.result(timeout=per_result_timeout)
+                if entry is not None:
+                    results[k] = entry
+            except Exception:
+                continue
+    except concurrent.futures.TimeoutError:
+        pass  # 전체 상한 초과 → 나머지는 건너뛰고 계속 진행
     finally:
-        executor.shutdown(wait=False)
+        # 공유 스레드풀이므로 여기서 shutdown하지 않는다(앱 전체가 계속 재사용).
+        # 아직 큐에서 시작도 못 한 future는 취소해서 불필요하게 스레드를 점유하지 않게 한다.
+        # (이미 실행 중인 future는 cancel()이 안 먹지만, 그건 원래 자연히 끝나고 사라진다.)
+        for f in futures:
+            f.cancel()
     return results
 # ────────────────────────────────────────────────────────────────────────
 
@@ -378,21 +403,21 @@ def fetch_investor_trend_monthly(sosok):
             return None
 
     rows = []
-    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+    _executor = get_shared_executor()
+    _futures = {_executor.submit(fetch_one, d): d for d in business_days}
     try:
-        futures = {_executor.submit(fetch_one, d): d for d in business_days}
-        try:
-            for future in concurrent.futures.as_completed(futures, timeout=20):
-                try:
-                    res = future.result(timeout=8)
-                    if res:
-                        rows.append(res)
-                except Exception:
-                    continue
-        except concurrent.futures.TimeoutError:
-            pass  # 전체 상한 초과 → 지금까지 모인 결과로 진행
+        for future in concurrent.futures.as_completed(_futures, timeout=20):
+            try:
+                res = future.result(timeout=8)
+                if res:
+                    rows.append(res)
+            except Exception:
+                continue
+    except concurrent.futures.TimeoutError:
+        pass  # 전체 상한 초과 → 지금까지 모인 결과로 진행
     finally:
-        _executor.shutdown(wait=False)
+        for f in _futures:
+            f.cancel()
 
     rows.sort(key=lambda r: r["날짜"])
     return rows
@@ -571,20 +596,20 @@ def fetch_sector_ranking():
         return None
         
     rows = []
-    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+    _executor = get_shared_executor()
+    _futures = [_executor.submit(get_data, n, c) for n, c in sector_etfs]
     try:
-        futures = [_executor.submit(get_data, n, c) for n, c in sector_etfs]
-        try:
-            for future in concurrent.futures.as_completed(futures, timeout=15):
-                try:
-                    res = future.result(timeout=6)
-                    if res: rows.append(res)
-                except Exception:
-                    continue
-        except concurrent.futures.TimeoutError:
-            pass
+        for future in concurrent.futures.as_completed(_futures, timeout=15):
+            try:
+                res = future.result(timeout=6)
+                if res: rows.append(res)
+            except Exception:
+                continue
+    except concurrent.futures.TimeoutError:
+        pass
     finally:
-        _executor.shutdown(wait=False)
+        for f in _futures:
+            f.cancel()
 
     if not rows: return pd.DataFrame()
     return pd.DataFrame(rows).sort_values("등락률_num", ascending=False).reset_index(drop=True)
@@ -633,21 +658,21 @@ def fetch_dividend_ranking():
         _dbg(f"총 {max_page}페이지 병렬 조회 시작")
 
         all_pages = []
-        _executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+        _executor = get_shared_executor()
+        _futures = {_executor.submit(fetch_page, p): p for p in range(1, max_page + 1)}
         try:
-            futures = {_executor.submit(fetch_page, p): p for p in range(1, max_page + 1)}
-            try:
-                for future in concurrent.futures.as_completed(futures, timeout=25):
-                    try:
-                        result = future.result(timeout=10)
-                        if result is not None:
-                            all_pages.append(result)
-                    except Exception:
-                        continue
-            except concurrent.futures.TimeoutError:
-                _dbg("전체 25초 상한 초과 (일부 페이지 스킵)")
+            for future in concurrent.futures.as_completed(_futures, timeout=25):
+                try:
+                    result = future.result(timeout=10)
+                    if result is not None:
+                        all_pages.append(result)
+                except Exception:
+                    continue
+        except concurrent.futures.TimeoutError:
+            _dbg("전체 25초 상한 초과 (일부 페이지 스킵)")
         finally:
-            _executor.shutdown(wait=False)
+            for f in _futures:
+                f.cancel()
 
         _dbg(f"병렬 조회 종료, {len(all_pages)}개 페이지 확보, concat 시작")
         if not all_pages:
@@ -1476,32 +1501,32 @@ def fetch_screener_data_generator():
     completed = 0
     failed_pages = []
 
-    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+    _executor = get_shared_executor()
     processed = set()
+    future_to_url = {_executor.submit(fetch_page_data, s, p, headers, cookies): (s, p) for s, p in urls}
     try:
-        future_to_url = {_executor.submit(fetch_page_data, s, p, headers, cookies): (s, p) for s, p in urls}
-        try:
-            for future in concurrent.futures.as_completed(future_to_url, timeout=90):
-                completed += 1
-                progress_pct = 10 + int((completed / total_pages) * 70)
-                yield f"⚡ 스텔스 모드 스캔 중... ({completed}/{total_pages} 페이지)", progress_pct
-                s, p = future_to_url[future]
-                processed.add((s, p))
-                try:
-                    df = future.result(timeout=15)
-                except Exception:
-                    df = None
-                if df is not None and not df.empty:
-                    all_data.append(df)
-                else:
-                    failed_pages.append((s, p))
-        except concurrent.futures.TimeoutError:
-            # 전체 상한(90초) 초과 → 아직 결과가 안 온 나머지 페이지는 실패로 간주하고 재시도 라운드로 넘김
-            for s, p in urls:
-                if (s, p) not in processed:
-                    failed_pages.append((s, p))
+        for future in concurrent.futures.as_completed(future_to_url, timeout=90):
+            completed += 1
+            progress_pct = 10 + int((completed / total_pages) * 70)
+            yield f"⚡ 스텔스 모드 스캔 중... ({completed}/{total_pages} 페이지)", progress_pct
+            s, p = future_to_url[future]
+            processed.add((s, p))
+            try:
+                df = future.result(timeout=15)
+            except Exception:
+                df = None
+            if df is not None and not df.empty:
+                all_data.append(df)
+            else:
+                failed_pages.append((s, p))
+    except concurrent.futures.TimeoutError:
+        # 전체 상한(90초) 초과 → 아직 결과가 안 온 나머지 페이지는 실패로 간주하고 재시도 라운드로 넘김
+        for s, p in urls:
+            if (s, p) not in processed:
+                failed_pages.append((s, p))
     finally:
-        _executor.shutdown(wait=False)
+        for f in future_to_url:
+            f.cancel()
 
     # ── 실패한 페이지 재시도 (네이버 측 레이트리밋으로 뒷부분 페이지들이 몰려서 실패하는 경우 대응) ──
     # 동시 요청 수를 점점 줄이고, 대기 시간을 늘려가며 최대 3라운드까지 재시도한다.
@@ -1513,27 +1538,27 @@ def fetch_screener_data_generator():
         time.sleep(backoff_seconds[retry_round])
         still_failed = []
         _retry_processed = set()
-        _retry_executor = concurrent.futures.ThreadPoolExecutor(max_workers=retry_workers[retry_round])
+        _retry_executor = get_shared_executor()
+        future_to_url = {_retry_executor.submit(fetch_page_data, s, p, headers, cookies): (s, p) for s, p in failed_pages}
         try:
-            future_to_url = {_retry_executor.submit(fetch_page_data, s, p, headers, cookies): (s, p) for s, p in failed_pages}
-            try:
-                for future in concurrent.futures.as_completed(future_to_url, timeout=45):
-                    s, p = future_to_url[future]
-                    _retry_processed.add((s, p))
-                    try:
-                        df = future.result(timeout=15)
-                    except Exception:
-                        df = None
-                    if df is not None and not df.empty:
-                        all_data.append(df)
-                    else:
-                        still_failed.append((s, p))
-            except concurrent.futures.TimeoutError:
-                for s, p in failed_pages:
-                    if (s, p) not in _retry_processed:
-                        still_failed.append((s, p))
+            for future in concurrent.futures.as_completed(future_to_url, timeout=45):
+                s, p = future_to_url[future]
+                _retry_processed.add((s, p))
+                try:
+                    df = future.result(timeout=15)
+                except Exception:
+                    df = None
+                if df is not None and not df.empty:
+                    all_data.append(df)
+                else:
+                    still_failed.append((s, p))
+        except concurrent.futures.TimeoutError:
+            for s, p in failed_pages:
+                if (s, p) not in _retry_processed:
+                    still_failed.append((s, p))
         finally:
-            _retry_executor.shutdown(wait=False)
+            for f in future_to_url:
+                f.cancel()
         failed_pages = still_failed
         retry_round += 1
 
@@ -1872,22 +1897,22 @@ def run_unified_market_scan():
     progress_text = "⚡ CSV 고점 데이터 매칭 중..." if high52_map else "⚡ 네이버 실시간 API 스캔 중..."
     completed = 0
 
-    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=scan_workers)
+    _executor = get_shared_executor()
+    _futures = {_executor.submit(check_naver_52w_robust, r): r for r in dict_records}
     try:
-        futures = {_executor.submit(check_naver_52w_robust, r): r for r in dict_records}
-        try:
-            for future in concurrent.futures.as_completed(futures, timeout=60):
-                completed += 1
-                pb.progress(int((completed / total) * 100), text=f"[2/2] {progress_text} ({completed}/{total})")
-                try:
-                    res = future.result(timeout=12)
-                except Exception:
-                    res = None
-                if res: rows.append(res)
-        except concurrent.futures.TimeoutError:
-            pass  # 전체 상한(60초) 초과 → 지금까지 모인 결과로 계속 진행
+        for future in concurrent.futures.as_completed(_futures, timeout=60):
+            completed += 1
+            pb.progress(int((completed / total) * 100), text=f"[2/2] {progress_text} ({completed}/{total})")
+            try:
+                res = future.result(timeout=12)
+            except Exception:
+                res = None
+            if res: rows.append(res)
+    except concurrent.futures.TimeoutError:
+        pass  # 전체 상한(60초) 초과 → 지금까지 모인 결과로 계속 진행
     finally:
-        _executor.shutdown(wait=False)
+        for f in _futures:
+            f.cancel()
 
     pb.progress(100, text="✨ 스캔 완료! (스크리너 + 추천 종목 데이터가 함께 갱신되었습니다)")
     time.sleep(0.4)
@@ -2750,21 +2775,21 @@ def render_watchlist_portfolio_summary(df):
 
     codes = holdings["종목코드"].tolist()
     current_prices = {}
-    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=6)
+    _executor = get_shared_executor()
+    _futures = {_executor.submit(fetch_live_price_change, code): code for code in codes}
     try:
-        futures = {_executor.submit(fetch_live_price_change, code): code for code in codes}
-        try:
-            for future in concurrent.futures.as_completed(futures, timeout=20):
-                code = futures[future]
-                try:
-                    price, _pct, _diff = future.result(timeout=8)
-                except Exception:
-                    price = None
-                current_prices[code] = price
-        except concurrent.futures.TimeoutError:
-            pass
+        for future in concurrent.futures.as_completed(_futures, timeout=20):
+            code = _futures[future]
+            try:
+                price, _pct, _diff = future.result(timeout=8)
+            except Exception:
+                price = None
+            current_prices[code] = price
+    except concurrent.futures.TimeoutError:
+        pass
     finally:
-        _executor.shutdown(wait=False)
+        for f in _futures:
+            f.cancel()
 
     total_buy = 0.0
     total_eval = 0.0
@@ -2979,23 +3004,23 @@ def render_watchlist():
         # executor.shutdown(wait=False)로 종료해서, 아직 안 끝난 스레드가 있어도
         # 여기서 더 이상 기다리지 않고 즉시 다음 로직으로 넘어간다.
         with st.spinner(f"🔄 관심종목 {len(_wl_codes)}건 시세 조회 중..."):
-            _wl_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+            _wl_executor = get_shared_executor()
+            _wl_futures = {_wl_executor.submit(_wl_prefetch_one, c): c for c in _wl_codes}
             try:
-                _wl_futures = {_wl_executor.submit(_wl_prefetch_one, c): c for c in _wl_codes}
-                try:
-                    _wl_done_iter = concurrent.futures.as_completed(_wl_futures, timeout=40)
-                    for _wl_future in _wl_done_iter:
-                        try:
-                            _code, _price_info, _spark, _ai_score = _wl_future.result(timeout=12)
-                        except Exception:
-                            continue
-                        wl_price_cache[_code] = _price_info
-                        sparkline_cache[_code] = _spark
-                        ai_score_cache[_code] = _ai_score
-                except concurrent.futures.TimeoutError:
-                    pass  # 일부 종목 조회가 40초를 넘김 → 나머지는 건너뛰고 계속 진행
+                _wl_done_iter = concurrent.futures.as_completed(_wl_futures, timeout=40)
+                for _wl_future in _wl_done_iter:
+                    try:
+                        _code, _price_info, _spark, _ai_score = _wl_future.result(timeout=12)
+                    except Exception:
+                        continue
+                    wl_price_cache[_code] = _price_info
+                    sparkline_cache[_code] = _spark
+                    ai_score_cache[_code] = _ai_score
+            except concurrent.futures.TimeoutError:
+                pass  # 일부 종목 조회가 40초를 넘김 → 나머지는 건너뛰고 계속 진행
             finally:
-                _wl_executor.shutdown(wait=False)
+                for f in _wl_futures:
+                    f.cancel()
 
     reached_summary = []  # [(종목명, 종목코드, 도달차수, 진입가, 현재가), ...]
     for _, _row in watchlist_df.iterrows():
