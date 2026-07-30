@@ -4556,8 +4556,7 @@ def render_dashboard():
         </div>
         """
         with col:
-            import streamlit.components.v1 as components
-            components.html(html, height=230 if show_volume else 210, scrolling=False)
+            st.markdown(html, unsafe_allow_html=True)
 
     c1, c2, c3 = st.columns(3)
     for col, key in [(c1, "kospi"), (c2, "kosdaq"), (c3, "nasdaq")]:
@@ -5983,17 +5982,72 @@ def render_fnguide():
     if active_code:
         code = active_code
         cache_key = f'fnguide_result_{code}'
-        
-        if search_btn or cache_key not in st.session_state:
-            with st.spinner("에프앤가이드(FnGuide) 서버에서 데이터를 분석 중입니다..."):
-                _info = fetch_company_info_fnguide(code)
-                _df_annual, _, _ = fetch_fnguide_data(code)
-                _per_ai, _pbr_ai, _roe_ai, _debt_ai, _drop_pct_ai, _div_ai = get_ai_diagnosis_inputs(code, _df_annual)
-                st.session_state[cache_key] = {
-                    'info': _info,
-                    'per_ai': _per_ai, 'pbr_ai': _pbr_ai, 'roe_ai': _roe_ai,
-                    'debt_ai': _debt_ai, 'drop_pct_ai': _drop_pct_ai, 'div_ai': _div_ai,
+
+        # ── [탭 멈춤 대응] 기업 재무 분석 데이터 로딩을 대시보드와 동일한
+        # 비동기(render_async_multi) 병렬 패턴으로 전환.
+        #
+        # 문제: 기존에는 fetch_company_info_fnguide → fetch_fnguide_data →
+        # get_ai_diagnosis_inputs를 st.spinner 블록 안에서 메인 스크립트
+        # 실행 스레드가 그대로 순차(블로킹) 호출했다. 각 함수 내부에는
+        # 네이버금융/와이즈리포트/FnGuide 모바일에 대한 requests.get이
+        # timeout=6~8초로 여러 번 순서대로 걸려 있어서, 응답이 느린
+        # 클라우드 환경(데이터센터 IP는 이런 국내 사이트들이 응답을
+        # 의도적으로 늦추거나 사실상 막는 경우가 흔함)에서는 이 구간
+        # 하나만으로도 수십 초간 메인 스레드가 블로킹됐다. 이 동안은
+        # Streamlit이 새 인터랙션(예: 다른 탭 클릭)을 받아줄 타이밍 자체가
+        # 없어서 "탭 이동 시 멈춤" 현상으로 그대로 이어졌다.
+        #
+        # 해결: 네트워크 I/O가 실제로 발생하는 두 함수(fetch_company_info_
+        # fnguide, fetch_fnguide_data)만 공유 스레드풀(get_shared_executor)에
+        # 병렬로 던지고, 메인 스크립트는 대시보드와 똑같이 render_async_multi
+        # (st.fragment(run_every=0.4)로 완료 여부만 짧게 폴링)로 기다린다.
+        # get_ai_diagnosis_inputs는 순수 로컬 계산(네트워크 호출 없음)이라
+        # 결과가 준비된 뒤 메인 스레드에서 그대로 호출해도 문제 없다.
+        need_fetch = search_btn or cache_key not in st.session_state
+
+        if need_fetch:
+            _fnguide_info_default = {
+                "name": "알 수 없음", "summary": "제공된 기업개요가 없습니다.",
+                "opinion": "📭 분석의견 없음", "target": "데이터 없음",
+                "opinion_score": "", "analyst_count": "", "consensus_note": "",
+            }
+
+            def _submit_fnguide_jobs():
+                ex = get_shared_executor()
+                return {
+                    "info": ex.submit(fetch_company_info_fnguide, code),
+                    "annual": ex.submit(fetch_fnguide_data, code),
                 }
+
+            def _collect_fnguide_results(futures):
+                info = futures["info"].result() if futures["info"].done() else _fnguide_info_default
+                if futures["annual"].done():
+                    df_annual, _, _ = futures["annual"].result()
+                else:
+                    df_annual = pd.DataFrame()
+                return {"info": info, "df_annual": df_annual}
+
+            _fnguide_default_result = {"info": _fnguide_info_default, "df_annual": pd.DataFrame()}
+
+            _fnguide_result, _fnguide_ready = render_async_multi(
+                job_key=f"fnguide_main_{code}",
+                submit_fn=_submit_fnguide_jobs,
+                collect_fn=_collect_fnguide_results,
+                default_result=_fnguide_default_result,
+                spinner_text="에프앤가이드(FnGuide) 서버에서 데이터를 분석 중입니다...",
+                overall_timeout=20,
+            )
+            if not _fnguide_ready:
+                return  # 아직 로딩 중 — 이후 렌더링은 건너뛰고, 폴링 프래그먼트가 알아서 이어간다
+
+            _info = _fnguide_result["info"]
+            _df_annual = _fnguide_result["df_annual"]
+            _per_ai, _pbr_ai, _roe_ai, _debt_ai, _drop_pct_ai, _div_ai = get_ai_diagnosis_inputs(code, _df_annual)
+            st.session_state[cache_key] = {
+                'info': _info,
+                'per_ai': _per_ai, 'pbr_ai': _pbr_ai, 'roe_ai': _roe_ai,
+                'debt_ai': _debt_ai, 'drop_pct_ai': _drop_pct_ai, 'div_ai': _div_ai,
+            }
 
         cached = st.session_state[cache_key]
         info        = cached['info']
