@@ -4242,13 +4242,13 @@ def main():
                     del st.query_params["session_token"]
                 st.rerun()
 
-    # 🔧 [디버깅 모드] 탭 이동 시 멈춤 현상의 원인 탭을 하나씩 좁혀보기 위해
-    # 대시보드 홈 탭만 제거하고 나머지는 그대로 둠.
+    # 🔧 [디버깅 모드] 탭 이동 시 멈춤 현상의 원인을 좁혀보기 위해
+    # 관심종목 탭만 제거하고 나머지는 그대로 둠(대시보드 포함).
     # 원상복구하려면 아래 주석을 해제하면 됨.
     SIDEBAR_GROUPS = [
-        # ("OVERVIEW", [
-        #     ("대시보드 홈", ":material/space_dashboard:"),
-        # ]),
+        ("OVERVIEW", [
+            ("대시보드 홈", ":material/space_dashboard:"),
+        ]),
         ("STOCK DISCOVERY", [
             ("추천 종목", ":material/target:"),
             ("종목 스크리너", ":material/tune:"),
@@ -4258,13 +4258,13 @@ def main():
             ("실시간 배당 순위", ":material/payments:"),
         ]),
         ("MY PAGE", [
-            ("관심종목", ":material/bookmark:"),
+            # ("관심종목", ":material/bookmark:"),
             ("비밀번호 변경", ":material/lock:"),
         ]),
     ]
 
     if "current_page" not in st.session_state:
-        st.session_state.current_page = "추천 종목"
+        st.session_state.current_page = "대시보드 홈"
 
     with st.sidebar:
         st.markdown('<span class="sidebar-logo-text">Inventory Manager</span>', unsafe_allow_html=True)
@@ -4361,12 +4361,12 @@ def main():
     # "진입"만 있고 "완료"가 없는 페이지가 바로 멈춘 지점이다.
     print(f"[DEBUG {datetime.datetime.now().strftime('%H:%M:%S')}] 페이지 진입: {selected}", file=sys.stderr, flush=True)
 
-    # elif selected == "대시보드 홈":      render_dashboard()
-    if   selected == "추천 종목":        render_recommendations()
+    if   selected == "대시보드 홈":      render_dashboard()
+    elif selected == "추천 종목":        render_recommendations()
     elif selected == "종목 스크리너":    render_screener()
     elif selected == "기업 재무 분석":   render_fnguide()
     elif selected == "실시간 배당 순위": render_dividend()
-    elif selected == "관심종목":         render_watchlist()
+    # elif selected == "관심종목":         render_watchlist()
     elif selected == "비밀번호 변경":     render_change_password()
 
     print(f"[DEBUG {datetime.datetime.now().strftime('%H:%M:%S')}] 페이지 렌더링 완료: {selected}", file=sys.stderr, flush=True)
