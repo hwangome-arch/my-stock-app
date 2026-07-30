@@ -707,9 +707,9 @@ def fetch_sector_ranking():
     _executor = get_shared_executor()
     _futures = [_executor.submit(get_data, n, c) for n, c in sector_etfs]
     try:
-        for future in concurrent.futures.as_completed(_futures, timeout=15):
+        for future in concurrent.futures.as_completed(_futures, timeout=10):
             try:
-                res = future.result(timeout=6)
+                res = future.result(timeout=5)
                 if res: rows.append(res)
             except Exception:
                 continue
@@ -769,15 +769,15 @@ def fetch_dividend_ranking():
         _executor = get_shared_executor()
         _futures = {_executor.submit(fetch_page, p): p for p in range(1, max_page + 1)}
         try:
-            for future in concurrent.futures.as_completed(_futures, timeout=25):
+            for future in concurrent.futures.as_completed(_futures, timeout=12):
                 try:
-                    result = future.result(timeout=10)
+                    result = future.result(timeout=6)
                     if result is not None:
                         all_pages.append(result)
                 except Exception:
                     continue
         except concurrent.futures.TimeoutError:
-            _dbg("전체 25초 상한 초과 (일부 페이지 스킵)")
+            _dbg("전체 12초 상한 초과 (일부 페이지 스킵)")
         finally:
             for f in _futures:
                 f.cancel()
@@ -1613,14 +1613,14 @@ def fetch_screener_data_generator():
     processed = set()
     future_to_url = {_executor.submit(fetch_page_data, s, p, headers, cookies): (s, p) for s, p in urls}
     try:
-        for future in concurrent.futures.as_completed(future_to_url, timeout=90):
+        for future in concurrent.futures.as_completed(future_to_url, timeout=35):
             completed += 1
             progress_pct = 10 + int((completed / total_pages) * 70)
             yield f"⚡ 스텔스 모드 스캔 중... ({completed}/{total_pages} 페이지)", progress_pct
             s, p = future_to_url[future]
             processed.add((s, p))
             try:
-                df = future.result(timeout=15)
+                df = future.result(timeout=10)
             except Exception:
                 df = None
             if df is not None and not df.empty:
@@ -1628,7 +1628,7 @@ def fetch_screener_data_generator():
             else:
                 failed_pages.append((s, p))
     except concurrent.futures.TimeoutError:
-        # 전체 상한(90초) 초과 → 아직 결과가 안 온 나머지 페이지는 실패로 간주하고 재시도 라운드로 넘김
+        # 전체 상한(35초) 초과 → 아직 결과가 안 온 나머지 페이지는 실패로 간주하고 재시도 라운드로 넘김
         for s, p in urls:
             if (s, p) not in processed:
                 failed_pages.append((s, p))
@@ -1649,11 +1649,11 @@ def fetch_screener_data_generator():
         _retry_executor = get_shared_executor()
         future_to_url = {_retry_executor.submit(fetch_page_data, s, p, headers, cookies): (s, p) for s, p in failed_pages}
         try:
-            for future in concurrent.futures.as_completed(future_to_url, timeout=45):
+            for future in concurrent.futures.as_completed(future_to_url, timeout=18):
                 s, p = future_to_url[future]
                 _retry_processed.add((s, p))
                 try:
-                    df = future.result(timeout=15)
+                    df = future.result(timeout=8)
                 except Exception:
                     df = None
                 if df is not None and not df.empty:
@@ -2008,16 +2008,16 @@ def run_unified_market_scan():
     _executor = get_shared_executor()
     _futures = {_executor.submit(check_naver_52w_robust, r): r for r in dict_records}
     try:
-        for future in concurrent.futures.as_completed(_futures, timeout=60):
+        for future in concurrent.futures.as_completed(_futures, timeout=25):
             completed += 1
             pb.progress(int((completed / total) * 100), text=f"[2/2] {progress_text} ({completed}/{total})")
             try:
-                res = future.result(timeout=12)
+                res = future.result(timeout=8)
             except Exception:
                 res = None
             if res: rows.append(res)
     except concurrent.futures.TimeoutError:
-        pass  # 전체 상한(60초) 초과 → 지금까지 모인 결과로 계속 진행
+        pass  # 전체 상한(25초) 초과 → 지금까지 모인 결과로 계속 진행
     finally:
         for f in _futures:
             f.cancel()
@@ -3215,9 +3215,9 @@ def render_watchlist():
             _wl_executor = get_shared_executor()
             _wl_futures = {_wl_executor.submit(_wl_prefetch_one, c): c for c in _wl_codes}
             try:
-                for _wl_future in concurrent.futures.as_completed(_wl_futures, timeout=15):
+                for _wl_future in concurrent.futures.as_completed(_wl_futures, timeout=8):
                     try:
-                        _code, _price_info, _spark, _ai_score, _hp_html = _wl_future.result(timeout=8)
+                        _code, _price_info, _spark, _ai_score, _hp_html = _wl_future.result(timeout=4)
                     except Exception:
                         continue
                     wl_price_cache[_code] = _price_info
