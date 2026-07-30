@@ -4135,7 +4135,13 @@ def main():
         render_login_page()
         return
 
-    st.markdown("""
+    # ⚡ 성능 최적화: 아래 대형 CSS 블록은 내용이 고정되어 있는데도
+    # main()이 rerun될 때마다(=탭을 넘길 때마다) 매번 다시 주입되고 있었다.
+    # Streamlit은 이걸 매번 "새 요소"로 취급해 화면에서 지웠다가 다시 그리기
+    # 때문에, 탭 전환 시 브라우저가 전체 스타일을 재계산하며 버벅이는
+    # 원인이 되었다. session_state 플래그로 세션당 1회만 주입하도록 변경.
+    if not st.session_state.get("_main_css_injected"):
+        st.markdown("""
         <style>
             .stApp { background-color: #F8FAFC !important; }
             section[data-testid="stMain"] > div.block-container { 
@@ -4290,7 +4296,8 @@ def main():
                 background-color: #F8FAFC !important; border-color: #CBD5E1 !important;
             }
         </style>
-    """, unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
+        st.session_state["_main_css_injected"] = True
 
     col_sp, col_user = st.columns([7.5, 2.5])
     with col_user:
