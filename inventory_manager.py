@@ -98,34 +98,62 @@ def normalize_kr_code(code):
 def get_shared_executor():
     return concurrent.futures.ThreadPoolExecutor(max_workers=32)
 
-# ── 메인 스레드 직접 호출 보호용 헬퍼 ──────────────────────────────────────
-# 문제: yfinance(내부적으로 curl_cffi 사용)에 timeout=8을 넘겨도, 클라우드 환경에서
-# 상대 서버(야후 파이낸스)가 소켓을 붙잡아두는 경우 그 timeout이 실제로 지켜지지
-# 않고 호출이 무한정 멈출 수 있다. 이런 호출이 메인 스크립트 실행 스레드에서 직접
-# 일어나면, 스레드풀 보호와 무관하게 앱 전체가 그 자리에서 완전히 멈춰버린다
-# (탭을 몇 번 안 눌렀는데 바로 먹통이 되는 현상은 대부분 이 패턴).
-# 해결: 메인 스레드에서 직접 호출하는 대신 항상 스레드에서 실행시키고, 결과를
-# 기다리는 시간 자체에 메인 스레드 쪽에서 강제 상한을 건다. 라이브러리의 자체
-# timeout을 못 믿는 상황에 대한 이중 안전장치이며, 상한을 넘기면 그 스레드는
-# 백그라운드에 남겨둔 채(cancel 시도만 하고) 메인 스레드는 즉시 다음 로직으로 넘어간다.
-#
-# ⚠️ 절대 get_shared_executor()를 재사용하면 안 된다! 이 함수(estimate_target_hit_
-# probability 등)는 관심종목 프리페치처럼 "이미 공유 풀의 워커 스레드 안"에서 호출되는
-# 경우가 있다. 그 상태에서 같은 공유 풀에 또 작업을 던지고 기다리면, 공유 풀의 워커가
-# 전부 이런 식으로 서로를 기다리게 될 때 새로 던진 작업을 실행해 줄 워커가 하나도
-# 안 남는 자기 자신을 기다리는 교착상태(deadlock)가 생길 수 있다. 그래서 이 안전장치
-# 전용으로 완전히 분리된 별도의 작은 풀을 쓴다.
+# ── 구글시트(gspread) 전용 안전 실행 풀 ──────────────────────────────────────
+# 문제(실제로 발생했던 "탭 왔다갔다 하면 결국 완전히 멈추고 리붓해야만 풀리는" 원인):
+# 예전에는 이 풀을 yfinance 호출과 gspread 호출이 함께 썼다. 그런데
+# future.cancel()은 "이미 실행 중인" 스레드를 죽이지 못한다(아래 call_with_timeout_yf
+# 주석 참고). yfinance(curl_cffi 기반) 호출이 클라우드 환경에서 정말로 응답이 영영
+# 안 오는 경우, 그 작업을 맡은 워커 스레드는 그 자리에서 "영구히" 멈춘 채로 남고,
+# ThreadPoolExecutor는 멈춘 워커를 새 걸로 교체해주지 않는다. 이런 일이 하나둘
+# 쌓이면 고정 크기 풀(워커 16개)의 워커가 결국 다 막히고, 그 순간부터는 로그인
+# 확인(load_users)이나 관심종목 저장/삭제처럼 "이 풀을 같이 쓰던" 완전히 무관한
+# 작업들까지 전부 막힌 워커들 뒤에서 무한정 대기하게 되어 앱 전체가 먹통이 됐다.
+# 해결: 구글시트 작업은 완전히 별도의 풀을 쓴다. yfinance 쪽에서 무슨 일이 나도
+# 로그인/관심종목 저장 같은 핵심 기능은 절대 같이 막히지 않도록 분리.
 @st.cache_resource(show_spinner=False)
-def get_yf_safety_executor():
-    return concurrent.futures.ThreadPoolExecutor(max_workers=16)
+def get_gsheet_safety_executor():
+    return concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
-def call_with_timeout(fn, timeout=10):
-    future = get_yf_safety_executor().submit(fn)
+def call_with_timeout_gsheet(fn, timeout=10):
+    """gspread 호출 전용. gspread는 timeout을 직접 노출하지 않고, 응답이 안 오면
+    스스로 안 끊기므로 별도 스레드에서 실행하고 메인 스레드 쪽에서 상한을 강제한다."""
+    future = get_gsheet_safety_executor().submit(fn)
     try:
         return future.result(timeout=timeout)
     except Exception:
         future.cancel()
         return None
+
+# ── yfinance 호출 전용 안전 실행 헬퍼 (고정 풀 대신 1회용 daemon 스레드) ──────────
+# 문제: yfinance는 내부적으로 curl_cffi를 쓴다. curl_cffi는 파이썬 socket 모듈을
+# 쓰지 않고 자체 C 라이브러리(libcurl)로 통신하기 때문에, 파일 맨 위의
+# socket.setdefaulttimeout(20)이 이 호출에는 전혀 적용되지 않는다. yf.Ticker(...).
+# history(timeout=8)처럼 timeout을 넘겨도 라이브러리/원격 서버 상태에 따라 실제로는
+# 지켜지지 않고 그 호출이 문자 그대로 영원히 안 끝날 수 있다.
+# ⚠️ 이런 "진짜로 영원히 안 끝날 수 있는" 호출을 고정 크기 스레드풀의 워커로
+# 실행하면, 하나가 멈출 때마다 그 풀의 워커 자리가 영구히 하나씩 줄어드는 셈이라
+# (future.cancel()은 실행 중인 스레드를 못 죽인다) 결국 풀 전체가 고갈된다.
+# 해결: 풀을 재사용하지 않고 호출마다 daemon 스레드를 새로 하나씩 띄운다. 하나가
+# 영원히 멈춰도 그냥 좀비 스레드 하나가 버려질 뿐(daemon=True라 프로세스 종료도
+# 안 막음), 다른 호출이 쓸 "고정된 워커 자리"를 뺏지 않는다 — 즉 한쪽이 아무리
+# 많이 멈춰도 다른 호출들의 가용 동시성은 줄어들지 않는다.
+def call_with_timeout_yf(fn, timeout=10):
+    result_box = {}
+    def _runner():
+        try:
+            result_box["value"] = fn()
+        except Exception:
+            result_box["value"] = None
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        return None  # 시간 안에 못 끝남 → 결과 포기하고 진행 (스레드는 백그라운드에 버려짐)
+    return result_box.get("value")
+
+# 하위 호환용 별칭: 과거 이름으로 호출하던 코드가 남아있을 경우를 대비.
+# (신규 코드는 용도에 맞게 call_with_timeout_gsheet / call_with_timeout_yf를 직접 쓸 것)
+call_with_timeout = call_with_timeout_yf
 # ────────────────────────────────────────────────────────────────────────
 # ────────────────────────────────────────────────────────────────────────
 
@@ -2072,7 +2100,7 @@ def estimate_target_hit_probability(stock_code, market_hint, target_price, horiz
         suffix_order = [".KQ", ".KS"] if market_hint == "코스닥" else [".KS", ".KQ"]
         hist = pd.DataFrame()
         for suf in suffix_order:
-            hist = call_with_timeout(
+            hist = call_with_timeout_yf(
                 lambda s=suf: yf.Ticker(f"{stock_code}{s}").history(period="1y", interval="1d", timeout=8),
                 timeout=10,
             )
@@ -2590,7 +2618,7 @@ def load_users():
         ws = _get_worksheet("users")
         return ws.get_all_records(numericise_ignore=['all'])
 
-    records = call_with_timeout(_fetch, timeout=10)
+    records = call_with_timeout_gsheet(_fetch, timeout=10)
     if records is None:
         return pd.DataFrame(columns=_USER_COLUMNS)
     try:
@@ -2626,7 +2654,7 @@ def save_user(username, password, email):
         ws.append_row(new_row, value_input_option="RAW")
         return True
 
-    ok = call_with_timeout(_write, timeout=10)
+    ok = call_with_timeout_gsheet(_write, timeout=10)
     if ok:
         load_users.clear()  # 캐시 무효화
         return True
@@ -2702,7 +2730,7 @@ def update_user_password(username, new_password):
         ws.update_cell(row_idx, _USER_COLUMNS.index("salt") + 1, salt)
         return True
 
-    result = call_with_timeout(_do, timeout=12)
+    result = call_with_timeout_gsheet(_do, timeout=12)
     if result is True:
         load_users.clear()
         return True
@@ -2724,7 +2752,7 @@ def _load_all_watchlist():
         ws = _get_worksheet("watchlist")
         return ws.get_all_records(numericise_ignore=['all'])
 
-    records = call_with_timeout(_fetch, timeout=10)
+    records = call_with_timeout_gsheet(_fetch, timeout=10)
     if records is None:
         return pd.DataFrame(columns=_WATCHLIST_COLUMNS)
     try:
@@ -2763,7 +2791,7 @@ def add_to_watchlist(username, code, name):
         ws.append_row(new_row, value_input_option="RAW")
         return True
 
-    ok = call_with_timeout(_write, timeout=10)
+    ok = call_with_timeout_gsheet(_write, timeout=10)
     if ok:
         _load_all_watchlist.clear()
         return True
@@ -2791,7 +2819,7 @@ def remove_from_watchlist(username, code):
             ws.delete_rows(row_idx)
         return True
 
-    result = call_with_timeout(_do, timeout=12)
+    result = call_with_timeout_gsheet(_do, timeout=12)
     if result is True:
         _load_all_watchlist.clear()
     elif result == "not_found":
@@ -2811,7 +2839,7 @@ def update_watchlist_holding(username, code, buy_price, qty):
             ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("수량") + 1, str(qty) if qty else "")
         return True
 
-    ok = call_with_timeout(_do, timeout=12)
+    ok = call_with_timeout_gsheet(_do, timeout=12)
     if ok:
         _load_all_watchlist.clear()
     else:
@@ -2830,7 +2858,7 @@ def update_watchlist_entries(username, code, entry1, entry2, entry3):
             ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("3차진입가") + 1, str(entry3) if entry3 else "")
         return True
 
-    ok = call_with_timeout(_do, timeout=12)
+    ok = call_with_timeout_gsheet(_do, timeout=12)
     if not ok:
         st.error("일시적인 통신 오류로 진입가 저장에 실패했습니다. 잠시 후 다시 시도해주세요.")
     else:
@@ -2854,7 +2882,7 @@ def toggle_watchlist_pin(username, code):
             ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("고정") + 1, "" if is_pinned else "Y")
         return True
 
-    result = call_with_timeout(_do, timeout=12)
+    result = call_with_timeout_gsheet(_do, timeout=12)
     if result is True:
         _load_all_watchlist.clear()
     elif result == "not_found":
@@ -6207,12 +6235,12 @@ def render_fnguide():
             def _fetch_ma(stock_code):
                 try:
                     import yfinance as yf
-                    df_ma = call_with_timeout(
+                    df_ma = call_with_timeout_yf(
                         lambda: yf.Ticker(f"{stock_code}.KS").history(period="90d", interval="1d", timeout=8),
                         timeout=10,
                     )
                     if df_ma is None or df_ma.empty:
-                        df_ma = call_with_timeout(
+                        df_ma = call_with_timeout_yf(
                             lambda: yf.Ticker(f"{stock_code}.KQ").history(period="90d", interval="1d", timeout=8),
                             timeout=10,
                         )
