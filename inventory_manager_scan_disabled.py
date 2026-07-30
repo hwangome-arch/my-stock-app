@@ -1943,6 +1943,25 @@ def check_naver_52w_robust(row_dict):
     return None
 
 def run_unified_market_scan():
+    """[진단용 스텁] 원래 함수는 아래 _run_unified_market_scan_ORIGINAL_DISABLED로
+    이름만 바꿔 그대로 보존해뒀다. '탭 이동 멈춤'이 스캔 기능 때문인지 확인하려고
+    실제 스캔은 아무것도 하지 않고 안내 메시지만 띄운다.
+
+    ⚠️ 참고로 원본 함수 안에는 다음과 같은, 메인 스레드를 그대로 붙잡는 코드가
+    있었다 (특히 이게 유력한 용의자다):
+        for future in concurrent.futures.as_completed(_futures, timeout=60):
+    이건 최대 60초 동안 메인 스크립트 실행 스레드를 통째로 멈춰 세운다. 이 시간
+    동안 Streamlit은 브라우저에서 온 다른 클릭(탭 이동 포함)을 전혀 처리하지
+    못한다 — run_async_multi/폴링 프래그먼트로 감싸지 않은 유일한 무거운 함수라
+    이 파일에서 가장 의심스러운 지점이다.
+
+    복구 방법: 이 스텁 함수를 지우고, 아래 _run_unified_market_scan_ORIGINAL_DISABLED
+    함수 이름을 다시 run_unified_market_scan으로 되돌리면 원래대로 동작한다.
+    """
+    st.warning("⚠️ [진단 모드] '종목 스캔' 기능이 테스트를 위해 일시적으로 비활성화되어 있습니다. (탭 멈춤 원인 확인용)")
+    return False
+
+def _run_unified_market_scan_ORIGINAL_DISABLED():
     """전체 시장 스크리너 스캔 + 52주 고점 매칭(추천 종목 후보 산출)을 한 번에 실행.
     대시보드 / 추천 종목 / 종목 스크리너, 어디서 버튼을 눌러도 이 함수 하나로
     'shared_screener_df'와 'reco_raw_data'가 함께 갱신되어 세 화면 모두 같은 데이터를 공유한다."""
