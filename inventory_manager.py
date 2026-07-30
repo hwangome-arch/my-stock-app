@@ -6340,6 +6340,7 @@ def render_dividend():
     with col_refresh:
         if st.button("데이터 새로고침"):
             fetch_dividend_ranking.clear()
+            st.session_state["dividend_scanned"] = True
     with col_toggle:
         st.markdown("<div style='display:flex; justify-content:flex-end; align-items:center; padding-top:4px; width:100%;'>", unsafe_allow_html=True)
         st.toggle(
@@ -6349,6 +6350,17 @@ def render_dividend():
             help="리츠(REITs) / 배당성향 100% 초과 / 배당수익률 30% 초과 종목을 제외합니다."
         )
         st.markdown("</div>", unsafe_allow_html=True)
+
+    # 🔧 [탭 이동 멈춤 대응] 예전에는 이 탭에 들어오기만 해도 fetch_dividend_ranking()이
+    # 자동으로 실행되면서(네이버 배당 페이지 여러 장 병렬 스크래핑) 스크립트가 그 자리에서
+    # 블로킹됐다. 그래서 다른 탭으로 빠르게 넘어가려 해도 이 스캔이 끝날 때까지 클릭이
+    # 씹혔다. 이제는 사용자가 명시적으로 버튼을 눌러야만 스캔을 시작하도록 변경.
+    if not st.session_state.get("dividend_scanned"):
+        st.info("💡 아직 배당 데이터를 조회하지 않았습니다. 아래 버튼을 눌러 조회해주세요. (약 5~15초 소요)")
+        if st.button("🔍 배당 데이터 조회", key="dividend_manual_scan_btn", type="primary"):
+            st.session_state["dividend_scanned"] = True
+            st.rerun()
+        return
 
     df = run_with_progress("마켓 데이터 수집 중...", fetch_dividend_ranking)
     
