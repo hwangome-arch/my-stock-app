@@ -3053,6 +3053,8 @@ def render_watchlist_portfolio_summary(df):
 
 
 def render_watchlist():
+    _wldbg = lambda msg: print(f"[DEBUG {datetime.datetime.now().strftime('%H:%M:%S')}] [관심종목] {msg}", file=sys.stderr, flush=True)
+    _wldbg("render_watchlist 시작")
     st.header(
         "관심종목",
         help="""💡 **[관심종목 안내]**\n\n관심 있는 종목을 저장해두고 한눈에 모아볼 수 있는 마이페이지입니다.\n\n종목코드 또는 종목명으로 검색해 추가하면, 계정에 저장되어 다음에 로그인해도 그대로 유지됩니다.\n\n'종목 스크리너'를 한 번 불러온 상태라면 현재가·PER·PBR·배당수익률도 함께 표시됩니다.\n\n각 카드 우측의 ⭐를 누르면 해당 종목이 목록 맨 위에 고정됩니다. 📊는 재무분석 바로가기, 🗑️는 삭제입니다.\n\n각 종목 카드의 '보유 정보 · 매수 타점 입력'에서 1차/2차/3차 진입가를 입력해두면, 현재가가 그 가격 이하로 내려왔을 때 카드와 목록 상단에 자동으로 알림이 표시됩니다."""
@@ -3159,12 +3161,16 @@ def render_watchlist():
 
     st.markdown("<br>", unsafe_allow_html=True)
 
+    _wldbg("load_watchlist 호출 전")
     watchlist_df = load_watchlist(username)
+    _wldbg(f"load_watchlist 완료 ({len(watchlist_df)}건)")
     if watchlist_df.empty:
         st.info("아직 저장된 관심종목이 없습니다. 위 검색창에서 종목을 추가해보세요.")
         return
 
+    _wldbg("portfolio_summary 렌더링 전")
     render_watchlist_portfolio_summary(watchlist_df)
+    _wldbg("portfolio_summary 렌더링 완료")
 
     # 고정(즐겨찾기)한 종목이 먼저 오도록 정렬 (안정 정렬이라 같은 그룹 내 원래 순서는 유지)
     watchlist_df = watchlist_df.assign(_pinned=(watchlist_df["고정"] == "Y")).sort_values(
@@ -3173,7 +3179,9 @@ def render_watchlist():
 
     # 종목 스크리너를 한 번이라도 불러온 상태면 현재가·PER·PBR·배당수익률을 함께 보여줌
     # (아래 병렬 조회에서 시장 구분에도 필요해서 여기로 끌어올림)
+    _wldbg("load_screener_df 호출 전")
     screener_df = load_screener_df()
+    _wldbg(f"load_screener_df 완료 ({len(screener_df) if screener_df is not None else 0}건)")
     has_live_data = screener_df is not None and not screener_df.empty and '종목코드' in screener_df.columns
     if has_live_data:
         screener_df = screener_df.copy()
@@ -3207,6 +3215,7 @@ def render_watchlist():
     # 스크리너 PER/PBR만으로) 먼저 다 구해둔다. 그래야 아래 프리페치에서 종목당 작업을
     # 딱 하나로 합칠 수 있다(시세+스파크라인+AI점수+도달확률을 한 스레드에서 순서대로).
     _hp_targets = {}  # code -> (market_hint, target_price, target_src)
+    _wldbg(f"_hp_targets 계산 시작 ({len(watchlist_df)}종목)")
     for _, _hp_row in watchlist_df.iterrows():
         _hp_code = _hp_row['종목코드']
         if _hp_code in _hp_targets:
