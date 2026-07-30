@@ -121,6 +121,11 @@ def call_with_timeout_gsheet(fn, timeout=10):
     try:
         return future.result(timeout=timeout)
     except Exception:
+        import traceback
+        print("=" * 60)
+        print("[gsheet 호출 실패 - 디버그용 로그]")
+        traceback.print_exc()
+        print("=" * 60)
         future.cancel()
         return None
 
@@ -3997,10 +4002,11 @@ def render_login_page():
                         for e in errors:
                             st.error(e)
                     else:
-                        save_user(su_id_clean, su_pw, su_email_clean)
-                        st.session_state["_force_login_tab"] = True
-                        st.session_state["signup_success_msg"] = f"회원가입이 완료되었습니다! 아이디 '{su_id_clean}'로 로그인해주세요."
-                        st.rerun()
+                        if save_user(su_id_clean, su_pw, su_email_clean):
+                            st.session_state["_force_login_tab"] = True
+                            st.session_state["signup_success_msg"] = f"회원가입이 완료되었습니다! 아이디 '{su_id_clean}'로 로그인해주세요."
+                            st.rerun()
+                        # 실패 시에는 save_user 내부의 st.error() 메시지가 그대로 화면에 남습니다.
 
 def render_change_password():
     st.header(
