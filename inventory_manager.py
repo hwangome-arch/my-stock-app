@@ -4053,14 +4053,19 @@ def main():
     if 'auth_user' not in st.session_state:
         st.session_state.auth_user = None
 
-    # 🔁 F5 새로고침 대응: session_state는 새로고침 시 초기화되지만
-    # URL 쿼리파라미터는 유지되므로, 그 안의 서명 토큰으로 로그인 상태를 복원한다.
-    if not st.session_state.auth_user:
-        _token = st.query_params.get("session_token")
-        if _token:
-            _restored_user = verify_session_token(_token)
-            if _restored_user:
-                st.session_state.auth_user = _restored_user
+    # 🔧 [디버깅 모드] 탭 이동 멈춤 현상이 로그인/세션 복원 쪽과 관련있는지
+    # 확인하기 위해 로그인을 완전히 우회함(환경변수 설정 없이 강제 적용).
+    # 원상복구하려면 아래 줄을 지우고 밑의 두 블록 주석을 해제하면 됨.
+    st.session_state.auth_user = "debug_user"
+
+    # # 🔁 F5 새로고침 대응: session_state는 새로고침 시 초기화되지만
+    # # URL 쿼리파라미터는 유지되므로, 그 안의 서명 토큰으로 로그인 상태를 복원한다.
+    # if not st.session_state.auth_user:
+    #     _token = st.query_params.get("session_token")
+    #     if _token:
+    #         _restored_user = verify_session_token(_token)
+    #         if _restored_user:
+    #             st.session_state.auth_user = _restored_user
 
     # 🛠️ 개발용 로그인 우회: 터미널에서 DEV_SKIP_LOGIN=admin 으로 실행할 때만 적용됨.
     # (환경변수를 설정하지 않고 배포하면 다른 사용자는 평소처럼 로그인해야 함)
