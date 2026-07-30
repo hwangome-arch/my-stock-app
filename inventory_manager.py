@@ -98,67 +98,34 @@ def normalize_kr_code(code):
 def get_shared_executor():
     return concurrent.futures.ThreadPoolExecutor(max_workers=32)
 
-# ── 구글시트(gspread) 전용 안전 실행 풀 ──────────────────────────────────────
-# 문제(실제로 발생했던 "탭 왔다갔다 하면 결국 완전히 멈추고 리붓해야만 풀리는" 원인):
-# 예전에는 이 풀을 yfinance 호출과 gspread 호출이 함께 썼다. 그런데
-# future.cancel()은 "이미 실행 중인" 스레드를 죽이지 못한다(아래 call_with_timeout_yf
-# 주석 참고). yfinance(curl_cffi 기반) 호출이 클라우드 환경에서 정말로 응답이 영영
-# 안 오는 경우, 그 작업을 맡은 워커 스레드는 그 자리에서 "영구히" 멈춘 채로 남고,
-# ThreadPoolExecutor는 멈춘 워커를 새 걸로 교체해주지 않는다. 이런 일이 하나둘
-# 쌓이면 고정 크기 풀(워커 16개)의 워커가 결국 다 막히고, 그 순간부터는 로그인
-# 확인(load_users)이나 관심종목 저장/삭제처럼 "이 풀을 같이 쓰던" 완전히 무관한
-# 작업들까지 전부 막힌 워커들 뒤에서 무한정 대기하게 되어 앱 전체가 먹통이 됐다.
-# 해결: 구글시트 작업은 완전히 별도의 풀을 쓴다. yfinance 쪽에서 무슨 일이 나도
-# 로그인/관심종목 저장 같은 핵심 기능은 절대 같이 막히지 않도록 분리.
+# ── 메인 스레드 직접 호출 보호용 헬퍼 ──────────────────────────────────────
+# 문제: yfinance(내부적으로 curl_cffi 사용)에 timeout=8을 넘겨도, 클라우드 환경에서
+# 상대 서버(야후 파이낸스)가 소켓을 붙잡아두는 경우 그 timeout이 실제로 지켜지지
+# 않고 호출이 무한정 멈출 수 있다. 이런 호출이 메인 스크립트 실행 스레드에서 직접
+# 일어나면, 스레드풀 보호와 무관하게 앱 전체가 그 자리에서 완전히 멈춰버린다
+# (탭을 몇 번 안 눌렀는데 바로 먹통이 되는 현상은 대부분 이 패턴).
+# 해결: 메인 스레드에서 직접 호출하는 대신 항상 스레드에서 실행시키고, 결과를
+# 기다리는 시간 자체에 메인 스레드 쪽에서 강제 상한을 건다. 라이브러리의 자체
+# timeout을 못 믿는 상황에 대한 이중 안전장치이며, 상한을 넘기면 그 스레드는
+# 백그라운드에 남겨둔 채(cancel 시도만 하고) 메인 스레드는 즉시 다음 로직으로 넘어간다.
+#
+# ⚠️ 절대 get_shared_executor()를 재사용하면 안 된다! 이 함수(estimate_target_hit_
+# probability 등)는 관심종목 프리페치처럼 "이미 공유 풀의 워커 스레드 안"에서 호출되는
+# 경우가 있다. 그 상태에서 같은 공유 풀에 또 작업을 던지고 기다리면, 공유 풀의 워커가
+# 전부 이런 식으로 서로를 기다리게 될 때 새로 던진 작업을 실행해 줄 워커가 하나도
+# 안 남는 자기 자신을 기다리는 교착상태(deadlock)가 생길 수 있다. 그래서 이 안전장치
+# 전용으로 완전히 분리된 별도의 작은 풀을 쓴다.
 @st.cache_resource(show_spinner=False)
-def get_gsheet_safety_executor():
-    return concurrent.futures.ThreadPoolExecutor(max_workers=8)
+def get_yf_safety_executor():
+    return concurrent.futures.ThreadPoolExecutor(max_workers=16)
 
-def call_with_timeout_gsheet(fn, timeout=10):
-    """gspread 호출 전용. gspread는 timeout을 직접 노출하지 않고, 응답이 안 오면
-    스스로 안 끊기므로 별도 스레드에서 실행하고 메인 스레드 쪽에서 상한을 강제한다."""
-    future = get_gsheet_safety_executor().submit(fn)
+def call_with_timeout(fn, timeout=10):
+    future = get_yf_safety_executor().submit(fn)
     try:
         return future.result(timeout=timeout)
     except Exception:
-        import traceback
-        print("=" * 60)
-        print("[gsheet 호출 실패 - 디버그용 로그]")
-        traceback.print_exc()
-        print("=" * 60)
         future.cancel()
         return None
-
-# ── yfinance 호출 전용 안전 실행 헬퍼 (고정 풀 대신 1회용 daemon 스레드) ──────────
-# 문제: yfinance는 내부적으로 curl_cffi를 쓴다. curl_cffi는 파이썬 socket 모듈을
-# 쓰지 않고 자체 C 라이브러리(libcurl)로 통신하기 때문에, 파일 맨 위의
-# socket.setdefaulttimeout(20)이 이 호출에는 전혀 적용되지 않는다. yf.Ticker(...).
-# history(timeout=8)처럼 timeout을 넘겨도 라이브러리/원격 서버 상태에 따라 실제로는
-# 지켜지지 않고 그 호출이 문자 그대로 영원히 안 끝날 수 있다.
-# ⚠️ 이런 "진짜로 영원히 안 끝날 수 있는" 호출을 고정 크기 스레드풀의 워커로
-# 실행하면, 하나가 멈출 때마다 그 풀의 워커 자리가 영구히 하나씩 줄어드는 셈이라
-# (future.cancel()은 실행 중인 스레드를 못 죽인다) 결국 풀 전체가 고갈된다.
-# 해결: 풀을 재사용하지 않고 호출마다 daemon 스레드를 새로 하나씩 띄운다. 하나가
-# 영원히 멈춰도 그냥 좀비 스레드 하나가 버려질 뿐(daemon=True라 프로세스 종료도
-# 안 막음), 다른 호출이 쓸 "고정된 워커 자리"를 뺏지 않는다 — 즉 한쪽이 아무리
-# 많이 멈춰도 다른 호출들의 가용 동시성은 줄어들지 않는다.
-def call_with_timeout_yf(fn, timeout=10):
-    result_box = {}
-    def _runner():
-        try:
-            result_box["value"] = fn()
-        except Exception:
-            result_box["value"] = None
-    t = threading.Thread(target=_runner, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
-    if t.is_alive():
-        return None  # 시간 안에 못 끝남 → 결과 포기하고 진행 (스레드는 백그라운드에 버려짐)
-    return result_box.get("value")
-
-# 하위 호환용 별칭: 과거 이름으로 호출하던 코드가 남아있을 경우를 대비.
-# (신규 코드는 용도에 맞게 call_with_timeout_gsheet / call_with_timeout_yf를 직접 쓸 것)
-call_with_timeout = call_with_timeout_yf
 # ────────────────────────────────────────────────────────────────────────
 # ────────────────────────────────────────────────────────────────────────
 
@@ -343,16 +310,8 @@ def fetch_market_index_table():
     def get_yfinance(key, meta):
         try:
             import yfinance as yf
-            # ⚠️ 반드시 call_with_timeout_yf로 감싼다! 이 함수는 run_parallel_safe를 통해
-            # get_shared_executor(앱 전체 공유 32워커풀)의 워커 스레드 안에서 실행된다.
-            # yf.Ticker(...)를 직접 호출하면(curl_cffi가 socket 기본 timeout을 안 따르므로)
-            # 응답이 안 올 때 이 공유 워커 자리가 영구히 사라져서, 결국 앱 전체(대시보드뿐
-            # 아니라 관심종목/스크리너 등 이 풀을 쓰는 모든 화면)가 멈추는 원인이 된다.
-            df = call_with_timeout_yf(
-                lambda: yf.Ticker(meta["symbol"]).history(period="2d", interval="1m", timeout=8),
-                timeout=10,
-            )
-            if df is None or df.empty:
+            df = yf.Ticker(meta["symbol"]).history(period="2d", interval="1m", timeout=8)
+            if df.empty:
                 raise ValueError("empty")
             price = float(df["Close"].dropna().iloc[-1])
             today = df.index[-1].date()
@@ -401,13 +360,8 @@ def fetch_sparkline_data():
     def get_history(key, symbol):
         try:
             import yfinance as yf
-            # ⚠️ get_yfinance와 동일한 이유로 call_with_timeout_yf 필수 (get_shared_executor
-            # 워커 안에서 실행되므로, 무보호 호출이 멈추면 공유 워커가 영구히 사라짐)
-            df = call_with_timeout_yf(
-                lambda: yf.Ticker(symbol).history(period="180d", interval="1d", timeout=8),
-                timeout=10,
-            )
-            if df is None or df.empty or "Close" not in df.columns:
+            df = yf.Ticker(symbol).history(period="180d", interval="1d", timeout=8)
+            if df.empty or "Close" not in df.columns:
                 return key, []
             closes = df["Close"].dropna().tolist()
             return key, closes
@@ -2118,7 +2072,7 @@ def estimate_target_hit_probability(stock_code, market_hint, target_price, horiz
         suffix_order = [".KQ", ".KS"] if market_hint == "코스닥" else [".KS", ".KQ"]
         hist = pd.DataFrame()
         for suf in suffix_order:
-            hist = call_with_timeout_yf(
+            hist = call_with_timeout(
                 lambda s=suf: yf.Ticker(f"{stock_code}{s}").history(period="1y", interval="1d", timeout=8),
                 timeout=10,
             )
@@ -2636,7 +2590,7 @@ def load_users():
         ws = _get_worksheet("users")
         return ws.get_all_records(numericise_ignore=['all'])
 
-    records = call_with_timeout_gsheet(_fetch, timeout=10)
+    records = call_with_timeout(_fetch, timeout=10)
     if records is None:
         return pd.DataFrame(columns=_USER_COLUMNS)
     try:
@@ -2672,7 +2626,7 @@ def save_user(username, password, email):
         ws.append_row(new_row, value_input_option="RAW")
         return True
 
-    ok = call_with_timeout_gsheet(_write, timeout=10)
+    ok = call_with_timeout(_write, timeout=10)
     if ok:
         load_users.clear()  # 캐시 무효화
         return True
@@ -2748,7 +2702,7 @@ def update_user_password(username, new_password):
         ws.update_cell(row_idx, _USER_COLUMNS.index("salt") + 1, salt)
         return True
 
-    result = call_with_timeout_gsheet(_do, timeout=12)
+    result = call_with_timeout(_do, timeout=12)
     if result is True:
         load_users.clear()
         return True
@@ -2770,7 +2724,7 @@ def _load_all_watchlist():
         ws = _get_worksheet("watchlist")
         return ws.get_all_records(numericise_ignore=['all'])
 
-    records = call_with_timeout_gsheet(_fetch, timeout=10)
+    records = call_with_timeout(_fetch, timeout=10)
     if records is None:
         return pd.DataFrame(columns=_WATCHLIST_COLUMNS)
     try:
@@ -2809,7 +2763,7 @@ def add_to_watchlist(username, code, name):
         ws.append_row(new_row, value_input_option="RAW")
         return True
 
-    ok = call_with_timeout_gsheet(_write, timeout=10)
+    ok = call_with_timeout(_write, timeout=10)
     if ok:
         _load_all_watchlist.clear()
         return True
@@ -2837,7 +2791,7 @@ def remove_from_watchlist(username, code):
             ws.delete_rows(row_idx)
         return True
 
-    result = call_with_timeout_gsheet(_do, timeout=12)
+    result = call_with_timeout(_do, timeout=12)
     if result is True:
         _load_all_watchlist.clear()
     elif result == "not_found":
@@ -2857,7 +2811,7 @@ def update_watchlist_holding(username, code, buy_price, qty):
             ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("수량") + 1, str(qty) if qty else "")
         return True
 
-    ok = call_with_timeout_gsheet(_do, timeout=12)
+    ok = call_with_timeout(_do, timeout=12)
     if ok:
         _load_all_watchlist.clear()
     else:
@@ -2876,7 +2830,7 @@ def update_watchlist_entries(username, code, entry1, entry2, entry3):
             ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("3차진입가") + 1, str(entry3) if entry3 else "")
         return True
 
-    ok = call_with_timeout_gsheet(_do, timeout=12)
+    ok = call_with_timeout(_do, timeout=12)
     if not ok:
         st.error("일시적인 통신 오류로 진입가 저장에 실패했습니다. 잠시 후 다시 시도해주세요.")
     else:
@@ -2900,7 +2854,7 @@ def toggle_watchlist_pin(username, code):
             ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("고정") + 1, "" if is_pinned else "Y")
         return True
 
-    result = call_with_timeout_gsheet(_do, timeout=12)
+    result = call_with_timeout(_do, timeout=12)
     if result is True:
         _load_all_watchlist.clear()
     elif result == "not_found":
@@ -2919,15 +2873,8 @@ def fetch_watchlist_sparkline_prices(stock_code, market=None, days=30):
 
         def _fetch(suffix):
             try:
-                # ⚠️ 이 함수는 관심종목 프리페치(_wl_prefetch_one) 안에서 호출되며,
-                # 이는 이미 get_shared_executor(공유 32워커풀)의 워커 스레드 위에서 실행 중이다.
-                # yf.Ticker(...)를 직접 부르면(무보호) 응답이 안 올 때 그 공유 워커를
-                # 영구히 잃게 되어 앱 전체가 멈추는 원인이 되므로 반드시 call_with_timeout_yf로 감싼다.
-                df = call_with_timeout_yf(
-                    lambda: yf.Ticker(f"{stock_code}{suffix}").history(period="60d", interval="1d", timeout=8),
-                    timeout=10,
-                )
-                return df["Close"].dropna().tolist() if df is not None and not df.empty else []
+                df = yf.Ticker(f"{stock_code}{suffix}").history(period="60d", interval="1d", timeout=8)
+                return df["Close"].dropna().tolist() if not df.empty else []
             except Exception:
                 return []
 
@@ -3058,8 +3005,6 @@ def render_watchlist_portfolio_summary(df):
 
 
 def render_watchlist():
-    _wldbg = lambda msg: print(f"[DEBUG {datetime.datetime.now().strftime('%H:%M:%S')}] [관심종목] {msg}", file=sys.stderr, flush=True)
-    _wldbg("render_watchlist 시작")
     st.header(
         "관심종목",
         help="""💡 **[관심종목 안내]**\n\n관심 있는 종목을 저장해두고 한눈에 모아볼 수 있는 마이페이지입니다.\n\n종목코드 또는 종목명으로 검색해 추가하면, 계정에 저장되어 다음에 로그인해도 그대로 유지됩니다.\n\n'종목 스크리너'를 한 번 불러온 상태라면 현재가·PER·PBR·배당수익률도 함께 표시됩니다.\n\n각 카드 우측의 ⭐를 누르면 해당 종목이 목록 맨 위에 고정됩니다. 📊는 재무분석 바로가기, 🗑️는 삭제입니다.\n\n각 종목 카드의 '보유 정보 · 매수 타점 입력'에서 1차/2차/3차 진입가를 입력해두면, 현재가가 그 가격 이하로 내려왔을 때 카드와 목록 상단에 자동으로 알림이 표시됩니다."""
@@ -3166,16 +3111,12 @@ def render_watchlist():
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    _wldbg("load_watchlist 호출 전")
     watchlist_df = load_watchlist(username)
-    _wldbg(f"load_watchlist 완료 ({len(watchlist_df)}건)")
     if watchlist_df.empty:
         st.info("아직 저장된 관심종목이 없습니다. 위 검색창에서 종목을 추가해보세요.")
         return
 
-    _wldbg("portfolio_summary 렌더링 전")
     render_watchlist_portfolio_summary(watchlist_df)
-    _wldbg("portfolio_summary 렌더링 완료")
 
     # 고정(즐겨찾기)한 종목이 먼저 오도록 정렬 (안정 정렬이라 같은 그룹 내 원래 순서는 유지)
     watchlist_df = watchlist_df.assign(_pinned=(watchlist_df["고정"] == "Y")).sort_values(
@@ -3184,9 +3125,7 @@ def render_watchlist():
 
     # 종목 스크리너를 한 번이라도 불러온 상태면 현재가·PER·PBR·배당수익률을 함께 보여줌
     # (아래 병렬 조회에서 시장 구분에도 필요해서 여기로 끌어올림)
-    _wldbg("load_screener_df 호출 전")
     screener_df = load_screener_df()
-    _wldbg(f"load_screener_df 완료 ({len(screener_df) if screener_df is not None else 0}건)")
     has_live_data = screener_df is not None and not screener_df.empty and '종목코드' in screener_df.columns
     if has_live_data:
         screener_df = screener_df.copy()
@@ -3220,7 +3159,6 @@ def render_watchlist():
     # 스크리너 PER/PBR만으로) 먼저 다 구해둔다. 그래야 아래 프리페치에서 종목당 작업을
     # 딱 하나로 합칠 수 있다(시세+스파크라인+AI점수+도달확률을 한 스레드에서 순서대로).
     _hp_targets = {}  # code -> (market_hint, target_price, target_src)
-    _wldbg(f"_hp_targets 계산 시작 ({len(watchlist_df)}종목)")
     for _, _hp_row in watchlist_df.iterrows():
         _hp_code = _hp_row['종목코드']
         if _hp_code in _hp_targets:
@@ -4002,11 +3940,10 @@ def render_login_page():
                         for e in errors:
                             st.error(e)
                     else:
-                        if save_user(su_id_clean, su_pw, su_email_clean):
-                            st.session_state["_force_login_tab"] = True
-                            st.session_state["signup_success_msg"] = f"회원가입이 완료되었습니다! 아이디 '{su_id_clean}'로 로그인해주세요."
-                            st.rerun()
-                        # 실패 시에는 save_user 내부의 st.error() 메시지가 그대로 화면에 남습니다.
+                        save_user(su_id_clean, su_pw, su_email_clean)
+                        st.session_state["_force_login_tab"] = True
+                        st.session_state["signup_success_msg"] = f"회원가입이 완료되었습니다! 아이디 '{su_id_clean}'로 로그인해주세요."
+                        st.rerun()
 
 def render_change_password():
     st.header(
@@ -4135,13 +4072,7 @@ def main():
         render_login_page()
         return
 
-    # ⚡ 성능 최적화: 아래 대형 CSS 블록은 내용이 고정되어 있는데도
-    # main()이 rerun될 때마다(=탭을 넘길 때마다) 매번 다시 주입되고 있었다.
-    # Streamlit은 이걸 매번 "새 요소"로 취급해 화면에서 지웠다가 다시 그리기
-    # 때문에, 탭 전환 시 브라우저가 전체 스타일을 재계산하며 버벅이는
-    # 원인이 되었다. session_state 플래그로 세션당 1회만 주입하도록 변경.
-    if not st.session_state.get("_main_css_injected"):
-        st.markdown("""
+    st.markdown("""
         <style>
             .stApp { background-color: #F8FAFC !important; }
             section[data-testid="stMain"] > div.block-container { 
@@ -4296,8 +4227,7 @@ def main():
                 background-color: #F8FAFC !important; border-color: #CBD5E1 !important;
             }
         </style>
-        """, unsafe_allow_html=True)
-        st.session_state["_main_css_injected"] = True
+    """, unsafe_allow_html=True)
 
     col_sp, col_user = st.columns([7.5, 2.5])
     with col_user:
@@ -4626,7 +4556,8 @@ def render_dashboard():
         </div>
         """
         with col:
-            st.markdown(html, unsafe_allow_html=True)
+            import streamlit.components.v1 as components
+            components.html(html, height=230 if show_volume else 210, scrolling=False)
 
     c1, c2, c3 = st.columns(3)
     for col, key in [(c1, "kospi"), (c2, "kosdaq"), (c3, "nasdaq")]:
@@ -6052,72 +5983,17 @@ def render_fnguide():
     if active_code:
         code = active_code
         cache_key = f'fnguide_result_{code}'
-
-        # ── [탭 멈춤 대응] 기업 재무 분석 데이터 로딩을 대시보드와 동일한
-        # 비동기(render_async_multi) 병렬 패턴으로 전환.
-        #
-        # 문제: 기존에는 fetch_company_info_fnguide → fetch_fnguide_data →
-        # get_ai_diagnosis_inputs를 st.spinner 블록 안에서 메인 스크립트
-        # 실행 스레드가 그대로 순차(블로킹) 호출했다. 각 함수 내부에는
-        # 네이버금융/와이즈리포트/FnGuide 모바일에 대한 requests.get이
-        # timeout=6~8초로 여러 번 순서대로 걸려 있어서, 응답이 느린
-        # 클라우드 환경(데이터센터 IP는 이런 국내 사이트들이 응답을
-        # 의도적으로 늦추거나 사실상 막는 경우가 흔함)에서는 이 구간
-        # 하나만으로도 수십 초간 메인 스레드가 블로킹됐다. 이 동안은
-        # Streamlit이 새 인터랙션(예: 다른 탭 클릭)을 받아줄 타이밍 자체가
-        # 없어서 "탭 이동 시 멈춤" 현상으로 그대로 이어졌다.
-        #
-        # 해결: 네트워크 I/O가 실제로 발생하는 두 함수(fetch_company_info_
-        # fnguide, fetch_fnguide_data)만 공유 스레드풀(get_shared_executor)에
-        # 병렬로 던지고, 메인 스크립트는 대시보드와 똑같이 render_async_multi
-        # (st.fragment(run_every=0.4)로 완료 여부만 짧게 폴링)로 기다린다.
-        # get_ai_diagnosis_inputs는 순수 로컬 계산(네트워크 호출 없음)이라
-        # 결과가 준비된 뒤 메인 스레드에서 그대로 호출해도 문제 없다.
-        need_fetch = search_btn or cache_key not in st.session_state
-
-        if need_fetch:
-            _fnguide_info_default = {
-                "name": "알 수 없음", "summary": "제공된 기업개요가 없습니다.",
-                "opinion": "📭 분석의견 없음", "target": "데이터 없음",
-                "opinion_score": "", "analyst_count": "", "consensus_note": "",
-            }
-
-            def _submit_fnguide_jobs():
-                ex = get_shared_executor()
-                return {
-                    "info": ex.submit(fetch_company_info_fnguide, code),
-                    "annual": ex.submit(fetch_fnguide_data, code),
+        
+        if search_btn or cache_key not in st.session_state:
+            with st.spinner("에프앤가이드(FnGuide) 서버에서 데이터를 분석 중입니다..."):
+                _info = fetch_company_info_fnguide(code)
+                _df_annual, _, _ = fetch_fnguide_data(code)
+                _per_ai, _pbr_ai, _roe_ai, _debt_ai, _drop_pct_ai, _div_ai = get_ai_diagnosis_inputs(code, _df_annual)
+                st.session_state[cache_key] = {
+                    'info': _info,
+                    'per_ai': _per_ai, 'pbr_ai': _pbr_ai, 'roe_ai': _roe_ai,
+                    'debt_ai': _debt_ai, 'drop_pct_ai': _drop_pct_ai, 'div_ai': _div_ai,
                 }
-
-            def _collect_fnguide_results(futures):
-                info = futures["info"].result() if futures["info"].done() else _fnguide_info_default
-                if futures["annual"].done():
-                    df_annual, _, _ = futures["annual"].result()
-                else:
-                    df_annual = pd.DataFrame()
-                return {"info": info, "df_annual": df_annual}
-
-            _fnguide_default_result = {"info": _fnguide_info_default, "df_annual": pd.DataFrame()}
-
-            _fnguide_result, _fnguide_ready = render_async_multi(
-                job_key=f"fnguide_main_{code}",
-                submit_fn=_submit_fnguide_jobs,
-                collect_fn=_collect_fnguide_results,
-                default_result=_fnguide_default_result,
-                spinner_text="에프앤가이드(FnGuide) 서버에서 데이터를 분석 중입니다...",
-                overall_timeout=20,
-            )
-            if not _fnguide_ready:
-                return  # 아직 로딩 중 — 이후 렌더링은 건너뛰고, 폴링 프래그먼트가 알아서 이어간다
-
-            _info = _fnguide_result["info"]
-            _df_annual = _fnguide_result["df_annual"]
-            _per_ai, _pbr_ai, _roe_ai, _debt_ai, _drop_pct_ai, _div_ai = get_ai_diagnosis_inputs(code, _df_annual)
-            st.session_state[cache_key] = {
-                'info': _info,
-                'per_ai': _per_ai, 'pbr_ai': _pbr_ai, 'roe_ai': _roe_ai,
-                'debt_ai': _debt_ai, 'drop_pct_ai': _drop_pct_ai, 'div_ai': _div_ai,
-            }
 
         cached = st.session_state[cache_key]
         info        = cached['info']
@@ -6277,12 +6153,12 @@ def render_fnguide():
             def _fetch_ma(stock_code):
                 try:
                     import yfinance as yf
-                    df_ma = call_with_timeout_yf(
+                    df_ma = call_with_timeout(
                         lambda: yf.Ticker(f"{stock_code}.KS").history(period="90d", interval="1d", timeout=8),
                         timeout=10,
                     )
                     if df_ma is None or df_ma.empty:
-                        df_ma = call_with_timeout_yf(
+                        df_ma = call_with_timeout(
                             lambda: yf.Ticker(f"{stock_code}.KQ").history(period="90d", interval="1d", timeout=8),
                             timeout=10,
                         )
