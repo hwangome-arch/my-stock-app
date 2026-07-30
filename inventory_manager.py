@@ -4357,7 +4357,9 @@ def main():
                         st.session_state.current_page = label
                         st.rerun()
 
-        _show_debug_memory()
+        # 🔧 [디버깅 모드] 데이터 조회가 전혀 없는 탭끼리 왔다갔다 해도 멈추는 현상이
+        # 확인되어, 모든 페이지에서 공통으로 도는 코드부터 하나씩 제거하며 테스트 중.
+        # _show_debug_memory()
 
     selected = st.session_state.current_page
 
