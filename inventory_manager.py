@@ -338,8 +338,16 @@ def fetch_market_index_table():
     def get_yfinance(key, meta):
         try:
             import yfinance as yf
-            df = yf.Ticker(meta["symbol"]).history(period="2d", interval="1m", timeout=8)
-            if df.empty:
+            # ⚠️ 반드시 call_with_timeout_yf로 감싼다! 이 함수는 run_parallel_safe를 통해
+            # get_shared_executor(앱 전체 공유 32워커풀)의 워커 스레드 안에서 실행된다.
+            # yf.Ticker(...)를 직접 호출하면(curl_cffi가 socket 기본 timeout을 안 따르므로)
+            # 응답이 안 올 때 이 공유 워커 자리가 영구히 사라져서, 결국 앱 전체(대시보드뿐
+            # 아니라 관심종목/스크리너 등 이 풀을 쓰는 모든 화면)가 멈추는 원인이 된다.
+            df = call_with_timeout_yf(
+                lambda: yf.Ticker(meta["symbol"]).history(period="2d", interval="1m", timeout=8),
+                timeout=10,
+            )
+            if df is None or df.empty:
                 raise ValueError("empty")
             price = float(df["Close"].dropna().iloc[-1])
             today = df.index[-1].date()
@@ -388,8 +396,13 @@ def fetch_sparkline_data():
     def get_history(key, symbol):
         try:
             import yfinance as yf
-            df = yf.Ticker(symbol).history(period="180d", interval="1d", timeout=8)
-            if df.empty or "Close" not in df.columns:
+            # ⚠️ get_yfinance와 동일한 이유로 call_with_timeout_yf 필수 (get_shared_executor
+            # 워커 안에서 실행되므로, 무보호 호출이 멈추면 공유 워커가 영구히 사라짐)
+            df = call_with_timeout_yf(
+                lambda: yf.Ticker(symbol).history(period="180d", interval="1d", timeout=8),
+                timeout=10,
+            )
+            if df is None or df.empty or "Close" not in df.columns:
                 return key, []
             closes = df["Close"].dropna().tolist()
             return key, closes
@@ -2901,8 +2914,15 @@ def fetch_watchlist_sparkline_prices(stock_code, market=None, days=30):
 
         def _fetch(suffix):
             try:
-                df = yf.Ticker(f"{stock_code}{suffix}").history(period="60d", interval="1d", timeout=8)
-                return df["Close"].dropna().tolist() if not df.empty else []
+                # ⚠️ 이 함수는 관심종목 프리페치(_wl_prefetch_one) 안에서 호출되며,
+                # 이는 이미 get_shared_executor(공유 32워커풀)의 워커 스레드 위에서 실행 중이다.
+                # yf.Ticker(...)를 직접 부르면(무보호) 응답이 안 올 때 그 공유 워커를
+                # 영구히 잃게 되어 앱 전체가 멈추는 원인이 되므로 반드시 call_with_timeout_yf로 감싼다.
+                df = call_with_timeout_yf(
+                    lambda: yf.Ticker(f"{stock_code}{suffix}").history(period="60d", interval="1d", timeout=8),
+                    timeout=10,
+                )
+                return df["Close"].dropna().tolist() if df is not None and not df.empty else []
             except Exception:
                 return []
 
