@@ -4298,9 +4298,6 @@ def main():
                     del st.query_params["session_token"]
                 st.rerun()
 
-    # 🔧 [디버깅 모드] 탭 이동 시 멈춤 현상의 원인을 좁혀보기 위해
-    # 관심종목 탭만 제거하고 나머지는 그대로 둠(대시보드 포함).
-    # 원상복구하려면 아래 주석을 해제하면 됨.
     SIDEBAR_GROUPS = [
         ("OVERVIEW", [
             ("대시보드 홈", ":material/space_dashboard:"),
@@ -4314,7 +4311,7 @@ def main():
             ("실시간 배당 순위", ":material/payments:"),
         ]),
         ("MY PAGE", [
-            # ("관심종목", ":material/bookmark:"),
+            ("관심종목", ":material/bookmark:"),
             ("비밀번호 변경", ":material/lock:"),
         ]),
     ]
@@ -4404,9 +4401,18 @@ def main():
                     type="primary" if is_selected else "secondary",
                     use_container_width=True,
                 ):
+                    # 🔧 [탭 이동 멈춤 대응] 예전에는 여기서 st.session_state를 바꾼 뒤
+                    # st.rerun()을 명시적으로 한 번 더 호출했다. 하지만 st.button()이
+                    # 클릭되는 순간 Streamlit은 이미 자동으로 스크립트를 처음부터
+                    # 다시 실행한다 — 그 위에 st.rerun()을 또 부르면 클릭 한 번에
+                    # rerun이 두 번(버튼 자체 rerun + 명시적 rerun) 연쇄로 발생한다.
+                    # 빠르게 연타하면 이 이중 rerun이 겹겹이 쌓이는데, 이건 Streamlit이
+                    # 공식적으로 인정한 버그(GitHub #9921: "Calling st.rerun in quick
+                    # succession causes crash/hang")와 같은 계열의 패턴이다.
+                    # session_state만 갱신하면 버튼의 자체 rerun이 알아서 새 값을
+                    # 반영해 다시 그려주므로 명시적 rerun은 불필요하다.
                     if st.session_state.current_page != label:
                         st.session_state.current_page = label
-                        st.rerun()
 
         _show_debug_memory()
 
@@ -4422,7 +4428,7 @@ def main():
     elif selected == "종목 스크리너":    render_screener()
     elif selected == "기업 재무 분석":   render_fnguide()
     elif selected == "실시간 배당 순위": render_dividend()
-    # elif selected == "관심종목":         render_watchlist()
+    elif selected == "관심종목":         render_watchlist()
     elif selected == "비밀번호 변경":     render_change_password()
 
     print(f"[DEBUG {datetime.datetime.now().strftime('%H:%M:%S')}] 페이지 렌더링 완료: {selected}", file=sys.stderr, flush=True)
@@ -6410,7 +6416,6 @@ def render_dividend():
         st.info("💡 아직 배당 데이터를 조회하지 않았습니다. 아래 버튼을 눌러 조회해주세요. (약 5~15초 소요)")
         if st.button("🔍 배당 데이터 조회", key="dividend_manual_scan_btn", type="primary"):
             st.session_state["dividend_scanned"] = True
-            st.rerun()
         return
 
     df = run_with_progress("마켓 데이터 수집 중...", fetch_dividend_ranking)
