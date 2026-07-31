@@ -95,8 +95,53 @@ def normalize_kr_code(code):
 # 스레드 수가 이 상한을 절대 넘지 않는다(넘치는 작업은 새 스레드를 만드는 대신 큐에서
 # 대기했다가 순서대로 실행된다).
 @st.cache_resource(show_spinner=False)
-def get_shared_executor():
+def _get_shared_executor_raw():
     return concurrent.futures.ThreadPoolExecutor(max_workers=32)
+
+# ── [자가치유] 스레드풀이 "좀비 스레드"로 완전히 막힌 채 오래 지속되면 자동 교체 ──
+# 문제: future.result(timeout=X)는 메인 스크립트가 기다리는 시간만 제한할 뿐,
+# 실제로 멈춘 워커 스레드 자체를 강제로 죽이지는 못한다(파이썬은 실행 중인 스레드를
+# 강제 종료할 방법이 없다). curl_cffi/requests 소켓이 완전히 멎어버리는 극단적인
+# 경우, 그 스레드는 풀 안에 죽은 채로 영원히 자리만 차지하게 된다. 이게 쌓여 풀의
+# max_workers를 전부 채우면, 그 순간부터 이 풀에 던져지는 모든 새 작업은 (다른
+# 세션이 새로고침을 해도) 영원히 대기하게 된다 — 이게 "리붓 아니면 답이 없는" 멈춤의
+# 진짜 정체다. 해결: 풀의 모든 워커가 꽉 차 있고(active >= max_workers) 큐에도
+# 대기 작업이 쌓여있는(queued > 0) 상태가 STUCK_THRESHOLD초 이상 지속되면, 그 풀을
+# 통째로 새 걸로 교체한다. 죽은 스레드들은 백그라운드에 버려두고 새 작업은 새 풀로
+# 보내지므로, 수동 리붓 없이도 자동으로 회복된다.
+@st.cache_resource(show_spinner=False)
+def _get_pool_stuck_tracker():
+    return {}
+
+def _get_or_heal_executor(raw_getter, name, max_workers, stuck_threshold=25):
+    ex = raw_getter()
+    try:
+        active = len(ex._threads)
+        queued = ex._work_queue.qsize()
+    except Exception:
+        return ex
+
+    tracker = _get_pool_stuck_tracker()
+    now = time.time()
+
+    if active >= max_workers and queued > 0:
+        since = tracker.get(name)
+        if since is None:
+            tracker[name] = now
+        elif now - since >= stuck_threshold:
+            print(f"[POOL HEAL {datetime.datetime.now().strftime('%H:%M:%S')}] "
+                  f"'{name}' 풀이 {stuck_threshold}초 이상 완전히 막혀있어 새 풀로 교체함 "
+                  f"(active={active}, queued={queued})", file=sys.stderr, flush=True)
+            raw_getter.clear()
+            tracker.pop(name, None)
+            ex = raw_getter()
+    else:
+        tracker.pop(name, None)
+
+    return ex
+
+def get_shared_executor():
+    return _get_or_heal_executor(_get_shared_executor_raw, "공유", 32)
 
 # ── 메인 스레드 직접 호출 보호용 헬퍼 ──────────────────────────────────────
 # 문제: yfinance(내부적으로 curl_cffi 사용)에 timeout=8을 넘겨도, 클라우드 환경에서
@@ -116,8 +161,11 @@ def get_shared_executor():
 # 안 남는 자기 자신을 기다리는 교착상태(deadlock)가 생길 수 있다. 그래서 이 안전장치
 # 전용으로 완전히 분리된 별도의 작은 풀을 쓴다.
 @st.cache_resource(show_spinner=False)
-def get_yf_safety_executor():
+def _get_yf_safety_executor_raw():
     return concurrent.futures.ThreadPoolExecutor(max_workers=16)
+
+def get_yf_safety_executor():
+    return _get_or_heal_executor(_get_yf_safety_executor_raw, "yf안전", 16)
 
 def call_with_timeout(fn, timeout=10):
     future = get_yf_safety_executor().submit(fn)
@@ -140,8 +188,11 @@ def call_with_timeout(fn, timeout=10):
 # 있다. 그래서 이렇게 "안에서 공유 풀을 쓰는 함수를 여러 개 동시에 돌리는" 바깥쪽
 # 오케스트레이션은 완전히 별도의 풀을 쓴다.
 @st.cache_resource(show_spinner=False)
-def get_orchestration_executor():
+def _get_orchestration_executor_raw():
     return concurrent.futures.ThreadPoolExecutor(max_workers=8)
+
+def get_orchestration_executor():
+    return _get_or_heal_executor(_get_orchestration_executor_raw, "오케스트레이션", 8)
 
 # ── 병렬 조회용 안전 실행 헬퍼 ──────────────────────────────────────────────
 # 문제: concurrent.futures.as_completed(futures)를 타임아웃 없이 쓰면, 스레드
@@ -4357,9 +4408,7 @@ def main():
                         st.session_state.current_page = label
                         st.rerun()
 
-        # 🔧 [디버깅 모드] 데이터 조회가 전혀 없는 탭끼리 왔다갔다 해도 멈추는 현상이
-        # 확인되어, 모든 페이지에서 공통으로 도는 코드부터 하나씩 제거하며 테스트 중.
-        # _show_debug_memory()
+        _show_debug_memory()
 
     selected = st.session_state.current_page
 
