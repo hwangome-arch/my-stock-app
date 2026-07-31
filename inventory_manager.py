@@ -1345,14 +1345,13 @@ def fetch_fnguide_data(code):
     }
 
     try:
-        # 🔧 [FnGuide 신버전 대응] 기존 모바일 페이지(m.comp.fnguide.com/m2/company_02.asp)가
-        # FnGuide 측에서 폐지되어 "페이지가 없습니다"를 반환하게 됨(2026-07-31 확인).
-        # PC용 재무제표 페이지(SVD_Finance.asp)로 교체. 표 탐색 로직은 고정 인덱스가
-        # 아니라 항목명(매출액/영업이익/ROE 등) 기반이라 URL만 바꿔도 재사용 가능.
-        url = (
-            f"https://comp.fnguide.com/SVO2/ASP/SVD_Finance.asp?"
-            f"pGB=1&gicode=A{code}&cID=&MenuYn=Y&ReportGB=&NewMenuID=103&stkGb=701"
-        )
+        # 🔧 [FnGuide 신버전 대응 v2] SVD_Finance.asp(구 PC 버전)도 이미 폐지되어
+        # 있었음("페이지가 없습니다"). 실제 신버전은 wcomp.fnguide.com 이고, 파라미터
+        # 형식도 gicode=A{code} → cmp_cd={code}(A 접두어 없음)로 바뀌었다(2026-07-31 확인).
+        # ⚠️ 이 URL이 SPA(자바스크립트 렌더링) 구조라면 requests.get()으로는 빈 뼈대만
+        # 받아올 수 있다 — 이 경우 아래 code_in_html 체크가 다시 실패할 것이므로,
+        # 디버그 정보로 확인 후 필요하면 실제 데이터 API 엔드포인트를 찾아야 한다.
+        url = f"https://wcomp.fnguide.com/CompanyInfo/Finance?cmp_cd={code}"
         res = requests.get(url, headers=_FN_DESKTOP_HEADERS, timeout=10)
         debug["status"] = res.status_code
         res.encoding = res.apparent_encoding or 'utf-8'
