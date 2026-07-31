@@ -1572,6 +1572,188 @@ def fetch_fnguide_data(code):
 
 
 # =========================
+# 🟢 네이버 금융(WiseReport) 기반 재무 데이터 - FnGuide 폴백 소스
+#
+# 배경: FnGuide(wcomp.fnguide.com)가 SPA 렌더링 구조로 바뀌거나 페이지 구조가
+# 바뀌면 fetch_fnguide_data()가 빈 결과를 반환한다. 네이버 금융이 종목 상세
+# 페이지의 "기업실적분석" 표를 그릴 때 실제로 쓰는 소스는 FnGuide가 아니라
+# NICE평가정보(WiseReport, navercomp.wisereport.co.kr)이며, 이쪽은 완전히
+# 다른 시스템이라 FnGuide 장애와 무관하게 독립적으로 살아있을 가능성이 높다.
+#
+# 동작 방식: 이 엔드포인트는 페이지 로딩마다 새로 발급되는 encparam/id 토큰이
+# 필요한 인증형 AJAX API다. 1) 먼저 c1010001.aspx 페이지를 GET해서 HTML 안에
+# 박혀있는 토큰을 정규식으로 추출하고, 2) 그 토큰을 붙여 cF1001.aspx를 호출하면
+# 연간 4개 기간 + 분기 4개 기간 데이터가 담긴 HTML 표 조각을 돌려준다.
+#
+# ⚠️ 응답 안에는 표가 2개 들어있는데, 첫 번째 표는 전부 동일한 가짜 숫자(예:
+# "4,485")로 채워진 스크래핑 방지용 더미 표다. 반드시 항목명(매출액 등)이
+# 실제로 들어있는 표를 찾아서 써야 한다 (실제 응답으로 확인 완료, 2026-07-31).
+# =========================
+
+_NAVER_WISE_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'X-Requested-With': 'XMLHttpRequest',
+    'Accept-Language': 'ko-KR,ko;q=0.9',
+}
+
+_NAVER_WISE_CORE_ITEMS = ['매출액', '영업이익', '당기순이익', '영업이익률', '순이익률',
+                          'ROE', 'PER', 'PBR', '부채비율']
+
+
+def _naver_wise_lookup(df, row_label, col):
+    """df.loc[row_label, col]을 안전하게 숫자로 반환. 실패 시 NaN."""
+    try:
+        if row_label not in df.index or col not in df.columns:
+            return float('nan')
+        val = df.loc[row_label, col]
+        if isinstance(val, pd.Series):  # 중복 인덱스 방어
+            val = val.iloc[0]
+        return pd.to_numeric(str(val).replace(',', '').strip(), errors='coerce')
+    except Exception:
+        return float('nan')
+
+
+def _naver_wise_build_period_table(real_df, col_period_pairs, is_quarter):
+    """네이버 WiseReport 표에서 연간/분기 한쪽 기간 그룹만 골라
+    fetch_fnguide_data()와 동일한 컬럼 구조('연도/분기', 매출액, 성장률 등)로 조립.
+    → 이 구조를 맞춰야 render_company_analysis 등 기존 렌더링 코드를 그대로 재사용 가능."""
+    rows = []
+    for col, period in col_period_pairs:
+        rows.append({
+            '연도/분기': period,
+            '매출액': _naver_wise_lookup(real_df, '매출액', col),
+            '영업이익': _naver_wise_lookup(real_df, '영업이익', col),
+            '당기순이익': _naver_wise_lookup(real_df, '당기순이익', col),
+            '영업이익률': _naver_wise_lookup(real_df, '영업이익률', col),
+            '순이익률': _naver_wise_lookup(real_df, '순이익률', col),
+            'ROE': _naver_wise_lookup(real_df, 'ROE(%)', col),
+            'PER': _naver_wise_lookup(real_df, 'PER(배)', col),
+            'PBR': _naver_wise_lookup(real_df, 'PBR(배)', col),
+            '부채비율': _naver_wise_lookup(real_df, '부채비율', col),
+        })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    label = '성장률(QoQ)' if is_quarter else '성장률(YoY)'
+    for c in ['매출액', '영업이익']:
+        out[f'{c} {label}'] = out[c].pct_change() * 100
+
+    final_cols = ['연도/분기']
+    for item in _NAVER_WISE_CORE_ITEMS:
+        final_cols.append(item)
+        if f'{item} {label}' in out.columns:
+            final_cols.append(f'{item} {label}')
+    return out[final_cols]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_naver_wisereport_data(code):
+    """네이버 금융(NICE평가정보 WiseReport)에서 연간/분기 재무 요약 데이터를 가져온다.
+    반환: (df_annual, df_quarter) - fetch_fnguide_data()와 동일한 컬럼 구조.
+    (배당 테이블은 이 엔드포인트에 없어서 빈 DataFrame 대신 호출부에서 FnGuide 값을 유지)
+    """
+    code = normalize_kr_code(code)
+    df_annual, df_quarter = pd.DataFrame(), pd.DataFrame()
+    debug = {"code": code, "step": None}
+
+    try:
+        page_url = f"https://navercomp.wisereport.co.kr/v2/company/c1010001.aspx?cmp_cd={code}"
+        headers = dict(_NAVER_WISE_HEADERS, Referer=page_url)
+
+        # 1단계: 페이지에서 encparam/id 토큰 추출
+        res0 = requests.get(page_url, headers=headers, timeout=10)
+        res0.encoding = 'utf-8'
+        debug["page_status"] = res0.status_code
+
+        m_enc = re.search(r"encparam\s*:\s*'([^']+)'", res0.text)
+        m_id = re.search(r"[^_a-zA-Z]id\s*:\s*'([^']+)'", res0.text)
+        if not m_enc or not m_id:
+            debug["step"] = "토큰(encparam/id) 추출 실패 - 페이지 구조가 바뀌었을 수 있음"
+            _DEBUG_STORE[f"_naver_wise_debug_{code}"] = debug
+            return df_annual, df_quarter
+        encparam, id_ = m_enc.group(1), m_id.group(1)
+
+        # 2단계: 실제 데이터 요청 (fin_typ=0, freq_typ=A 조합이 연간+분기를 함께 반환)
+        ajax_url = "https://navercomp.wisereport.co.kr/v2/company/ajax/cF1001.aspx"
+        params = {"cmp_cd": code, "fin_typ": 0, "freq_typ": "A",
+                  "encparam": encparam, "id": id_}
+        res = requests.get(ajax_url, headers=headers, params=params, timeout=10)
+        res.encoding = 'utf-8'
+        debug["ajax_status"] = res.status_code
+        debug["resp_len"] = len(res.text)
+
+        dfs = pd.read_html(io.StringIO(res.text), header=[0, 1])
+        debug["num_tables"] = len(dfs)
+
+        # 더미 표(전부 같은 값)를 걸러내고 실제 항목명이 있는 표만 채택
+        real_df = None
+        for d in dfs:
+            first_col_vals = [str(x) for x in d.iloc[:, 0]]
+            if any('매출액' in s for s in first_col_vals):
+                real_df = d
+                break
+        if real_df is None:
+            debug["step"] = "실제 데이터 표를 못 찾음 (더미 표만 있거나 구조 변경)"
+            _DEBUG_STORE[f"_naver_wise_debug_{code}"] = debug
+            return df_annual, df_quarter
+
+        item_col = real_df.columns[0]
+        real_df = real_df.set_index(item_col)
+        real_df.index = [str(x).strip() for x in real_df.index]
+
+        annual_cols, quarter_cols = [], []
+        for c in real_df.columns:
+            top, sub = str(c[0]), str(c[1])
+            m = re.match(r'^(\d{4}/\d{2}(?:\(E\))?)', sub.strip())
+            if not m:
+                continue
+            period = m.group(1)
+            if '분기' in top:
+                quarter_cols.append((c, period))
+            elif '연간' in top:
+                annual_cols.append((c, period))
+
+        debug["annual_periods_found"] = [p for _, p in annual_cols]
+        debug["quarter_periods_found"] = [p for _, p in quarter_cols]
+
+        df_annual = _naver_wise_build_period_table(real_df, annual_cols, is_quarter=False)
+        df_quarter = _naver_wise_build_period_table(real_df, quarter_cols, is_quarter=True)
+
+        if df_annual.empty and df_quarter.empty:
+            _DEBUG_STORE[f"_naver_wise_debug_{code}"] = debug
+
+    except Exception as e:
+        debug["exception"] = f"{type(e).__name__}: {e}"
+        _DEBUG_STORE[f"_naver_wise_debug_{code}"] = debug
+
+    return df_annual, df_quarter
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_financial_data(code):
+    """연간/분기/배당 재무 데이터 통합 진입점.
+    1순위: FnGuide(fetch_fnguide_data) - 배당 데이터까지 포함해 더 풍부함
+    2순위(폴백): 네이버 WiseReport(fetch_naver_wisereport_data) - FnGuide가 막히거나
+                 구조 변경으로 실패했을 때만 사용. 배당 데이터는 이 소스에 없음.
+    두 소스 다 실패하면 빈 DataFrame 3개를 그대로 반환(기존 호출부의
+    '데이터를 불러오지 못했습니다' 처리 로직이 그대로 동작).
+    """
+    df_annual, df_quarter, df_dividend = fetch_fnguide_data(code)
+
+    if df_annual.empty and df_quarter.empty:
+        naver_annual, naver_quarter = fetch_naver_wisereport_data(code)
+        if not naver_annual.empty or not naver_quarter.empty:
+            df_annual, df_quarter = naver_annual, naver_quarter
+            _DEBUG_STORE[f"_financial_source_{normalize_kr_code(code)}"] = "naver_wisereport_fallback"
+    else:
+        _DEBUG_STORE[f"_financial_source_{normalize_kr_code(code)}"] = "fnguide"
+
+    return df_annual, df_quarter, df_dividend
+
+
+# =========================
 # 📢 DART 전자공시 연동 모듈
 # =========================
 import zipfile
@@ -2428,7 +2610,7 @@ def _quarter_freshness_badge(df_quarter):
 
 def draw_fnguide_details(code):
     info = fetch_company_info_fnguide(code)
-    df_annual, df_quarter, df_dividend = fetch_fnguide_data(code)
+    df_annual, df_quarter, df_dividend = fetch_financial_data(code)
 
     if info['name'] != "알 수 없음" or not df_annual.empty:
         opinion_score_html = f'<span style="color: #94A3B8; font-size: 12px; margin-left: 8px;">({info["opinion_score"]})</span>' if info['opinion_score'] else ''
@@ -2697,11 +2879,15 @@ def draw_fnguide_details(code):
             with tab4:
                 render_disclosure_tab(code)
         else:
-            st.caption("ℹ️ 연간/분기 실적 데이터를 불러오지 못했습니다.")
+            st.caption("ℹ️ 연간/분기 실적 데이터를 불러오지 못했습니다. (FnGuide·네이버 두 소스 모두 실패)")
             _fdbg = _DEBUG_STORE.get(f"_fnguide_debug_{code}")
-            if _fdbg:
+            _ndbg = _DEBUG_STORE.get(f"_naver_wise_debug_{code}")
+            if _fdbg or _ndbg:
                 with st.expander("🔧 디버그 정보 (실적 데이터 실패 원인 확인용)"):
-                    st.json(_fdbg)
+                    st.write("① FnGuide 조회 결과:")
+                    st.json(_fdbg or {"info": "호출 안 됨"})
+                    st.write("② 네이버(WiseReport) 폴백 조회 결과:")
+                    st.json(_ndbg or {"info": "호출 안 됨 (FnGuide가 성공했거나 폴백 로직 미도달)"})
 
             st.markdown("""
                 <div style='background-color: #F9FAFB; padding: 15px; border-radius: 8px; margin-top: 15px; font-size: 13px; color: #6B7280;'>
@@ -5011,7 +5197,7 @@ def get_ai_total_score(code, screener_df=None):
     screener_df를 미리 전달하면(예: 관심종목 병렬조회) 백그라운드 스레드에서 다시
     load_screener_df()를 호출하지 않아도 되어 session_state 접근을 피할 수 있다."""
     try:
-        df_annual_ai, _, _ = fetch_fnguide_data(code)
+        df_annual_ai, _, _ = fetch_financial_data(code)
         per_ai, pbr_ai, roe_ai, debt_ai, drop_pct_ai, div_ai = get_ai_diagnosis_inputs(code, df_annual_ai, screener_df=screener_df)
         return calc_ai_scores(per_ai, pbr_ai, roe_ai, debt_ai, drop_pct_ai, div_ai)["total"]
     except Exception:
@@ -6173,7 +6359,7 @@ def render_fnguide():
         if search_btn or cache_key not in st.session_state:
             with st.spinner("에프앤가이드(FnGuide) 서버에서 데이터를 분석 중입니다..."):
                 _info = fetch_company_info_fnguide(code)
-                _df_annual, _, _ = fetch_fnguide_data(code)
+                _df_annual, _, _ = fetch_financial_data(code)
                 _per_ai, _pbr_ai, _roe_ai, _debt_ai, _drop_pct_ai, _div_ai = get_ai_diagnosis_inputs(code, _df_annual)
                 st.session_state[cache_key] = {
                     'info': _info,
