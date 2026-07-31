@@ -1373,8 +1373,30 @@ def fetch_fnguide_data(code):
         #    추가/삭제해서 표 순서(인덱스)가 밀려도 안 깨지도록 하기 위함.
         #    (과거: 순서 고정 가정이 깨지며 전종목 실적 조회가 실패하는 버그 발생)
         def _indexed(d):
+            # 🔧 [FnGuide 구조 변경 대응] 예전엔 항상 첫 번째 열(d.columns[0])이
+            #    항목명(매출액/영업이익 등) 열이었지만, 2026-08 확인 결과 첫 번째 열이
+            #    통째로 빈 칸(아이콘/토글용으로 추정)으로 바뀌어 전부 NaN이 되는 케이스가
+            #    발생함 → 이 경우 실제 항목명은 두 번째 열 이후에 있음.
+            #    그래서 첫 3개 열 중 "빈 값이 가장 적고 텍스트가 많은" 열을 자동으로 찾아
+            #    그 열을 인덱스로 사용한다 (숫자만 있는 열은 항목명 열이 아니므로 제외 유도).
             try:
-                return d.set_index(d.columns[0])
+                ncols_to_check = min(3, len(d.columns))
+                best_col, best_score = None, -1
+                for c in d.columns[:ncols_to_check]:
+                    col = d[c].dropna()
+                    if col.empty:
+                        score = 0
+                    else:
+                        # 숫자/퍼센트/콤마 형식이 아닌(=글자로 된) 값의 개수를 우선시
+                        non_numeric = col.apply(
+                            lambda v: not re.match(r'^-?[\d,\.]+%?$', str(v).strip())
+                        ).sum()
+                        score = non_numeric * 100 + len(col)
+                    if score > best_score:
+                        best_score, best_col = score, c
+                if best_col is None or best_score <= 0:
+                    return None
+                return d.set_index(best_col)
             except Exception:
                 return None
 
