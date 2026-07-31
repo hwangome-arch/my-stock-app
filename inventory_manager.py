@@ -864,6 +864,15 @@ _FN_MOBILE_HEADERS = {
     'Accept-Language': 'ko-KR,ko;q=0.9',
 }
 
+# 🔧 [FnGuide 신버전 대응] 모바일 페이지(m.comp.fnguide.com/m2/...)가 폐지되어
+# PC용 comp.fnguide.com/SVO2/ 페이지로 전환하면서 쓰는 전용 헤더.
+_FN_DESKTOP_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Referer': 'https://comp.fnguide.com/',
+    'Accept-Language': 'ko-KR,ko;q=0.9',
+}
+
 
 def _parse_mobile_consensus(html_text):
     """m.comp.fnguide.com company_03.asp(컨센서스) 페이지 파싱."""
@@ -1336,8 +1345,15 @@ def fetch_fnguide_data(code):
     }
 
     try:
-        url = f"https://m.comp.fnguide.com/m2/company_02.asp?pGB=1&gicode=A{code}&MenuYn=Y"
-        res = requests.get(url, headers=_FN_MOBILE_HEADERS, timeout=10)
+        # 🔧 [FnGuide 신버전 대응] 기존 모바일 페이지(m.comp.fnguide.com/m2/company_02.asp)가
+        # FnGuide 측에서 폐지되어 "페이지가 없습니다"를 반환하게 됨(2026-07-31 확인).
+        # PC용 재무제표 페이지(SVD_Finance.asp)로 교체. 표 탐색 로직은 고정 인덱스가
+        # 아니라 항목명(매출액/영업이익/ROE 등) 기반이라 URL만 바꿔도 재사용 가능.
+        url = (
+            f"https://comp.fnguide.com/SVO2/ASP/SVD_Finance.asp?"
+            f"pGB=1&gicode=A{code}&cID=&MenuYn=Y&ReportGB=&NewMenuID=103&stkGb=701"
+        )
+        res = requests.get(url, headers=_FN_DESKTOP_HEADERS, timeout=10)
         debug["status"] = res.status_code
         res.encoding = res.apparent_encoding or 'utf-8'
         html = res.text
