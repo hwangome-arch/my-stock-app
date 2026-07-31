@@ -4394,25 +4394,22 @@ def main():
             )
             for label, icon in group_items:
                 is_selected = st.session_state.current_page == label
-                if st.button(
+                st.button(
                     label,
                     icon=icon,
                     key=f"nav_{label}",
                     type="primary" if is_selected else "secondary",
                     use_container_width=True,
-                ):
-                    # 🔧 [탭 이동 멈춤 대응] 예전에는 여기서 st.session_state를 바꾼 뒤
-                    # st.rerun()을 명시적으로 한 번 더 호출했다. 하지만 st.button()이
-                    # 클릭되는 순간 Streamlit은 이미 자동으로 스크립트를 처음부터
-                    # 다시 실행한다 — 그 위에 st.rerun()을 또 부르면 클릭 한 번에
-                    # rerun이 두 번(버튼 자체 rerun + 명시적 rerun) 연쇄로 발생한다.
-                    # 빠르게 연타하면 이 이중 rerun이 겹겹이 쌓이는데, 이건 Streamlit이
-                    # 공식적으로 인정한 버그(GitHub #9921: "Calling st.rerun in quick
-                    # succession causes crash/hang")와 같은 계열의 패턴이다.
-                    # session_state만 갱신하면 버튼의 자체 rerun이 알아서 새 값을
-                    # 반영해 다시 그려주므로 명시적 rerun은 불필요하다.
-                    if st.session_state.current_page != label:
-                        st.session_state.current_page = label
+                    # 🔧 [사이드바 색상 한 박자 밀리는 현상 대응] 예전에는
+                    # `if st.button(...): session_state 갱신` 방식이었다. 이 경우
+                    # "이 버튼 자신의 type(primary/secondary)"은 이미 클릭을 처리하기
+                    # *전에* 계산된 is_selected로 그려져 버린 뒤라, 클릭한 바로 그
+                    # 렌더링에서는 메인 콘텐츠만 바뀌고 버튼 색은 다음 클릭이 와야
+                    # 비로소 새 상태를 반영했다. on_click 콜백은 스크립트가 처음부터
+                    # 다시 그려지기 *전에* 먼저 실행되므로, session_state가 미리
+                    # 갱신된 채로 이번 렌더링의 모든 버튼이 그려져 색상이 항상 맞다.
+                    on_click=lambda _label=label: st.session_state.__setitem__("current_page", _label),
+                )
 
         _show_debug_memory()
 
