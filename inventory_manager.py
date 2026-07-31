@@ -874,6 +874,49 @@ _FN_DESKTOP_HEADERS = {
 }
 
 
+def _parse_wisereport_consensus(html_text):
+    """navercomp.wisereport.co.kr c1010001.aspx 페이지 안에 정적으로 포함된
+    '투자의견컨센서스' 표에서 목표주가/투자의견 점수/추정기관수를 추출.
+    (2026-08 실측 확인: 목표주가(원)/EPS(원)/PER(배)/추정기관수 컬럼을 가진 표가
+     페이지에 그대로 포함되어 있어, 이미 기업개요 조회 때 받아온 응답을 그대로
+     재사용해서 파싱 가능 — 별도 네트워크 요청이 필요 없다)"""
+    result = {"opinion": "", "opinion_score": "", "target": "", "analyst_count": ""}
+    try:
+        dfs = pd.read_html(io.StringIO(html_text))
+    except Exception:
+        return result
+
+    for d in dfs:
+        cols = [str(c) for c in d.columns]
+        if any('목표주가' in c for c in cols) and any('투자의견' in c for c in cols) and not d.empty:
+            row = d.iloc[0]
+            for c in d.columns:
+                cs = str(c)
+                val = str(row[c]).replace(',', '').strip()
+                try:
+                    if '투자의견' in cs:
+                        op_val = float(val)
+                        if op_val > 0:
+                            result["opinion_score"] = f"{op_val:.1f} / 5.0"
+                            if op_val >= 4.5:   result["opinion"] = "🔥 강력매수"
+                            elif op_val >= 3.5: result["opinion"] = "👍 매수"
+                            elif op_val >= 2.5: result["opinion"] = "✋ 중립"
+                            elif op_val >= 1.5: result["opinion"] = "👎 매도"
+                            else:               result["opinion"] = "💀 강력매도"
+                    elif '목표주가' in cs:
+                        tg = int(float(val))
+                        if tg > 0:
+                            result["target"] = f"{tg:,} 원"
+                    elif '추정기관' in cs:
+                        n = int(float(val))
+                        if n > 0:
+                            result["analyst_count"] = f"추정기관 {n}곳"
+                except (ValueError, TypeError):
+                    pass
+            break
+    return result
+
+
 def _parse_desktop_consensus(html_text):
     """wcomp.fnguide.com/CompanyInfo/Consensus 페이지 파싱.
     페이지 구조가 자주 바뀌므로, 특정 태그/클래스에 의존하지 않고
@@ -1066,12 +1109,14 @@ def fetch_company_info_fnguide(code):
     # ①-2 기업개요(상세): navercomp.wisereport.co.kr의 <div class="cmp_comment"> 블록에서
     #    실제 FnGuide 기업개요 불릿 설명을 가져와 네이버 요약(짧은 1~2문장)보다
     #    더 길고 구체적인 내용으로 덮어쓴다. 실패 시 위 네이버 요약을 그대로 유지(안전한 폴백).
+    res_wr_text = None  # ②에서 컨센서스 파싱할 때 재사용(같은 페이지에 투자의견 표가 포함되어 있음)
     try:
         wr_url = f"https://navercomp.wisereport.co.kr/v2/company/c1010001.aspx?cmp_cd={code}"
         res_wr = requests.get(wr_url, headers=_WISEREPORT_HEADERS, timeout=8)
         res_wr.encoding = res_wr.apparent_encoding or 'utf-8'
         # data-cd 속성에 요청 코드가 실제로 있는지 확인 (다른 종목 고정 스냅샷 방지)
         if f'data-cd="{code}"' in res_wr.text:
+            res_wr_text = res_wr.text
             detailed_summary = _parse_wisereport_overview(res_wr.text)
             if detailed_summary and len(detailed_summary) > 20:
                 data["summary"] = detailed_summary
@@ -1079,26 +1124,39 @@ def fetch_company_info_fnguide(code):
         pass
 
     # ② 투자의견 / 목표주가 컨센서스
-    # 🔧 [FnGuide 신버전 대응] 기존에 쓰던 m.comp.fnguide.com/m2/company_03.asp는
-    #    이미 폐지된 모바일 페이지였음(재무제표 소스를 wcomp.fnguide.com으로 옮길 때
-    #    이 함수만 함께 옮기지 못해 계속 통신 오류가 나고 있었음, 2026-08 확인).
-    #    재무제표와 동일 계열의 신버전 desktop URL(wcomp.fnguide.com/CompanyInfo/Consensus)로 전환.
+    # 🔧 [네이버(WISEfn) 소스로 전환] FnGuide 쪽(모바일 URL 폐지, desktop Consensus 페이지도
+    #    구조 변경으로 매칭 실패 가능성 있음)보다, 네이버금융이 실제로 쓰는 데이터 소스인
+    #    navercomp.wisereport.co.kr 페이지에 투자의견 컨센서스 표가 정적으로 포함돼 있는 걸
+    #    확인함(2026-08). ①-2에서 이미 받아온 응답을 그대로 재사용 → 네트워크 요청 절약.
+    #    혹시 그 조회 자체가 실패했을 경우에만 별도로 한 번 더 요청한다.
     consensus = {"opinion": "", "opinion_score": "", "target": "", "analyst_count": ""}
     fetch_failed = False
-    consensus_debug = {"code": code, "status": None, "resp_len": None, "code_in_html": None, "exception": None}
+    consensus_debug = {"code": code, "status": None, "resp_len": None, "reused_overview_response": res_wr_text is not None, "exception": None}
     try:
-        fn_desktop_url = f"https://wcomp.fnguide.com/CompanyInfo/Consensus?cmp_cd={code}"
-        res3 = requests.get(fn_desktop_url, headers=_FN_DESKTOP_HEADERS, timeout=8)
-        res3.encoding = res3.apparent_encoding or 'utf-8'
-        consensus_debug["status"] = res3.status_code
-        consensus_debug["resp_len"] = len(res3.text)
-        consensus_debug["code_in_html"] = (code in res3.text)
-        # 차단(다른 종목 고정) 여부 확인: 요청 코드가 응답 안에 실제로 있는지 검증
-        if code in res3.text:
-            consensus = _parse_desktop_consensus(res3.text)
+        html_for_consensus = res_wr_text
+        if html_for_consensus is None:
+            wr_url2 = f"https://navercomp.wisereport.co.kr/v2/company/c1010001.aspx?cmp_cd={code}"
+            res3 = requests.get(wr_url2, headers=_WISEREPORT_HEADERS, timeout=8)
+            res3.encoding = res3.apparent_encoding or 'utf-8'
+            consensus_debug["status"] = res3.status_code
+            consensus_debug["resp_len"] = len(res3.text)
+            if f'data-cd="{code}"' in res3.text:
+                html_for_consensus = res3.text
+            else:
+                fetch_failed = True
+
+        if html_for_consensus is not None:
+            consensus = _parse_wisereport_consensus(html_for_consensus)
             consensus_debug["parsed"] = consensus
-        else:
-            fetch_failed = True
+            if not consensus["opinion"] and not consensus["target"]:
+                # 표는 있는데 파싱이 안 된 경우 진단을 위해 표 목록을 남긴다
+                try:
+                    _dfs_dbg = pd.read_html(io.StringIO(html_for_consensus))
+                    consensus_debug["tables_with_columns"] = [
+                        [str(c) for c in d.columns.tolist()][:8] for d in _dfs_dbg
+                    ][:20]
+                except Exception:
+                    pass
     except Exception as e:
         fetch_failed = True
         consensus_debug["exception"] = f"{type(e).__name__}: {e}"
@@ -1379,11 +1437,124 @@ def _fn_build_dividend_table(income_df, valuation_df):
     return out
 
 
+def _get_wisereport_token(code, html_hint=None):
+    """navercomp.wisereport.co.kr 페이지의 <script> 안에 있는 encparam/id 토큰을 추출.
+    재무제표 AJAX(cF1001.aspx) 호출에 필요한 값으로, 페이지를 새로 열 때마다 새로 발급됨."""
+    try:
+        html = html_hint
+        if html is None:
+            wr_url = f"https://navercomp.wisereport.co.kr/v2/company/c1010001.aspx?cmp_cd={code}"
+            res = requests.get(wr_url, headers=_WISEREPORT_HEADERS, timeout=8)
+            res.encoding = res.apparent_encoding or 'utf-8'
+            html = res.text
+        enc_m = re.search(r"encparam\s*:\s*'([^']+)'", html)
+        id_m = re.search(r"\bid\s*:\s*'([^']+)'", html)
+        if enc_m and id_m:
+            return enc_m.group(1), id_m.group(1)
+    except Exception:
+        pass
+    return None, None
+
+
+def _parse_wisereport_finsum_json(raw_json):
+    """cF1001.aspx 응답 JSON의 실제 키 이름을 아직 실측하지 못했기 때문에,
+    리스트를 담고 있을 법한 최상위 키를 최대한 유연하게 자동 탐색한다.
+    (원본 구조를 debug로 남겨서, 다음 단계에서 정확한 필드 매핑을 확정하기 위함)"""
+    if raw_json is None:
+        return None, {"note": "raw_json is None"}
+    candidate_keys = ['DATA', 'data', 'List', 'list', 'RESULT', 'result']
+    rows, used_key = None, None
+    if isinstance(raw_json, list):
+        rows, used_key = raw_json, "(top-level list)"
+    elif isinstance(raw_json, dict):
+        for k in candidate_keys:
+            if k in raw_json and isinstance(raw_json[k], list) and raw_json[k]:
+                rows, used_key = raw_json[k], k
+                break
+        if rows is None:
+            for k, v in raw_json.items():
+                if isinstance(v, list) and v:
+                    rows, used_key = v, k
+                    break
+    meta = {
+        "used_key": used_key,
+        "top_level_keys": list(raw_json.keys()) if isinstance(raw_json, dict) else "(top-level list)",
+        "row_count": len(rows) if rows else 0,
+        "sample_row": rows[0] if rows else None,
+        "sample_row_2": rows[1] if rows and len(rows) > 1 else None,
+    }
+    return rows, meta
+
+
+def _fetch_wisereport_finsum_raw(code, encparam, token_id, freq_typ, fin_typ=0):
+    """cF1001.aspx AJAX 호출로 손익/재무상태/투자지표 원본 JSON을 가져온다.
+    freq_typ: 'Y'(연간) 또는 'Q'(분기)."""
+    url = "https://navercomp.wisereport.co.kr/v2/company/ajax/cF1001.aspx"
+    params = {'cmp_cd': code, 'fin_typ': fin_typ, 'freq_typ': freq_typ, 'encparam': encparam, 'id': token_id}
+    headers = {
+        'User-Agent': _WISEREPORT_HEADERS['User-Agent'],
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
+        'Referer': f'https://navercomp.wisereport.co.kr/v2/company/c1010001.aspx?cmp_cd={code}',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Accept-Language': 'ko-KR,ko;q=0.9',
+    }
+    return requests.get(url, params=params, headers=headers, timeout=8)
+
+
+def fetch_wisereport_data(code):
+    """🧪 [실험적 / 진단 단계] 네이버금융이 실제로 쓰는 WISEfn(navercomp.wisereport.co.kr)
+    소스에서 연간/분기 재무 실적을 가져오는 것을 시도한다. FnGuide 스크래핑이 막힐 때를
+    대비한 대체 소스로 검토 중이다.
+    ⚠️ cF1001.aspx 응답 JSON의 정확한 키 구조를 아직 실측 검증하지 못한 상태라,
+    지금은 df_annual/df_quarter를 채우지 않고 항상 빈 DataFrame을 반환한다 —
+    대신 _DEBUG_STORE['_wisereport_fin_debug_{code}']에 실제 응답 구조를 남겨서,
+    다음 단계에서 정확한 필드 매핑(어느 키가 '매출액'인지 등)을 확정할 수 있게 한다.
+    (틀린 키 매핑으로 잘못된 숫자를 보여주는 것보다, 명확히 비어있는 게 안전함)"""
+    debug = {"code": code, "step": None}
+    df_annual, df_quarter = pd.DataFrame(), pd.DataFrame()
+    try:
+        encparam, token_id = _get_wisereport_token(code)
+        debug["token_found"] = bool(encparam and token_id)
+        if not (encparam and token_id):
+            debug["step"] = "token_extract_failed (encparam/id를 페이지에서 못 찾음)"
+            _DEBUG_STORE[f"_wisereport_fin_debug_{code}"] = debug
+            return df_annual, df_quarter
+
+        for freq_label, freq_typ in [("annual", "Y"), ("quarter", "Q")]:
+            try:
+                res = _fetch_wisereport_finsum_raw(code, encparam, token_id, freq_typ)
+                debug[f"{freq_label}_status"] = res.status_code
+                try:
+                    raw_json = res.json()
+                    rows, meta = _parse_wisereport_finsum_json(raw_json)
+                    debug[f"{freq_label}_meta"] = meta
+                except Exception as e:
+                    debug[f"{freq_label}_json_error"] = f"{type(e).__name__}: {e}"
+                    debug[f"{freq_label}_raw_preview"] = res.text[:500]
+            except Exception as e:
+                debug[f"{freq_label}_request_error"] = f"{type(e).__name__}: {e}"
+
+        debug["step"] = "응답 구조 확인됨 - 다음 단계에서 필드 매핑 확정 필요"
+    except Exception as e:
+        debug["exception"] = f"{type(e).__name__}: {e}"
+
+    _DEBUG_STORE[f"_wisereport_fin_debug_{code}"] = debug
+    return df_annual, df_quarter
+
+
 # 💡 모바일 페이지(company_02: 재무정보) 기반 fetch_fnguide_data
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fnguide_data(code):
     code = normalize_kr_code(code)
     df_annual, df_quarter, df_dividend = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    # 🧪 [진단 단계] 네이버(WISEfn) 소스 먼저 시도 — 지금은 항상 비어서 돌아오지만
+    #    _DEBUG_STORE에 실제 AJAX 응답 구조를 남긴다. FnGuide 쪽이 계속 실패하면
+    #    아래 debug expander에서 이 정보를 확인해 다음 수정에 활용할 수 있다.
+    try:
+        fetch_wisereport_data(code)
+    except Exception:
+        pass
 
     debug = {
         "code": code, "status": None, "resp_len": None,
@@ -2700,8 +2871,12 @@ def draw_fnguide_details(code):
             st.caption("ℹ️ 연간/분기 실적 데이터를 불러오지 못했습니다.")
             _fdbg = _DEBUG_STORE.get(f"_fnguide_debug_{code}")
             if _fdbg:
-                with st.expander("🔧 디버그 정보 (실적 데이터 실패 원인 확인용)"):
+                with st.expander("🔧 디버그 정보 (실적 데이터 실패 원인 확인용 - FnGuide)"):
                     st.json(_fdbg)
+            _wdbg = _DEBUG_STORE.get(f"_wisereport_fin_debug_{code}")
+            if _wdbg:
+                with st.expander("🔧 디버그 정보 (네이버/WISEfn 대체 소스 응답 구조 확인용)"):
+                    st.json(_wdbg)
 
             st.markdown("""
                 <div style='background-color: #F9FAFB; padding: 15px; border-radius: 8px; margin-top: 15px; font-size: 13px; color: #6B7280;'>
