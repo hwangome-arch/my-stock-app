@@ -1648,14 +1648,55 @@ def _naver_wise_build_period_table(real_df, col_period_pairs, is_quarter):
     return out[final_cols]
 
 
+def _naver_wise_build_dividend_table(real_df, annual_col_period_pairs):
+    """네이버 WiseReport 표의 '현금DPS(원)'/'현금배당수익률'/'현금배당성향(%)'는
+    FnGuide처럼 EPS×PER로 역산 추정한 값이 아니라 실측 배당 데이터라 더 정확하다.
+    반환 형식은 _fn_build_dividend_table()과 동일: ['연도','주당배당금','배당총액','배당수익률','배당성향']
+    (연간 데이터만 대상으로 함 - 배당은 보통 연 단위로 발표되므로 분기 컬럼은 사용 안 함)
+    """
+    rows = []
+    for col, period in annual_col_period_pairs:
+        dps = _naver_wise_lookup(real_df, '현금DPS(원)', col)
+        div_yield = _naver_wise_lookup(real_df, '현금배당수익률', col)
+        payout = _naver_wise_lookup(real_df, '현금배당성향(%)', col)
+        net_income = _naver_wise_lookup(real_df, '당기순이익', col)
+        shares = _naver_wise_lookup(real_df, '발행주식수(보통주)', col)
+
+        # 배당총액(억원): DPS(원) × 발행주식수(주) ÷ 1억이 가장 직접적이고 정확함.
+        # 발행주식수를 못 구한 경우에만 당기순이익×배당성향 방식으로 대체(FnGuide와 동일 로직).
+        total_div = float('nan')
+        if pd.notna(dps) and pd.notna(shares) and shares != 0:
+            total_div = dps * shares / 1e8
+        elif pd.notna(payout) and pd.notna(net_income):
+            total_div = net_income * payout / 100
+
+        rows.append({
+            '연도': period,
+            '주당배당금': dps,
+            '배당총액': total_div,
+            '배당수익률': div_yield,
+            '배당성향': payout,
+        })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    # 주당배당금이 없는(=그 해 배당 자체가 없거나 데이터가 없는) 연도는 제외
+    out = out[out['주당배당금'].notna()].reset_index(drop=True)
+    return out
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_naver_wisereport_data(code):
     """네이버 금융(NICE평가정보 WiseReport)에서 연간/분기 재무 요약 데이터를 가져온다.
-    반환: (df_annual, df_quarter) - fetch_fnguide_data()와 동일한 컬럼 구조.
-    (배당 테이블은 이 엔드포인트에 없어서 빈 DataFrame 대신 호출부에서 FnGuide 값을 유지)
+    반환: (df_annual, df_quarter, df_dividend) - fetch_fnguide_data()와 동일한 컬럼 구조.
+
+    💰 [배당 데이터 추가] 이 표에는 '현금DPS(원)'/'현금배당수익률'/'현금배당성향(%)'이
+    실측치로 그대로 들어있다. FnGuide 쪽처럼 EPS×PER로 주가를 추정해 배당수익률을
+    역산할 필요가 없어서, 오히려 이쪽이 더 정확한 배당 데이터 소스다.
     """
     code = normalize_kr_code(code)
-    df_annual, df_quarter = pd.DataFrame(), pd.DataFrame()
+    df_annual, df_quarter, df_dividend = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     debug = {"code": code, "step": None}
 
     try:
@@ -1672,7 +1713,7 @@ def fetch_naver_wisereport_data(code):
         if not m_enc or not m_id:
             debug["step"] = "토큰(encparam/id) 추출 실패 - 페이지 구조가 바뀌었을 수 있음"
             _DEBUG_STORE[f"_naver_wise_debug_{code}"] = debug
-            return df_annual, df_quarter
+            return df_annual, df_quarter, df_dividend
         encparam, id_ = m_enc.group(1), m_id.group(1)
 
         # 2단계: 실제 데이터 요청 (fin_typ=0, freq_typ=A 조합이 연간+분기를 함께 반환)
@@ -1697,7 +1738,7 @@ def fetch_naver_wisereport_data(code):
         if real_df is None:
             debug["step"] = "실제 데이터 표를 못 찾음 (더미 표만 있거나 구조 변경)"
             _DEBUG_STORE[f"_naver_wise_debug_{code}"] = debug
-            return df_annual, df_quarter
+            return df_annual, df_quarter, df_dividend
 
         item_col = real_df.columns[0]
         real_df = real_df.set_index(item_col)
@@ -1717,38 +1758,55 @@ def fetch_naver_wisereport_data(code):
 
         debug["annual_periods_found"] = [p for _, p in annual_cols]
         debug["quarter_periods_found"] = [p for _, p in quarter_cols]
+        debug["dividend_rows_present"] = [
+            kw for kw in ['현금DPS(원)', '현금배당수익률', '현금배당성향(%)', '발행주식수(보통주)']
+            if kw in real_df.index
+        ]
 
         df_annual = _naver_wise_build_period_table(real_df, annual_cols, is_quarter=False)
         df_quarter = _naver_wise_build_period_table(real_df, quarter_cols, is_quarter=True)
+        df_dividend = _naver_wise_build_dividend_table(real_df, annual_cols)
+        debug["dividend_rows_found"] = len(df_dividend)
 
-        if df_annual.empty and df_quarter.empty:
+        if df_annual.empty and df_quarter.empty and df_dividend.empty:
             _DEBUG_STORE[f"_naver_wise_debug_{code}"] = debug
 
     except Exception as e:
         debug["exception"] = f"{type(e).__name__}: {e}"
         _DEBUG_STORE[f"_naver_wise_debug_{code}"] = debug
 
-    return df_annual, df_quarter
+    return df_annual, df_quarter, df_dividend
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_financial_data(code):
     """연간/분기/배당 재무 데이터 통합 진입점.
-    1순위: FnGuide(fetch_fnguide_data) - 배당 데이터까지 포함해 더 풍부함
-    2순위(폴백): 네이버 WiseReport(fetch_naver_wisereport_data) - FnGuide가 막히거나
-                 구조 변경으로 실패했을 때만 사용. 배당 데이터는 이 소스에 없음.
-    두 소스 다 실패하면 빈 DataFrame 3개를 그대로 반환(기존 호출부의
-    '데이터를 불러오지 못했습니다' 처리 로직이 그대로 동작).
+    1순위: FnGuide(fetch_fnguide_data)
+    2순위(폴백): 네이버 WiseReport(fetch_naver_wisereport_data)
+
+    ⚠️ [배당 폴백 버그 수정] 예전에는 연간/분기가 FnGuide에서 성공하면(=네이버로
+    안 넘어가면) 배당은 무조건 FnGuide 값만 썼는데, FnGuide가 전체적으로 막혀있는
+    상황에서는 연간/분기·배당 모두 실패한다. 그래서 배당은 연간/분기와 별개로
+    "FnGuide 배당이 비어있으면 네이버로 보강"하도록 독립적으로 폴백을 건다
+    (연간/분기가 이미 네이버로 넘어간 경우든, FnGuide로 성공한 경우든 상관없이).
     """
     df_annual, df_quarter, df_dividend = fetch_fnguide_data(code)
+    financial_source = "fnguide" if not (df_annual.empty and df_quarter.empty) else None
 
-    if df_annual.empty and df_quarter.empty:
-        naver_annual, naver_quarter = fetch_naver_wisereport_data(code)
+    naver_annual = naver_quarter = naver_dividend = None
+    need_naver = (df_annual.empty and df_quarter.empty) or df_dividend.empty
+    if need_naver:
+        naver_annual, naver_quarter, naver_dividend = fetch_naver_wisereport_data(code)
+
+    if df_annual.empty and df_quarter.empty and naver_annual is not None:
         if not naver_annual.empty or not naver_quarter.empty:
             df_annual, df_quarter = naver_annual, naver_quarter
-            _DEBUG_STORE[f"_financial_source_{normalize_kr_code(code)}"] = "naver_wisereport_fallback"
-    else:
-        _DEBUG_STORE[f"_financial_source_{normalize_kr_code(code)}"] = "fnguide"
+            financial_source = "naver_wisereport_fallback"
+
+    if df_dividend.empty and naver_dividend is not None and not naver_dividend.empty:
+        df_dividend = naver_dividend
+
+    _DEBUG_STORE[f"_financial_source_{normalize_kr_code(code)}"] = financial_source or "all_failed"
 
     return df_annual, df_quarter, df_dividend
 
