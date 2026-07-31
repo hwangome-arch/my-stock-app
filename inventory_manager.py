@@ -1386,9 +1386,45 @@ def fetch_fnguide_data(code):
 
         indexed_dfs = [_indexed(d) for d in dfs]
 
+        # 🔧 [진단 강화] 실패 시 원인을 바로 알 수 있도록, 매칭 성공 여부와 무관하게
+        #    찾아낸 모든 표의 실제 행 이름(index)·컬럼명을 debug에 항상 남긴다.
+        #    (이전에는 매칭에 실패하면 표 안에 실제로 뭐가 들어있었는지 전혀 알 수 없어
+        #     원인 파악이 불가능했음 — 이 필드로 FnGuide 쪽 표기 변경 여부를 바로 확인)
+        debug["all_tables_preview"] = []
+        for _ti, _d in enumerate(indexed_dfs):
+            if _d is None or _d.empty:
+                debug["all_tables_preview"].append({"table_idx": _ti, "note": "인덱싱 실패 또는 빈 표"})
+                continue
+            debug["all_tables_preview"].append({
+                "table_idx": _ti,
+                "shape": list(_d.shape),
+                "columns": [str(c) for c in _d.columns.tolist()][:10],
+                "index_preview": [str(x) for x in _d.index.tolist()][:20],
+            })
+
         income_candidates = [d for d in indexed_dfs if _has_rows(d, ['매출액', '영업이익'])]
         balance_candidates = [d for d in indexed_dfs if _has_rows(d, ['부채', '자본'])]
         valuation_candidates = [d for d in indexed_dfs if _has_rows(d, ['ROE', 'PER(배)'])]
+
+        # 🔧 [완화 매칭 폴백] 엄격한 AND 매칭(예: '매출액'과 '영업이익' 둘 다 필요)이
+        #    실패하면, 키워드 하나만 있어도 되는 느슨한 조건으로 한 번 더 시도한다.
+        #    FnGuide가 세부 표기(예: 'PER(배)' → 'PER')를 살짝 바꿔도 버티기 위함.
+        #    엄격 매칭이 이미 성공한 경우에는 건드리지 않는다(기존 동작 유지).
+        if len(income_candidates) < 2:
+            loose = [d for d in indexed_dfs if _has_rows(d, ['매출액']) or _has_rows(d, ['영업이익'])]
+            if len(loose) >= 2:
+                income_candidates = loose
+                debug["income_matched_via"] = "loose_fallback"
+        if len(balance_candidates) < 2:
+            loose = [d for d in indexed_dfs if _has_rows(d, ['자산총계']) or (_has_rows(d, ['부채']) and _has_rows(d, ['자본']))]
+            if len(loose) >= 2:
+                balance_candidates = loose
+                debug["balance_matched_via"] = "loose_fallback"
+        if not valuation_candidates:
+            loose = [d for d in indexed_dfs if _has_rows(d, ['ROE']) or _has_rows(d, ['PER'])]
+            if loose:
+                valuation_candidates = loose
+                debug["valuation_matched_via"] = "loose_fallback"
 
         debug["income_candidates_found"] = len(income_candidates)
         debug["balance_candidates_found"] = len(balance_candidates)
@@ -1396,7 +1432,7 @@ def fetch_fnguide_data(code):
 
         # 문서상 등장 순서 기준: 첫 번째 = 연간(연결), 두 번째 = 분기(연결)
         if len(income_candidates) < 2 or len(balance_candidates) < 2 or not valuation_candidates:
-            debug["exception"] = "필요한 재무 표를 찾지 못함 (항목명 매칭 실패 - FnGuide 페이지 구조 변경 가능성)"
+            debug["exception"] = "필요한 재무 표를 찾지 못함 (항목명 매칭 실패 - FnGuide 페이지 구조 변경 가능성). all_tables_preview를 확인하세요."
             _DEBUG_STORE[f"_fnguide_debug_{code}"] = debug
             return df_annual, df_quarter, df_dividend
 
