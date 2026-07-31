@@ -874,8 +874,47 @@ _FN_DESKTOP_HEADERS = {
 }
 
 
+def _parse_desktop_consensus(html_text):
+    """wcomp.fnguide.com/CompanyInfo/Consensus 페이지 파싱.
+    페이지 구조가 자주 바뀌므로, 특정 태그/클래스에 의존하지 않고
+    '목표주가'/'투자의견' 같은 키워드 주변의 숫자·텍스트를 느슨하게 추출한다."""
+    result = {"opinion": "", "opinion_score": "", "target": "", "analyst_count": ""}
+
+    # 목표주가: '목표주가' 글자 뒤 400자 이내에 나오는 첫 콤마 포함 숫자(예: 95,000)
+    target_search = re.search(r'목표주가.{0,400}?(\d{2,3}(?:,\d{3})+)', html_text, re.DOTALL)
+    if target_search:
+        try:
+            tg = int(target_search.group(1).replace(',', ''))
+            if tg > 0:
+                result["target"] = f"{tg:,} 원"
+        except ValueError:
+            pass
+
+    # 투자의견 점수: '투자의견' 근처의 'X.X' 형태 점수(5점 만점 기준)
+    opinion_score_search = re.search(r'투자의견.{0,300}?([0-5]\.\d{1,2})', html_text, re.DOTALL)
+    if opinion_score_search:
+        try:
+            op_val = float(opinion_score_search.group(1))
+            if op_val > 0:
+                result["opinion_score"] = f"{op_val:.1f} / 5.0"
+                if op_val >= 4.5:   result["opinion"] = "🔥 강력매수"
+                elif op_val >= 3.5: result["opinion"] = "👍 매수"
+                elif op_val >= 2.5: result["opinion"] = "✋ 중립"
+                elif op_val >= 1.5: result["opinion"] = "👎 매도"
+                else:               result["opinion"] = "💀 강력매도"
+        except ValueError:
+            pass
+
+    # 추정 증권사(기관) 수
+    count_search = re.search(r'(\d+)\s*개\s*(?:증권사|기관)', html_text)
+    if count_search:
+        result["analyst_count"] = f"추정기관 {count_search.group(1)}곳"
+
+    return result
+
+
 def _parse_mobile_consensus(html_text):
-    """m.comp.fnguide.com company_03.asp(컨센서스) 페이지 파싱."""
+    """m.comp.fnguide.com company_03.asp(컨센서스) 페이지 파싱. (구버전 폴백용으로만 유지)"""
     result = {"opinion": "", "opinion_score": "", "target": "", "analyst_count": ""}
 
     score_match = re.search(r'<div class="msg step\d"[^>]*><span[^>]*>([\d.]+)</span></div>', html_text)
@@ -1039,20 +1078,31 @@ def fetch_company_info_fnguide(code):
     except Exception:
         pass
 
-    # ② 투자의견 / 목표주가 컨센서스: FnGuide 모바일 컨센서스 페이지 사용
+    # ② 투자의견 / 목표주가 컨센서스
+    # 🔧 [FnGuide 신버전 대응] 기존에 쓰던 m.comp.fnguide.com/m2/company_03.asp는
+    #    이미 폐지된 모바일 페이지였음(재무제표 소스를 wcomp.fnguide.com으로 옮길 때
+    #    이 함수만 함께 옮기지 못해 계속 통신 오류가 나고 있었음, 2026-08 확인).
+    #    재무제표와 동일 계열의 신버전 desktop URL(wcomp.fnguide.com/CompanyInfo/Consensus)로 전환.
     consensus = {"opinion": "", "opinion_score": "", "target": "", "analyst_count": ""}
     fetch_failed = False
+    consensus_debug = {"code": code, "status": None, "resp_len": None, "code_in_html": None, "exception": None}
     try:
-        fn_mobile_url = f"https://m.comp.fnguide.com/m2/company_03.asp?pGB=1&gicode=A{code}&MenuYn=Y"
-        res3 = requests.get(fn_mobile_url, headers=_FN_MOBILE_HEADERS, timeout=8)
+        fn_desktop_url = f"https://wcomp.fnguide.com/CompanyInfo/Consensus?cmp_cd={code}"
+        res3 = requests.get(fn_desktop_url, headers=_FN_DESKTOP_HEADERS, timeout=8)
         res3.encoding = res3.apparent_encoding or 'utf-8'
-        # 차단(삼성전자 고정) 여부 확인: 요청 코드가 응답 안에 실제로 있는지 검증
+        consensus_debug["status"] = res3.status_code
+        consensus_debug["resp_len"] = len(res3.text)
+        consensus_debug["code_in_html"] = (code in res3.text)
+        # 차단(다른 종목 고정) 여부 확인: 요청 코드가 응답 안에 실제로 있는지 검증
         if code in res3.text:
-            consensus = _parse_mobile_consensus(res3.text)
+            consensus = _parse_desktop_consensus(res3.text)
+            consensus_debug["parsed"] = consensus
         else:
             fetch_failed = True
-    except Exception:
+    except Exception as e:
         fetch_failed = True
+        consensus_debug["exception"] = f"{type(e).__name__}: {e}"
+    _DEBUG_STORE[f"_consensus_debug_{code}"] = consensus_debug
 
     if consensus["opinion"]:
         data["opinion"] = consensus["opinion"]
@@ -2414,6 +2464,12 @@ def draw_fnguide_details(code):
                 </p>
             </div>
         """, unsafe_allow_html=True)
+
+        if info.get("consensus_note"):
+            _cdbg = _DEBUG_STORE.get(f"_consensus_debug_{code}")
+            if _cdbg:
+                with st.expander("🔧 디버그 정보 (컨센서스 조회 실패 원인 확인용)"):
+                    st.json(_cdbg)
 
         # ── 최근 수급 동향 (외국인 / 기관 / 개인 추정 순매매) ────────────────────
         st.markdown("<h4 style='font-size:16px; margin:20px 0 4px 0;'>📊 최근 수급 동향</h4>", unsafe_allow_html=True)
