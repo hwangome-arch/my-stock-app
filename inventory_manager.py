@@ -3883,35 +3883,46 @@ def render_watchlist():
         return code, price_info, spark, ai_score, hit_prob_html
 
     if _wl_codes:
-        # ⚠️ Streamlit은 새 탭 클릭(재실행 요청)이 와도, 지금 실행 중인 스크립트가
-        # 여기처럼 순수 파이썬 블로킹 호출(as_completed/future.result) 안에 있으면 그
-        # 자리에서 끼어들 수 없다. 사용자가 몇 초 안에 여러 번 연달아 탭을 누르면,
-        # 이전 실행이 아직 이 대기 구간에 갇혀 있는 채로 새 실행들이 밀리고, 그 새
-        # 실행들도 각자 같은 공유 스레드풀에 작업을 또 밀어넣어 워커가 금방 동나버려서
-        # 사실상 멈춘 것처럼 보이는 현상으로 이어진다. 그래서 상한을 짧게(15초/8초)
-        # 유지한다 — 상한을 넘기면 이번 렌더링에서는 일부 종목 데이터가 비어있는 채로
-        # 넘어가고(다음 새로고침 때 캐시가 채워지며 자연히 보임), 그 대신 Streamlit이
-        # 최대한 빨리 제어권을 되찾아서 대기 중인 새 클릭을 처리할 수 있게 하는 걸
-        # 더 우선한다.
-        with st.spinner(f"🔄 관심종목 {len(_wl_codes)}건 시세 조회 중..."):
+        # [탭 이동 멈춤 대응] 예전에는 as_completed(timeout=8)로 메인 스크립트가 최대 8초를
+        # 한 번에 몰아서 기다렸다 — 그동안은 Streamlit이 사이드바 탭 클릭 같은 새 상호작용을
+        # 전혀 받아줄 수 없어서 멈춘 것처럼 보였다(특히 캐시가 비어있는 경우: 캐시 삭제 직후,
+        # 또는 현재가 캐시 TTL 60초가 지나 재조회가 필요한 시점에 자주 체감됨).
+        # 대시보드와 동일하게 render_async_multi로 바꿔서, 0.4초 폴링 간격 사이사이에
+        # Streamlit이 새 클릭을 정상적으로 받아줄 수 있게 한다.
+        def _submit_wl_jobs():
             _wl_executor = get_shared_executor()
-            _wl_futures = {_wl_executor.submit(_wl_prefetch_one, c): c for c in _wl_codes}
-            try:
-                for _wl_future in concurrent.futures.as_completed(_wl_futures, timeout=8):
+            return {c: _wl_executor.submit(_wl_prefetch_one, c) for c in _wl_codes}
+
+        def _collect_wl_results(futures):
+            out = {"price": {}, "spark": {}, "ai": {}, "hitprob": {}}
+            for _code, f in futures.items():
+                if f.done():
                     try:
-                        _code, _price_info, _spark, _ai_score, _hp_html = _wl_future.result(timeout=4)
+                        _c, _price_info, _spark, _ai_score, _hp_html = f.result(timeout=0.1)
+                        out["price"][_c] = _price_info
+                        out["spark"][_c] = _spark
+                        out["ai"][_c] = _ai_score
+                        if _hp_html:
+                            out["hitprob"][_c] = _hp_html
                     except Exception:
-                        continue
-                    wl_price_cache[_code] = _price_info
-                    sparkline_cache[_code] = _spark
-                    ai_score_cache[_code] = _ai_score
-                    if _hp_html:
-                        hit_prob_cache[_code] = _hp_html
-            except concurrent.futures.TimeoutError:
-                pass  # 전체 상한 초과 → 나머지는 건너뛰고 계속 진행
-            finally:
-                for f in _wl_futures:
-                    f.cancel()
+                        pass  # 아직 안 끝났거나 실패 → 그냥 비워둠(다음 새로고침 때 캐시로 채워짐)
+            return out
+
+        _wl_results, _wl_ready = render_async_multi(
+            job_key="watchlist_prefetch",
+            submit_fn=_submit_wl_jobs,
+            collect_fn=_collect_wl_results,
+            default_result={"price": {}, "spark": {}, "ai": {}, "hitprob": {}},
+            spinner_text=f"관심종목 {len(_wl_codes)}건 시세 조회 중...",
+            overall_timeout=15,
+        )
+        if not _wl_ready:
+            return  # 아직 로딩 중 — 폴링 프래그먼트가 알아서 이어가고, 이후 렌더링은 건너뜀
+
+        wl_price_cache = _wl_results["price"]
+        sparkline_cache = _wl_results["spark"]
+        ai_score_cache = _wl_results["ai"]
+        hit_prob_cache = _wl_results["hitprob"]
 
 
     reached_summary = []  # [(종목명, 종목코드, 도달차수, 진입가, 현재가), ...]
