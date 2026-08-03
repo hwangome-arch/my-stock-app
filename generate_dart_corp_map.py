@@ -21,7 +21,7 @@ from io import BytesIO
 import xml.etree.ElementTree as ET
 import re
 
-API_KEY = "여기에_secrets.toml의_DART_API_KEY_값을_그대로_붙여넣기"
+API_KEY = "fa3d35b617cf073f3d282d325c9271bc53d4a913"
 
 def normalize_kr_code(code):
     return re.sub(r"\D", "", str(code)).zfill(6)[:6]
