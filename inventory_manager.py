@@ -608,6 +608,7 @@ FED_RATE_HISTORY = [
 ]
 
 BOK_RATE_HISTORY = [
+    {"date": "2026-07-16", "rate": 2.75, "action": "인상 (+0.25%p)"},
     {"date": "2026-05-28", "rate": 2.50, "action": "동결"},
     {"date": "2026-04-10", "rate": 2.50, "action": "동결"},
     {"date": "2026-02-26", "rate": 2.50, "action": "동결"},
