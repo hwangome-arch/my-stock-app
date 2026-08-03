@@ -652,6 +652,20 @@ def fetch_fed_rate_data():
 def fetch_bok_rate_data():
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 
+    # ── [자동 라벨 판정] BOK_RATE_HISTORY 갱신을 깜빡해도 숫자만은 최신으로 보이게 ──
+    # 실시간 조회는 "현재 금리 숫자"만 줄 뿐 "이번에 인상/인하/동결됐는지"는 알려주지
+    # 않는다. 예전엔 그 라벨을 항상 하드코딩된 BOK_RATE_HISTORY에서만 가져왔는데,
+    # 회의가 끝나고 이 리스트를 사람이 업데이트하는 걸 깜빡하면(2026-07-16 인상 건이
+    # 실제로 그랬다) 화면에는 옛날 숫자+옛날 라벨이 함께 나왔다.
+    # 지금은 실시간 숫자가 하드코딩된 최신 이력과 다르면, 그 차이를 보고 인상/인하
+    # 라벨을 자동 계산해서 이력 맨 앞에 끼워넣는다. 다만 회의 날짜·정확한 %p폭 같은
+    # 세부 정보는 모르므로 "(자동감지)"를 붙여 사람이 넣은 값과 구분한다.
+    history = [
+        {"date": h["date"], "range": f"{h['rate']:.2f}%", "action": h["action"]}
+        for h in BOK_RATE_HISTORY[:10]
+    ]
+    latest_hardcoded = BOK_RATE_HISTORY[0]
+
     try:
         url = "https://m.stock.naver.com/api/index/IRR_BOK/basic"
         res = requests.get(url, headers=headers, timeout=8)
@@ -662,18 +676,14 @@ def fetch_bok_rate_data():
         date_display = dt.strftime("%Y-%m-%d") if pd.notna(dt) else "최신"
 
         if rate_val > 0:
-            history = [
-                {"date": h["date"], "range": f"{h['rate']:.2f}%", "action": h["action"]}
-                for h in BOK_RATE_HISTORY[:10]
-            ]
+            diff = round(rate_val - latest_hardcoded["rate"], 2)
+            if abs(diff) >= 0.01:
+                auto_action = f"{'인상' if diff > 0 else '인하'} ({diff:+.2f}%p, 자동감지)"
+                history = [{"date": date_display, "range": f"{rate_val:.2f}%", "action": auto_action}] + history
             return {"current": {"rate": f"{rate_val:.2f}%", "date": date_display}, "history": history}
     except Exception:
         pass
 
-    history = [
-        {"date": h["date"], "range": f"{h['rate']:.2f}%", "action": h["action"]}
-        for h in BOK_RATE_HISTORY[:10]
-    ]
     latest = BOK_RATE_HISTORY[0]
     return {"current": {"rate": f"{latest['rate']:.2f}%", "date": latest["date"]}, "history": history}
 
@@ -3884,41 +3894,68 @@ def render_watchlist():
         return code, price_info, spark, ai_score, hit_prob_html
 
     if _wl_codes:
-        # [탭 이동 멈춤 대응] 예전에는 as_completed(timeout=8)로 메인 스크립트가 최대 8초를
-        # 한 번에 몰아서 기다렸다 — 그동안은 Streamlit이 사이드바 탭 클릭 같은 새 상호작용을
-        # 전혀 받아줄 수 없어서 멈춘 것처럼 보였다(특히 캐시가 비어있는 경우: 캐시 삭제 직후,
-        # 또는 현재가 캐시 TTL 60초가 지나 재조회가 필요한 시점에 자주 체감됨).
-        # 대시보드와 동일하게 render_async_multi로 바꿔서, 0.4초 폴링 간격 사이사이에
-        # Streamlit이 새 클릭을 정상적으로 받아줄 수 있게 한다.
-        def _submit_wl_jobs():
-            _wl_executor = get_shared_executor()
-            return {c: _wl_executor.submit(_wl_prefetch_one, c) for c in _wl_codes}
-
-        def _collect_wl_results(futures):
-            out = {"price": {}, "spark": {}, "ai": {}, "hitprob": {}}
-            for _code, f in futures.items():
-                if f.done():
-                    try:
-                        _c, _price_info, _spark, _ai_score, _hp_html = f.result(timeout=0.1)
-                        out["price"][_c] = _price_info
-                        out["spark"][_c] = _spark
-                        out["ai"][_c] = _ai_score
-                        if _hp_html:
-                            out["hitprob"][_c] = _hp_html
-                    except Exception:
-                        pass  # 아직 안 끝났거나 실패 → 그냥 비워둠(다음 새로고침 때 캐시로 채워짐)
-            return out
-
-        _wl_results, _wl_ready = render_async_multi(
-            job_key="watchlist_prefetch",
-            submit_fn=_submit_wl_jobs,
-            collect_fn=_collect_wl_results,
-            default_result={"price": {}, "spark": {}, "ai": {}, "hitprob": {}},
-            spinner_text=f"관심종목 {len(_wl_codes)}건 시세 조회 중...",
-            overall_timeout=15,
+        # [클릭할 때마다 초기화되는 문제 대응] render_async_multi는 완료되면 session_state의
+        # job을 pop해버린다. 그런데 카드 안의 익스팬더(⭐/📊/🗑️/보유정보 입력 등)를 하나만
+        # 눌러도 Streamlit은 이 함수 전체를 처음부터 다시 실행한다 — 그때마다 job이 이미
+        # 없으니 매번 "새 조회"로 인식해서 futures를 새로 던지고, 아직 안 끝났으니
+        # render_async_multi가 즉시 return(대기 화면)해버려서 카드 목록이 통째로
+        # "관심종목 N건 시세 조회 중..."으로 순간 초기화되는 것처럼 보였다.
+        # 해결: 방금 받은 결과를 세션에 잠깐(현재가 캐시 TTL보다 살짝 짧게) 저장해두고,
+        # 같은 종목 구성으로 그 시간 안에 다시 렌더링되면 재조회 없이 그대로 재사용한다.
+        _WL_PREFETCH_REFRESH_SEC = 55
+        _wl_cache_key = "_wl_prefetch_cache"
+        _wl_codes_sig = tuple(_wl_codes)
+        _wl_cache = st.session_state.get(_wl_cache_key)
+        _wl_cache_fresh = (
+            _wl_cache is not None
+            and _wl_cache.get("codes") == _wl_codes_sig
+            and (time.time() - _wl_cache.get("ts", 0)) < _WL_PREFETCH_REFRESH_SEC
         )
-        if not _wl_ready:
-            return  # 아직 로딩 중 — 폴링 프래그먼트가 알아서 이어가고, 이후 렌더링은 건너뜀
+
+        if _wl_cache_fresh:
+            _wl_results = _wl_cache["results"]
+        else:
+            # [탭 이동 멈춤 대응] 예전에는 as_completed(timeout=8)로 메인 스크립트가 최대 8초를
+            # 한 번에 몰아서 기다렸다 — 그동안은 Streamlit이 사이드바 탭 클릭 같은 새 상호작용을
+            # 전혀 받아줄 수 없어서 멈춘 것처럼 보였다(특히 캐시가 비어있는 경우: 캐시 삭제 직후,
+            # 또는 현재가 캐시 TTL 60초가 지나 재조회가 필요한 시점에 자주 체감됨).
+            # 대시보드와 동일하게 render_async_multi로 바꿔서, 0.4초 폴링 간격 사이사이에
+            # Streamlit이 새 클릭을 정상적으로 받아줄 수 있게 한다.
+            def _submit_wl_jobs():
+                _wl_executor = get_shared_executor()
+                return {c: _wl_executor.submit(_wl_prefetch_one, c) for c in _wl_codes}
+
+            def _collect_wl_results(futures):
+                out = {"price": {}, "spark": {}, "ai": {}, "hitprob": {}}
+                for _code, f in futures.items():
+                    if f.done():
+                        try:
+                            _c, _price_info, _spark, _ai_score, _hp_html = f.result(timeout=0.1)
+                            out["price"][_c] = _price_info
+                            out["spark"][_c] = _spark
+                            out["ai"][_c] = _ai_score
+                            if _hp_html:
+                                out["hitprob"][_c] = _hp_html
+                        except Exception:
+                            pass  # 아직 안 끝났거나 실패 → 그냥 비워둠(다음 새로고침 때 캐시로 채워짐)
+                return out
+
+            _wl_results, _wl_ready = render_async_multi(
+                job_key="watchlist_prefetch",
+                submit_fn=_submit_wl_jobs,
+                collect_fn=_collect_wl_results,
+                default_result={"price": {}, "spark": {}, "ai": {}, "hitprob": {}},
+                spinner_text=f"관심종목 {len(_wl_codes)}건 시세 조회 중...",
+                overall_timeout=15,
+            )
+            if not _wl_ready:
+                return  # 아직 로딩 중 — 폴링 프래그먼트가 알아서 이어가고, 이후 렌더링은 건너뜀
+
+            st.session_state[_wl_cache_key] = {
+                "codes": _wl_codes_sig,
+                "results": _wl_results,
+                "ts": time.time(),
+            }
 
         wl_price_cache = _wl_results["price"]
         sparkline_cache = _wl_results["spark"]
