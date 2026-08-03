@@ -1839,17 +1839,66 @@ def get_dart_api_key():
 #    교체 필요. 자체 프록시로 바꿀 때는 _DART_USE_PROXY = False로 내리고
 #    _dart_request() 내부에서 자체 프록시 URL을 호출하도록 바꾸면 된다.
 _DART_USE_PROXY = True
-_DART_PROXY_BASE = "https://api.allorigins.win/raw?url="
+# ── [폴백 체인] 무료 공개 프록시는 개별적으로 다운되는 경우가 잦아서(allorigins가
+# 내부 오류를 내는 사례 확인됨), 하나가 실패하면 다음 프록시로 자동 전환하도록
+# 여러 개를 순서대로 등록해둔다. 앞쪽이 우선순위가 높다.
+_DART_PROXY_BASES = [
+    "https://api.allorigins.win/raw?url=",
+    "https://api.codetabs.com/v1/proxy?quest=",
+]
+
+
+def _is_proxy_error_response(res):
+    """DART가 아니라 프록시 서비스 자체가 낸 오류인지 판별.
+
+    allorigins 등 무료 프록시가 내부 오류일 때 HTTP 400대 상태코드와 함께
+    {"error": "...", "stack": "..."} 형태의 JSON을 반환하는 것을 확인했다.
+    이런 응답을 DART 응답으로 착각해 파싱하면 status=None으로 흘러가 버리므로,
+    여기서 미리 걸러내고 다음 프록시로 넘어간다.
+    """
+    if res.status_code >= 400:
+        return True
+    body_preview = res.text[:200].lstrip()
+    if body_preview.startswith("{"):
+        try:
+            body = res.json()
+        except Exception:
+            return False
+        if isinstance(body, dict) and "error" in body and "stack" in body:
+            return True
+    return False
 
 
 def _dart_request(url, params, timeout):
-    """DART API에 요청을 보낸다. _DART_USE_PROXY가 True면 CORS 프록시를 경유한다."""
-    if _DART_USE_PROXY:
-        full_target_url = f"{url}?{urllib.parse.urlencode(params)}"
-        proxied_url = _DART_PROXY_BASE + urllib.parse.quote(full_target_url, safe="")
-        return requests.get(proxied_url, timeout=timeout)
-    else:
+    """DART API에 요청을 보낸다.
+
+    _DART_USE_PROXY가 True면 등록된 CORS 프록시들을 순서대로 시도한다.
+    한 프록시가 네트워크 예외를 던지거나 프록시 자체 내부 오류를 반환하면,
+    바로 실패 처리하지 않고 다음 프록시로 자동 폴백한다. 모든 프록시가
+    실패하면 마지막으로 받은 응답(또는 마지막 예외)을 그대로 반환/발생시켜
+    기존 호출부의 에러 처리 로직(디버그 로깅 등)이 그대로 동작하게 한다.
+    """
+    if not _DART_USE_PROXY:
         return requests.get(url, params=params, timeout=timeout)
+
+    full_target_url = f"{url}?{urllib.parse.urlencode(params)}"
+    last_res = None
+    last_exc = None
+    for proxy_base in _DART_PROXY_BASES:
+        proxied_url = proxy_base + urllib.parse.quote(full_target_url, safe="")
+        try:
+            res = requests.get(proxied_url, timeout=timeout)
+        except Exception as e:
+            last_exc = e
+            continue
+        last_res = res
+        if not _is_proxy_error_response(res):
+            return res
+        # 이 프록시가 내부 오류를 낸 경우 → 다음 프록시로 계속 시도
+
+    if last_res is not None:
+        return last_res
+    raise last_exc
 
 
 @st.cache_data(ttl=86400 * 7, show_spinner=False)  # 고유번호 목록은 자주 안 바뀌므로 7일 캐싱
