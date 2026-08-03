@@ -1832,18 +1832,36 @@ def fetch_dart_corp_code_map():
     """
     DART 전체 기업 고유번호(corp_code) 목록을 받아
     {6자리 종목코드: {"corp_code": ..., "corp_name": ...}} 형태로 반환.
+
+    🔧 [디버그] 이 함수는 실패해도 조용히 {}를 반환하기 때문에, 앱 화면만 보면
+    "API 키가 잘못됐는지 / 아직 활성화 전인지 / 네트워크 문제인지" 구분이 불가능했다.
+    다른 데이터 소스(FnGuide/네이버)와 동일하게 _DEBUG_STORE에 실패 원인을 남겨서
+    render_disclosure_tab에서 expander로 확인할 수 있게 한다.
     """
+    debug_info = {"step": "start", "api_key_set": bool(get_dart_api_key())}
     api_key = get_dart_api_key()
     if not api_key:
+        debug_info["step"] = "no_api_key"
+        _DEBUG_STORE["_dart_corpmap_debug"] = debug_info
         return {}
 
     try:
         url = "https://opendart.fss.or.kr/api/corpCode.xml"
         res = requests.get(url, params={"crtfc_key": api_key}, timeout=10)
+        debug_info["http_status"] = res.status_code
+        debug_info["content_type"] = res.headers.get("Content-Type", "")
         res.raise_for_status()
 
-        with zipfile.ZipFile(BytesIO(res.content)) as zf:
-            xml_bytes = zf.read(zf.namelist()[0])
+        try:
+            with zipfile.ZipFile(BytesIO(res.content)) as zf:
+                xml_bytes = zf.read(zf.namelist()[0])
+        except zipfile.BadZipFile:
+            # DART가 zip 대신 에러 메시지(XML/텍스트)를 반환한 경우.
+            # 보통 키 미승인/오타/사용한도초과일 때 이 분기로 들어온다.
+            debug_info["step"] = "not_a_zip_file"
+            debug_info["raw_response_preview"] = res.content[:300].decode("utf-8", errors="replace")
+            _DEBUG_STORE["_dart_corpmap_debug"] = debug_info
+            return {}
 
         root = ET.fromstring(xml_bytes)
         result = {}
@@ -1856,8 +1874,16 @@ def fetch_dart_corp_code_map():
                     "corp_code": corp_code,
                     "corp_name": corp_name,
                 }
+
+        debug_info["step"] = "success"
+        debug_info["total_listed_companies"] = len(result)
+        debug_info["samsung_005930_found"] = "005930" in result
+        _DEBUG_STORE["_dart_corpmap_debug"] = debug_info
         return result
-    except Exception:
+    except Exception as e:
+        debug_info["step"] = "exception"
+        debug_info["exception"] = f"{type(e).__name__}: {e}"
+        _DEBUG_STORE["_dart_corpmap_debug"] = debug_info
         return {}
 
 
@@ -1867,15 +1893,24 @@ def fetch_disclosure_list(code, days=90, page_count=30):
     특정 종목코드의 최근 공시 목록을 반환.
     반환 형식: list of dict [{date, title, report_no, url, flag}, ...]
     """
+    debug_info = {"step": "start", "requested_code": code}
     api_key = get_dart_api_key()
     if not api_key:
+        debug_info["step"] = "no_api_key"
+        _DEBUG_STORE[f"_dart_disclosure_debug_{code}"] = debug_info
         return []
 
     code = normalize_kr_code(code)
     corp_map = fetch_dart_corp_code_map()
+    debug_info["corp_map_size"] = len(corp_map)
     corp_info = corp_map.get(code)
     if not corp_info:
+        debug_info["step"] = "corp_code_not_found_in_map"
+        _DEBUG_STORE[f"_dart_disclosure_debug_{code}"] = debug_info
         return []
+
+    debug_info["corp_name"] = corp_info.get("corp_name")
+    debug_info["corp_code"] = corp_info.get("corp_code")
 
     end_dt = datetime.datetime.now()
     start_dt = end_dt - datetime.timedelta(days=days)
@@ -1894,8 +1929,13 @@ def fetch_disclosure_list(code, days=90, page_count=30):
         }
         res = requests.get(url, params=params, timeout=8)
         data = res.json()
+        debug_info["dart_status"] = data.get("status")
+        debug_info["dart_message"] = data.get("message")
 
         if data.get("status") != "000":
+            # DART status 코드 참고: 013=조회된 데이터 없음, 020=사용한도초과, 800=시스템점검 등
+            debug_info["step"] = "dart_status_not_000"
+            _DEBUG_STORE[f"_dart_disclosure_debug_{code}"] = debug_info
             return []
 
         rows = []
@@ -1908,8 +1948,14 @@ def fetch_disclosure_list(code, days=90, page_count=30):
                 "url": f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={item.get('rcept_no', '')}",
                 "flag": _classify_disclosure(title),
             })
+        debug_info["step"] = "success"
+        debug_info["rows_found"] = len(rows)
+        _DEBUG_STORE[f"_dart_disclosure_debug_{code}"] = debug_info
         return rows
-    except Exception:
+    except Exception as e:
+        debug_info["step"] = "exception"
+        debug_info["exception"] = f"{type(e).__name__}: {e}"
+        _DEBUG_STORE[f"_dart_disclosure_debug_{code}"] = debug_info
         return []
 
 
@@ -1953,6 +1999,15 @@ def render_disclosure_tab(code):
 
     if not rows:
         st.caption("최근 공시 내역이 없거나 DART에 등록된 종목코드를 찾을 수 없습니다.")
+        norm_code = normalize_kr_code(code)
+        _corpmap_dbg = _DEBUG_STORE.get("_dart_corpmap_debug")
+        _disclosure_dbg = _DEBUG_STORE.get(f"_dart_disclosure_debug_{norm_code}")
+        if _corpmap_dbg or _disclosure_dbg:
+            with st.expander("🔧 디버그 정보 (공시 조회 실패 원인 확인용)"):
+                st.write("① 기업 고유번호(corp_code) 목록 조회 결과:")
+                st.json(_corpmap_dbg or {"info": "호출 안 됨"})
+                st.write("② 공시 목록 조회 결과:")
+                st.json(_disclosure_dbg or {"info": "호출 안 됨"})
         return
 
     flag_style = {
