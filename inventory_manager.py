@@ -1839,22 +1839,26 @@ def get_dart_api_key():
 #    교체 필요. 자체 프록시로 바꿀 때는 _DART_USE_PROXY = False로 내리고
 #    _dart_request() 내부에서 자체 프록시 URL을 호출하도록 바꾸면 된다.
 _DART_USE_PROXY = True
-# ── [폴백 체인] 무료 공개 프록시는 개별적으로 다운되는 경우가 잦아서(allorigins가
-# 내부 오류를 내는 사례 확인됨), 하나가 실패하면 다음 프록시로 자동 전환하도록
-# 여러 개를 순서대로 등록해둔다. 앞쪽이 우선순위가 높다.
+# ── [폴백 체인] 무료 공개 프록시는 개별적으로(때로는 동시에) 다운되는 경우가 흔해서
+# (allorigins 내부 오류, codetabs 521 다운 모두 실제로 관측됨), 하나가 실패하면
+# 다음 프록시로 자동 전환하도록 여러 개를 순서대로 등록해둔다. 앞쪽이 우선순위가 높다.
+# mode="query": 대상 URL을 인코딩해서 쿼리 파라미터로 붙이는 방식 (allorigins, codetabs, corsproxy.io)
+# mode="path" : 대상 URL을 인코딩하지 않고 경로 뒤에 그대로 이어붙이는 방식 (thingproxy)
 _DART_PROXY_BASES = [
-    "https://api.allorigins.win/raw?url=",
-    "https://api.codetabs.com/v1/proxy?quest=",
+    {"base": "https://api.allorigins.win/raw?url=", "mode": "query"},
+    {"base": "https://api.codetabs.com/v1/proxy?quest=", "mode": "query"},
+    {"base": "https://corsproxy.io/?url=", "mode": "query"},
+    {"base": "https://thingproxy.freeboard.io/fetch/", "mode": "path"},
 ]
 
 
 def _is_proxy_error_response(res):
     """DART가 아니라 프록시 서비스 자체가 낸 오류인지 판별.
 
-    allorigins 등 무료 프록시가 내부 오류일 때 HTTP 400대 상태코드와 함께
-    {"error": "...", "stack": "..."} 형태의 JSON을 반환하는 것을 확인했다.
-    이런 응답을 DART 응답으로 착각해 파싱하면 status=None으로 흘러가 버리므로,
-    여기서 미리 걸러내고 다음 프록시로 넘어간다.
+    - HTTP 4xx/5xx (예: codetabs가 죽었을 때 뜨는 521 "Web server is down" 에러 페이지)
+    - allorigins처럼 {"error": "...", "stack": "..."} 형태의 JSON 내부 오류
+    이런 응답을 DART 응답으로 착각해 그대로 파싱하면 status=None/json_decode_error로
+    흘러가 버리므로, 여기서 미리 걸러내고 다음 프록시로 넘어간다.
     """
     if res.status_code >= 400:
         return True
@@ -1874,25 +1878,34 @@ def _dart_request(url, params, timeout):
 
     _DART_USE_PROXY가 True면 등록된 CORS 프록시들을 순서대로 시도한다.
     한 프록시가 네트워크 예외를 던지거나 프록시 자체 내부 오류를 반환하면,
-    바로 실패 처리하지 않고 다음 프록시로 자동 폴백한다. 모든 프록시가
-    실패하면 마지막으로 받은 응답(또는 마지막 예외)을 그대로 반환/발생시켜
-    기존 호출부의 에러 처리 로직(디버그 로깅 등)이 그대로 동작하게 한다.
+    바로 실패 처리하지 않고 다음 프록시로 자동 폴백한다. 프록시 하나가 응답이
+    느리거나 멈춰있을 때 전체 요청이 timeout(기본 30초) x 프록시 개수만큼 오래
+    걸리지 않도록, 프록시별 시도는 더 짧은 attempt_timeout으로 빠르게 실패시키고
+    넘어간다. 모든 프록시가 실패하면 마지막으로 받은 응답(또는 마지막 예외)을
+    그대로 반환/발생시켜 기존 호출부의 에러 처리 로직(디버그 로깅 등)이 그대로
+    동작하게 한다.
     """
     if not _DART_USE_PROXY:
         return requests.get(url, params=params, timeout=timeout)
 
     full_target_url = f"{url}?{urllib.parse.urlencode(params)}"
+    attempt_timeout = min(timeout, 12)
     last_res = None
     last_exc = None
-    for proxy_base in _DART_PROXY_BASES:
-        proxied_url = proxy_base + urllib.parse.quote(full_target_url, safe="")
+    for proxy in _DART_PROXY_BASES:
+        if proxy["mode"] == "query":
+            proxied_url = proxy["base"] + urllib.parse.quote(full_target_url, safe="")
+        else:  # "path" 모드
+            proxied_url = proxy["base"] + full_target_url
         try:
-            res = requests.get(proxied_url, timeout=timeout)
+            res = requests.get(proxied_url, timeout=attempt_timeout)
         except Exception as e:
             last_exc = e
             continue
         last_res = res
         if not _is_proxy_error_response(res):
+            return res
+        # 이 프록시가 내부 오류를 낸 경우 → 다음 프록시로 계속 시도
             return res
         # 이 프록시가 내부 오류를 낸 경우 → 다음 프록시로 계속 시도
 
