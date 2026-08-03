@@ -2188,7 +2188,7 @@ def fetch_screener_data_generator():
         session.get("https://finance.naver.com/sise/sise_market_sum.naver", headers=headers, timeout=10)
     except Exception:
         pass  # 세션 워밍업 실패해도 쿠키 없이 계속 진행 (뒤에서 페이지별로 재시도됨)
-    time.sleep(0.5)
+    time.sleep(0.15)
 
     field_url = "https://finance.naver.com/sise/field_submit.naver?menu=market_sum&returnUrl=https%3A%2F%2Ffinance.naver.com%2Fsise%2Fsise_market_sum.naver&fieldIds=per&fieldIds=pbr&fieldIds=roe&fieldIds=dividend&fieldIds=property_total&fieldIds=debt_total&fieldIds=high52"
     try:
@@ -2374,6 +2374,66 @@ def fetch_live_price_change(code):
         return None, None, None
 
 HIGH52_PATH = "saved_high52_data.csv"
+HIGH52_META_PATH = "saved_high52_meta.json"
+
+
+def _parse_krx_date_series(raw_series):
+    """KRX CSV의 날짜/연월 컬럼을 최대한 유연하게 파싱해서 datetime Series로 반환.
+    '2025/07', '202507', '2025-07-01', '20250701' 등 KRX가 실제로 내려주는
+    여러 표기 형태를 다 커버하려고 두 가지 방식을 시도한다."""
+    s = raw_series.astype(str).str.strip()
+    parsed = pd.to_datetime(s, errors='coerce')
+    if parsed.notna().sum() < len(s) * 0.5:
+        digits = s.str.extract(r'(\d{4})\D?(\d{2})')
+        alt = pd.to_datetime(
+            digits[0] + '-' + digits[1] + '-01',
+            errors='coerce', format='%Y-%m-%d'
+        )
+        if alt.notna().sum() > parsed.notna().sum():
+            parsed = alt
+    return parsed
+
+
+def _extract_krx_date_range(h_df):
+    """업로드된 KRX CSV에서 날짜 컬럼을 찾아 'YYYY.MM ~ YYYY.MM' 형태로 반환.
+    날짜 컬럼을 못 찾거나 파싱에 실패하면 None (호출부에서 기간 표시만 생략)."""
+    date_col = find_col(h_df, ['년/월', '년월', '일자', '날짜', '기준일자', '기준월', '연월'])
+    if not date_col:
+        return None
+    parsed = _parse_krx_date_series(h_df[date_col])
+    parsed = parsed.dropna()
+    if parsed.empty:
+        return None
+    d_min, d_max = parsed.min(), parsed.max()
+    if d_min.strftime('%Y.%m') == d_max.strftime('%Y.%m'):
+        return d_min.strftime('%Y.%m')
+    return f"{d_min.strftime('%Y.%m')} ~ {d_max.strftime('%Y.%m')}"
+
+
+def save_high52_meta(market_info):
+    """market_info: {"코스피": {"date_range": "2025.07 ~ 2026.08", "count": 912}, ...}
+    업로드 직후 호출해서, 다음부터는 화면에 재진입해도(=재업로드 안 해도) 언제 갱신됐고
+    데이터 기간이 어디까지인지 계속 확인할 수 있도록 파일로 남긴다."""
+    meta = {
+        "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "markets": market_info,
+    }
+    try:
+        with open(HIGH52_META_PATH, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def load_high52_meta():
+    if not os.path.exists(HIGH52_META_PATH):
+        return None
+    try:
+        with open(HIGH52_META_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
 
 def merge_high52(df):
     if not os.path.exists(HIGH52_PATH): return df
@@ -2587,7 +2647,7 @@ def run_unified_market_scan():
 
     if val_df.empty:
         pb.progress(100, text="✨ 시장 스캔 완료!")
-        time.sleep(0.3)
+        time.sleep(0.15)
         pb.empty()
         st.warning("현재 시장 데이터 기준, 최소 요건(D급)을 통과한 종목조차 없습니다. 추천 종목 후보 산출은 건너뜁니다.")
         return True
@@ -2617,7 +2677,7 @@ def run_unified_market_scan():
             f.cancel()
 
     pb.progress(100, text="✨ 스캔 완료! (스크리너 + 추천 종목 데이터가 함께 갱신되었습니다)")
-    time.sleep(0.4)
+    time.sleep(0.15)
     pb.empty()
 
     if rows:
@@ -3314,6 +3374,24 @@ def update_user_password(username, new_password):
         return False
     st.error("일시적인 통신 오류로 비밀번호 변경에 실패했습니다. 잠시 후 다시 시도해주세요.")
     return False
+
+
+def is_admin_user():
+    """현재 로그인한 사용자가 관리자인지 확인.
+
+    secrets.toml에 다음처럼 등록해서 관리한다 (쉼표로 여러 명 등록 가능):
+        ADMIN_USERNAMES = "내아이디,다른관리자아이디"
+    등록돼 있지 않으면 아무도 관리자가 아닌 것으로 간주(보수적 기본값).
+    """
+    current = st.session_state.get("auth_user")
+    if not current:
+        return False
+    try:
+        raw = st.secrets.get("ADMIN_USERNAMES", "")
+    except Exception:
+        raw = ""
+    admin_ids = {u.strip() for u in str(raw).split(",") if u.strip()}
+    return current in admin_ids
 
 
 # =========================
@@ -6214,85 +6292,134 @@ KRX 정보데이터시스템의 **[12004] 종목 시세 추이(월/연도)** 화
 스크리너 · 추천종목 탭에 반영됩니다."""
             )
 
+    _h52_meta = load_high52_meta()
+    if _h52_meta and _h52_meta.get("markets"):
+        _mkt_meta = _h52_meta["markets"]
+        _parts = []
+        for _label in ["코스피", "코스닥"]:
+            _info = _mkt_meta.get(_label)
+            if _info:
+                _rng = _info.get("date_range") or "기간 확인 불가"
+                _cnt = _info.get("count", 0)
+                _parts.append(f"{_label} {_rng} ({_cnt:,}종목)")
+        if _parts:
+            st.markdown(
+                f"<div style='font-size:12.5px; color:#15803D; background:#F0FDF4; "
+                f"border:1px solid #BBF7D0; border-radius:6px; padding:8px 12px; margin:2px 0 14px 0;'>"
+                f"✅ 52주 고점 데이터 반영됨 — {' · '.join(_parts)}"
+                f"<br><span style='color:#65A30D;'>마지막 갱신: {_h52_meta.get('updated_at', '알 수 없음')}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+    else:
+        st.markdown(
+            "<div style='font-size:12.5px; color:#92400E; background:#FFFBEB; "
+            "border:1px solid #FDE68A; border-radius:6px; padding:8px 12px; margin:2px 0 14px 0;'>"
+            "⚠️ 아직 52주 고점 데이터가 업로드되지 않았습니다.</div>",
+            unsafe_allow_html=True,
+        )
+
     with st.expander("업로드하기", expanded=False):
-        st.markdown("""
-            <p style="font-size: 13px; color: #5D6475; margin-bottom: 6px;">
-                KRX 종목시세추이 CSV(약 1년치)를 <b>코스피 / 코스닥 각각 업로드</b>하면 종목코드 매칭 후
-                <b>52주고점</b>과 <b>고점대비(%)</b> 컬럼이 자동으로 추가됩니다.
-            </p>
-        """, unsafe_allow_html=True)
-        st.link_button("🔗 KRX [52주 최고/최저] 데이터 다운로드", "http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020104", use_container_width=True)
+        if not is_admin_user():
+            st.info("🔒 이 기능은 관리자 계정만 사용할 수 있습니다. 데이터 업데이트가 필요하면 관리자에게 요청해주세요.")
+        else:
+            st.markdown("""
+                <p style="font-size: 13px; color: #5D6475; margin-bottom: 6px;">
+                    KRX 종목시세추이 CSV(약 1년치)를 <b>코스피 / 코스닥 각각 업로드</b>하면 종목코드 매칭 후
+                    <b>52주고점</b>과 <b>고점대비(%)</b> 컬럼이 자동으로 추가됩니다.
+                </p>
+            """, unsafe_allow_html=True)
+            st.link_button("🔗 KRX [52주 최고/최저] 데이터 다운로드", "http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020104", use_container_width=True)
 
-        def process_high52_upload(uploaded_file, market_label):
-            try:
-                try: h_df = pd.read_csv(uploaded_file, encoding='cp949')
-                except:
-                    uploaded_file.seek(0)
-                    h_df = pd.read_csv(uploaded_file, encoding='utf-8')
-                h_df.columns = h_df.columns.str.strip()
-                h_code_col = find_col(h_df, ['종목코드', '단축코드'])
-                h_high_col = find_col(h_df, ['최고가(종가)', '최고가', '52주최고'])
+            def process_high52_upload(uploaded_file, market_label):
+                try:
+                    try: h_df = pd.read_csv(uploaded_file, encoding='cp949')
+                    except:
+                        uploaded_file.seek(0)
+                        h_df = pd.read_csv(uploaded_file, encoding='utf-8')
+                    h_df.columns = h_df.columns.str.strip()
+                    h_code_col = find_col(h_df, ['종목코드', '단축코드'])
+                    h_high_col = find_col(h_df, ['최고가(종가)', '최고가', '52주최고'])
                 
-                if not h_code_col or not h_high_col:
-                    st.error(f"[{market_label}] 종목코드 또는 최고가 컬럼을 찾을 수 초과니다. (감지된 컬럼: {list(h_df.columns)})")
-                    return None
-                h_df['종목코드'] = h_df[h_code_col].astype(str).str.zfill(6)
-                h_df[h_high_col] = pd.to_numeric(h_df[h_high_col].astype(str).str.replace(',', ''), errors='coerce')
-                return h_df.groupby('종목코드')[h_high_col].max()
-            except Exception as e:
-                st.error(f"[{market_label}] 파일 처리 오류: {e}")
-                return None
+                    if not h_code_col or not h_high_col:
+                        st.error(f"[{market_label}] 종목코드 또는 최고가 컬럼을 찾을 수 초과니다. (감지된 컬럼: {list(h_df.columns)})")
+                        return None, None
+                    date_range = _extract_krx_date_range(h_df)
+                    h_df['종목코드'] = h_df[h_code_col].astype(str).str.zfill(6)
+                    h_df[h_high_col] = pd.to_numeric(h_df[h_high_col].astype(str).str.replace(',', ''), errors='coerce')
+                    return h_df.groupby('종목코드')[h_high_col].max(), date_range
+                except Exception as e:
+                    st.error(f"[{market_label}] 파일 처리 오류: {e}")
+                    return None, None
 
-        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-        col_kp, col_kq = st.columns(2)
+            st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+            col_kp, col_kq = st.columns(2)
 
-        with col_kp:
-            st.markdown("<b style='font-size:13px;'>🔵 KOSPI (코스피) CSV</b>", unsafe_allow_html=True)
-            uploaded_kospi = st.file_uploader("코스피 파일 업로드", type=['csv'], key='high52_kospi')
+            with col_kp:
+                st.markdown("<b style='font-size:13px;'>🔵 KOSPI (코스피) CSV</b>", unsafe_allow_html=True)
+                uploaded_kospi = st.file_uploader("코스피 파일 업로드", type=['csv'], key='high52_kospi')
 
-        with col_kq:
-            st.markdown("<b style='font-size:13px;'>🟢 KOSDAQ (코스닥) CSV</b>", unsafe_allow_html=True)
-            uploaded_kosdaq = st.file_uploader("코스닥 파일 업로드", type=['csv'], key='high52_kosdaq')
+            with col_kq:
+                st.markdown("<b style='font-size:13px;'>🟢 KOSDAQ (코스닥) CSV</b>", unsafe_allow_html=True)
+                uploaded_kosdaq = st.file_uploader("코스닥 파일 업로드", type=['csv'], key='high52_kosdaq')
 
-        if uploaded_kospi or uploaded_kosdaq:
-            maps = {}
-            if uploaded_kospi:
-                m = process_high52_upload(uploaded_kospi, "코스피")
-                if m is not None: maps['코스피'] = m
-            if uploaded_kosdaq:
-                m = process_high52_upload(uploaded_kosdaq, "코스닥")
-                if m is not None: maps['코스닥'] = m
+            if uploaded_kospi or uploaded_kosdaq:
+                maps = {}
+                date_ranges = {}
+                if uploaded_kospi:
+                    m, dr = process_high52_upload(uploaded_kospi, "코스피")
+                    if m is not None:
+                        maps['코스피'] = m
+                        date_ranges['코스피'] = dr
+                if uploaded_kosdaq:
+                    m, dr = process_high52_upload(uploaded_kosdaq, "코스닥")
+                    if m is not None:
+                        maps['코스닥'] = m
+                        date_ranges['코스닥'] = dr
 
-            if maps:
-                combined_map = pd.concat(maps.values()).groupby(level=0).max()
-                base_df = load_screener_df()
-                if base_df.empty:
-                    st.error("먼저 실시간 스캔 데이터가 필요합니다. 위 [실시간 데이터 ⚡초고속 스캔 실행] 버튼을 눌러주세요.")
-                else:
-                    base_df['52주고점'] = base_df['종목코드'].map(combined_map)
-                    mask_h = (base_df['현재가'] > 0) & (base_df['52주고점'] > 0)
-                    base_df['고점대비(%)'] = None
-                    base_df.loc[mask_h, '고점대비(%)'] = (
-                        (base_df.loc[mask_h, '현재가'] - base_df.loc[mask_h, '52주고점'])
-                        / base_df.loc[mask_h, '52주고점']
-                    ) * 100
-                    base_cols = [c for c in base_df.columns if c not in ['52주고점', '고점대비(%)']]
-                    base_df[base_cols].to_csv(save_path, index=False, encoding='utf-8-sig')
-                    high52_save = base_df[['종목코드', '52주고점', '고점대비(%)']].dropna(subset=['52주고점'])
-                    high52_save.to_csv(HIGH52_PATH, index=False, encoding='utf-8-sig')
-                    st.session_state['shared_screener_df'] = base_df
-                    load_high52_map.clear()
-                    if 'reco_raw_data' in st.session_state:
-                        del st.session_state['reco_raw_data']
-                    if os.path.exists(RECO_PATH):
-                        try:
-                            os.remove(RECO_PATH)
-                        except Exception:
-                            pass
-                
-                    matched = int(mask_h.sum())
-                    markets_done = " + ".join(maps.keys())
-                    st.success(f"✅ 52주 고점 매칭 완료! ({markets_done}) {matched}종목 업데이트되었습니다. 추천 종목 탭에서 재스캔 시 새 데이터가 바로 적용됩니다.")
+                if maps:
+                    combined_map = pd.concat(maps.values()).groupby(level=0).max()
+                    base_df = load_screener_df()
+                    if base_df.empty:
+                        st.error("먼저 실시간 스캔 데이터가 필요합니다. 위 [실시간 데이터 ⚡초고속 스캔 실행] 버튼을 눌러주세요.")
+                    else:
+                        base_df['52주고점'] = base_df['종목코드'].map(combined_map)
+                        mask_h = (base_df['현재가'] > 0) & (base_df['52주고점'] > 0)
+                        base_df['고점대비(%)'] = None
+                        base_df.loc[mask_h, '고점대비(%)'] = (
+                            (base_df.loc[mask_h, '현재가'] - base_df.loc[mask_h, '52주고점'])
+                            / base_df.loc[mask_h, '52주고점']
+                        ) * 100
+                        base_cols = [c for c in base_df.columns if c not in ['52주고점', '고점대비(%)']]
+                        base_df[base_cols].to_csv(save_path, index=False, encoding='utf-8-sig')
+                        high52_save = base_df[['종목코드', '52주고점', '고점대비(%)']].dropna(subset=['52주고점'])
+                        high52_save.to_csv(HIGH52_PATH, index=False, encoding='utf-8-sig')
+                        st.session_state['shared_screener_df'] = base_df
+                        load_high52_map.clear()
+                        if 'reco_raw_data' in st.session_state:
+                            del st.session_state['reco_raw_data']
+                        if os.path.exists(RECO_PATH):
+                            try:
+                                os.remove(RECO_PATH)
+                            except Exception:
+                                pass
+
+                        # 시장별(코스피/코스닥) 매칭 건수 + 업로드 CSV의 데이터 기간을 메타로 저장
+                        # → 스크리너 탭에 재진입할 때마다(재업로드 없이도) 최신화 여부를 바로 확인 가능
+                        market_info = {}
+                        for label, m in maps.items():
+                            matched_count = int(base_df.loc[
+                                mask_h & base_df['종목코드'].isin(m.index), '종목코드'
+                            ].nunique())
+                            market_info[label] = {
+                                "date_range": date_ranges.get(label),
+                                "count": matched_count,
+                            }
+                        save_high52_meta(market_info)
+
+                        matched = int(mask_h.sum())
+                        markets_done = " + ".join(maps.keys())
+                        st.success(f"✅ 52주 고점 매칭 완료! ({markets_done}) {matched}종목 업데이트되었습니다. 추천 종목 탭에서 재스캔 시 새 데이터가 바로 적용됩니다.")
 
     df = load_screener_df()
 
