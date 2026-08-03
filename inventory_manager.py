@@ -1816,6 +1816,7 @@ def fetch_financial_data(code):
 # =========================
 import zipfile
 import xml.etree.ElementTree as ET
+import urllib.parse
 from io import BytesIO
 
 
@@ -1825,6 +1826,29 @@ def get_dart_api_key():
         return st.secrets["DART_API_KEY"]
     except Exception:
         return os.environ.get("DART_API_KEY", "")
+
+
+# ── ⚠️ [임시 우회] Streamlit Cloud → opendart.fss.or.kr 직접 연결 차단 우회용 프록시 ──
+# 문제: Streamlit Community Cloud(해외 서버)에서 opendart.fss.or.kr로 직접 요청하면
+# 매번 ConnectTimeout이 발생한다(로컬 PC에서는 정상 동작 확인됨). DART가 국내 IP가
+# 아닌 요청을 막고 있는 것으로 추정됨.
+# 임시 조치: 무료 공개 CORS 프록시(allorigins)를 경유해서 우회한다.
+# ⚠️ 이 경로를 쓰면 DART API 키가 제3자 서버(allorigins.win)에 노출된다.
+#    임시 검증/우회용으로만 사용할 것 — 장기적으로는 자체 국내 리전 프록시 서버로
+#    교체 필요. 자체 프록시로 바꿀 때는 _DART_USE_PROXY = False로 내리고
+#    _dart_request() 내부에서 자체 프록시 URL을 호출하도록 바꾸면 된다.
+_DART_USE_PROXY = True
+_DART_PROXY_BASE = "https://api.allorigins.win/raw?url="
+
+
+def _dart_request(url, params, timeout):
+    """DART API에 요청을 보낸다. _DART_USE_PROXY가 True면 CORS 프록시를 경유한다."""
+    if _DART_USE_PROXY:
+        full_target_url = f"{url}?{urllib.parse.urlencode(params)}"
+        proxied_url = _DART_PROXY_BASE + urllib.parse.quote(full_target_url, safe="")
+        return requests.get(proxied_url, timeout=timeout)
+    else:
+        return requests.get(url, params=params, timeout=timeout)
 
 
 @st.cache_data(ttl=86400 * 7, show_spinner=False)  # 고유번호 목록은 자주 안 바뀌므로 7일 캐싱
@@ -1847,8 +1871,9 @@ def fetch_dart_corp_code_map():
 
     try:
         url = "https://opendart.fss.or.kr/api/corpCode.xml"
-        res = requests.get(url, params={"crtfc_key": api_key}, timeout=10)
+        res = _dart_request(url, {"crtfc_key": api_key}, timeout=15)
         debug_info["http_status"] = res.status_code
+        debug_info["via_proxy"] = _DART_USE_PROXY
         debug_info["content_type"] = res.headers.get("Content-Type", "")
         res.raise_for_status()
 
@@ -1927,10 +1952,11 @@ def fetch_disclosure_list(code, days=90, page_count=30):
             "sort": "date",
             "sort_mth": "desc",
         }
-        res = requests.get(url, params=params, timeout=8)
+        res = _dart_request(url, params, timeout=15)
         data = res.json()
         debug_info["dart_status"] = data.get("status")
         debug_info["dart_message"] = data.get("message")
+        debug_info["via_proxy"] = _DART_USE_PROXY
 
         if data.get("status") != "000":
             # DART status 코드 참고: 013=조회된 데이터 없음, 020=사용한도초과, 800=시스템점검 등
