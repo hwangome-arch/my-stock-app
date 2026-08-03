@@ -1845,9 +1845,13 @@ _DART_USE_PROXY = True
 # mode="query": 대상 URL을 인코딩해서 쿼리 파라미터로 붙이는 방식 (allorigins, codetabs, corsproxy.io)
 # mode="path" : 대상 URL을 인코딩하지 않고 경로 뒤에 그대로 이어붙이는 방식 (thingproxy)
 _DART_PROXY_BASES = [
+    # ⭐ 1순위: 자체 Cloudflare Worker 프록시 (배포 완료, 가장 안정적).
+    {"base": "https://restless-fog-8937.daimon8835.workers.dev/?url=", "mode": "query"},
     {"base": "https://api.allorigins.win/raw?url=", "mode": "query"},
     {"base": "https://api.codetabs.com/v1/proxy?quest=", "mode": "query"},
-    {"base": "https://corsproxy.io/?url=", "mode": "query"},
+    # ❌ corsproxy.io는 제외함: 무료 플랜이 서버→서버 요청 자체를 막아놔서
+    # ("Server-side requests are not allowed on your plan") 여기서는 구조적으로
+    # 항상 실패한다. 일시적 장애가 아니라 이 조합에서는 영구적으로 못 쓰는 서비스.
     {"base": "https://thingproxy.freeboard.io/fetch/", "mode": "path"},
 ]
 
