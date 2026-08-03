@@ -1895,7 +1895,7 @@ def fetch_dart_corp_code_map():
 
     try:
         url = "https://opendart.fss.or.kr/api/corpCode.xml"
-        res = _dart_request(url, {"crtfc_key": api_key}, timeout=15)
+        res = _dart_request(url, {"crtfc_key": api_key}, timeout=30)
         debug_info["http_status"] = res.status_code
         debug_info["via_proxy"] = _DART_USE_PROXY
         debug_info["content_type"] = res.headers.get("Content-Type", "")
@@ -1976,7 +1976,7 @@ def fetch_disclosure_list(code, days=90, page_count=30):
             "sort": "date",
             "sort_mth": "desc",
         }
-        res = _dart_request(url, params, timeout=15)
+        res = _dart_request(url, params, timeout=30)
         data = res.json()
         debug_info["dart_status"] = data.get("status")
         debug_info["dart_message"] = data.get("message")
