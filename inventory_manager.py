@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import socket
 import threading
 import concurrent.futures
@@ -1857,12 +1858,35 @@ def fetch_dart_corp_code_map():
     DART 전체 기업 고유번호(corp_code) 목록을 받아
     {6자리 종목코드: {"corp_code": ..., "corp_name": ...}} 형태로 반환.
 
-    🔧 [디버그] 이 함수는 실패해도 조용히 {}를 반환하기 때문에, 앱 화면만 보면
-    "API 키가 잘못됐는지 / 아직 활성화 전인지 / 네트워크 문제인지" 구분이 불가능했다.
-    다른 데이터 소스(FnGuide/네이버)와 동일하게 _DEBUG_STORE에 실패 원인을 남겨서
-    render_disclosure_tab에서 expander로 확인할 수 있게 한다.
+    ⚠️ [정적 파일 우선] Streamlit Cloud에서 opendart.fss.or.kr의 corpCode.xml
+    (3.5MB zip)을 실시간으로 받아오는 게 네트워크 제약(느림/차단/프록시 불안정)으로
+    어려워서, generate_dart_corp_map.py로 로컬에서 미리 생성해둔
+    dart_corp_code_map.json을 같은 폴더에서 우선 읽는다. 이 매핑은 자주 안 바뀌므로
+    실시간 API 호출이 굳이 필요 없다. 파일이 없거나 읽기 실패하면 기존처럼
+    API에서 직접(또는 프록시로) 받아오는 것으로 폴백한다.
+
+    🔧 [디버그] 실패 원인을 _DEBUG_STORE에 남겨서 render_disclosure_tab에서
+    expander로 확인할 수 있게 한다.
     """
     debug_info = {"step": "start", "api_key_set": bool(get_dart_api_key())}
+
+    # ── 1순위: 로컬 정적 파일 ─────────────────────────────────────────
+    static_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dart_corp_code_map.json")
+    try:
+        if os.path.exists(static_path):
+            with open(static_path, "r", encoding="utf-8") as f:
+                result = json.load(f)
+            debug_info["step"] = "success_from_static_file"
+            debug_info["source"] = static_path
+            debug_info["total_listed_companies"] = len(result)
+            debug_info["samsung_005930_found"] = "005930" in result
+            _DEBUG_STORE["_dart_corpmap_debug"] = debug_info
+            return result
+    except Exception as e:
+        debug_info["static_file_error"] = f"{type(e).__name__}: {e}"
+        # 정적 파일 읽기가 실패하면 아래 API 폴백으로 계속 진행
+
+    # ── 2순위: API에서 직접(또는 프록시로) 받아오기 (기존 로직 폴백) ──────
     api_key = get_dart_api_key()
     if not api_key:
         debug_info["step"] = "no_api_key"
@@ -1900,7 +1924,7 @@ def fetch_dart_corp_code_map():
                     "corp_name": corp_name,
                 }
 
-        debug_info["step"] = "success"
+        debug_info["step"] = "success_from_api"
         debug_info["total_listed_companies"] = len(result)
         debug_info["samsung_005930_found"] = "005930" in result
         _DEBUG_STORE["_dart_corpmap_debug"] = debug_info
