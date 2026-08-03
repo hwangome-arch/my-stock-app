@@ -1977,12 +1977,21 @@ def fetch_disclosure_list(code, days=90, page_count=30):
             "sort_mth": "desc",
         }
         res = _dart_request(url, params, timeout=30)
-        data = res.json()
-        debug_info["dart_status"] = data.get("status")
-        debug_info["dart_message"] = data.get("message")
+        debug_info["http_status"] = res.status_code
+        debug_info["raw_response_preview"] = res.text[:500]
+        try:
+            data = res.json()
+        except Exception as e:
+            debug_info["step"] = "json_decode_error"
+            debug_info["json_decode_exception"] = f"{type(e).__name__}: {e}"
+            _DEBUG_STORE[f"_dart_disclosure_debug_{code}"] = debug_info
+            return []
+        debug_info["response_keys"] = list(data.keys()) if isinstance(data, dict) else f"not_a_dict: {type(data).__name__}"
+        debug_info["dart_status"] = data.get("status") if isinstance(data, dict) else None
+        debug_info["dart_message"] = data.get("message") if isinstance(data, dict) else None
         debug_info["via_proxy"] = _DART_USE_PROXY
 
-        if data.get("status") != "000":
+        if not isinstance(data, dict) or data.get("status") != "000":
             # DART status 코드 참고: 013=조회된 데이터 없음, 020=사용한도초과, 800=시스템점검 등
             debug_info["step"] = "dart_status_not_000"
             _DEBUG_STORE[f"_dart_disclosure_debug_{code}"] = debug_info
