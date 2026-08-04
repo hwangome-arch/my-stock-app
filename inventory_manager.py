@@ -3894,12 +3894,16 @@ def render_watchlist():
         return code, price_info, spark, ai_score, hit_prob_html
 
     if _wl_codes:
-        # [클릭할 때마다 초기화되는 문제 대응 + 종목 추가 시 전체 재조회 방지]
-        # 종목 코드 전체를 하나의 캐시 키로 묶으면(예전 방식), 종목을 하나 추가/삭제하기만
-        # 해도 코드 목록 자체가 달라져서 캐시가 통째로 무효화되고 이미 갖고 있던 종목들까지
-        # 전부 다시 조회하게 된다. 그래서 종목 하나하나를 독립적으로 캐싱한다 —
-        # 이미 조회해서 55초가 안 지난 종목은 그대로 재사용하고, 새로 추가됐거나
-        # 신선도가 지난 종목만 골라서 조회한다.
+        # [저장 버튼 클릭 시 멈춤 대응] render_async_multi의 자동 폴링(0.4초 간격)은
+        # 아직 안 끝났으면 st.fragment 안에서 st.rerun()으로 "전체 페이지"를 강제로
+        # 다시 실행시킨다. 이건 신규 종목처럼 보여줄 데이터가 아예 없을 때는 필요하지만,
+        # 이미 캐시된 값이 있고 그저 55초 신선도가 지나서 "슬쩍 갱신"하는 상황에서까지
+        # 이 강제 리런 루프를 돌리면, 하필 사용자가 매수가/수량을 입력하고 저장 버튼을
+        # 누르는 시점과 겹칠 때 백그라운드 강제 리런이 진행 중인 상호작용과 부딪혀
+        # 세션이 꼬이는 것으로 추정되는 멈춤 현상이 있었다.
+        # 그래서 "완전히 처음 보는 신규 종목"만 어쩔 수 없이 기다리게 하고,
+        # "이미 있던 종목의 신선도 갱신"은 대기/강제리런 없이 조용히 백그라운드에
+        # 던져두기만 했다가 다음 자연스러운 재실행(다른 버튼 클릭 등) 때 반영한다.
         _WL_PREFETCH_REFRESH_SEC = 55
         _wl_cache_key = "_wl_prefetch_cache"
         _wl_cache = st.session_state.setdefault(
@@ -3907,21 +3911,17 @@ def render_watchlist():
             {"results": {"price": {}, "spark": {}, "ai": {}, "hitprob": {}}, "ts": {}},
         )
         _wl_now = time.time()
-        _wl_needed_codes = [
+
+        _wl_missing_codes = [c for c in _wl_codes if c not in _wl_cache["ts"]]
+        _wl_stale_codes = [
             c for c in _wl_codes
-            if c not in _wl_cache["ts"] or (_wl_now - _wl_cache["ts"][c]) >= _WL_PREFETCH_REFRESH_SEC
+            if c not in _wl_missing_codes and (_wl_now - _wl_cache["ts"][c]) >= _WL_PREFETCH_REFRESH_SEC
         ]
 
-        if _wl_needed_codes:
-            # [탭 이동 멈춤 대응] 예전에는 as_completed(timeout=8)로 메인 스크립트가 최대 8초를
-            # 한 번에 몰아서 기다렸다 — 그동안은 Streamlit이 사이드바 탭 클릭 같은 새 상호작용을
-            # 전혀 받아줄 수 없어서 멈춘 것처럼 보였다. 대시보드와 동일하게 render_async_multi로
-            # 바꿔서, 0.4초 폴링 간격 사이사이에 Streamlit이 새 클릭을 정상적으로 받아줄 수 있게
-            # 한다. 조회 대상도 "필요한 종목만"으로 줄여서(_wl_needed_codes) 매번 전체를 다시
-            # 조회하지 않는다.
+        if _wl_missing_codes:
             def _submit_wl_jobs():
                 _wl_executor = get_shared_executor()
-                return {c: _wl_executor.submit(_wl_prefetch_one, c) for c in _wl_needed_codes}
+                return {c: _wl_executor.submit(_wl_prefetch_one, c) for c in _wl_missing_codes}
 
             def _collect_wl_results(futures):
                 out = {"price": {}, "spark": {}, "ai": {}, "hitprob": {}}
@@ -3935,28 +3935,51 @@ def render_watchlist():
                             if _hp_html:
                                 out["hitprob"][_c] = _hp_html
                         except Exception:
-                            pass  # 아직 안 끝났거나 실패 → 그냥 비워둠(다음 새로고침 때 캐시로 채워짐)
+                            pass
                 return out
 
             _wl_new_results, _wl_ready = render_async_multi(
-                job_key="watchlist_prefetch",
+                job_key="watchlist_prefetch_new",
                 submit_fn=_submit_wl_jobs,
                 collect_fn=_collect_wl_results,
                 default_result={"price": {}, "spark": {}, "ai": {}, "hitprob": {}},
-                spinner_text=f"관심종목 {len(_wl_needed_codes)}건 시세 조회 중...",
+                spinner_text=f"신규 관심종목 {len(_wl_missing_codes)}건 시세 조회 중...",
                 overall_timeout=15,
             )
             if not _wl_ready:
-                return  # 아직 로딩 중 — 폴링 프래그먼트가 알아서 이어가고, 이후 렌더링은 건너뜀
+                return  # 처음 보는 종목이라 보여줄 게 없을 때만 대기
 
-            # 조회 결과를 기존 캐시에 병합. 실패/타임아웃난 종목도 시도한 시각을 남겨둬서
-            # 다음 새로고침 때마다 매번 재시도하지 않고 신선도 주기(55초)만큼 쉬었다가 재시도한다.
             for _key in ("price", "spark", "ai", "hitprob"):
                 _wl_cache["results"][_key].update(_wl_new_results.get(_key, {}))
-            for _c in _wl_needed_codes:
+            for _c in _wl_missing_codes:
                 _wl_cache["ts"][_c] = _wl_now
 
-        # 관심종목에서 삭제된 종목의 캐시는 더 이상 쓸모없으니 정리(메모리 누적 방지)
+        if _wl_stale_codes:
+            # 강제 리런/대기 없이 그냥 백그라운드에 던져만 놓는다.
+            _wl_bg_jobs = st.session_state.setdefault("_wl_bg_jobs", {})
+            _wl_executor = get_shared_executor()
+            for c in _wl_stale_codes:
+                if c not in _wl_bg_jobs or _wl_bg_jobs[c].done():
+                    _wl_bg_jobs[c] = _wl_executor.submit(_wl_prefetch_one, c)
+
+        # 예전에 백그라운드로 던져놓은 작업 중 그 사이 끝난 게 있으면 조용히 캐시에 반영
+        _wl_bg_jobs = st.session_state.get("_wl_bg_jobs", {})
+        for c in list(_wl_bg_jobs.keys()):
+            f = _wl_bg_jobs[c]
+            if f.done():
+                try:
+                    _c, _price_info, _spark, _ai_score, _hp_html = f.result(timeout=0.1)
+                    _wl_cache["results"]["price"][_c] = _price_info
+                    _wl_cache["results"]["spark"][_c] = _spark
+                    _wl_cache["results"]["ai"][_c] = _ai_score
+                    if _hp_html:
+                        _wl_cache["results"]["hitprob"][_c] = _hp_html
+                    _wl_cache["ts"][_c] = time.time()
+                except Exception:
+                    pass
+                del _wl_bg_jobs[c]
+
+        # 관심종목에서 삭제된 종목의 캐시/백그라운드 작업은 정리(메모리 누적 방지)
         _wl_codes_set = set(_wl_codes)
         for _key in ("price", "spark", "ai", "hitprob"):
             _wl_cache["results"][_key] = {
