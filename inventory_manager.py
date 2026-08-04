@@ -34,11 +34,31 @@ socket.setdefaulttimeout(20)
 # 워커 스레드)에서 접근하면 Streamlit 공식 문서상 지원되지 않으며, 실제로 이로 인해
 # 스크립트 실행이 멈춰버리는(무한 로딩) 문제가 발생했다. 단순 dict 대입/조회는 CPython의
 # GIL 덕분에 스레드에서 안전하므로, 디버그용 정보는 여기로 옮겨서 저장한다.
-_DEBUG_STORE = {}
+#
+# ── [버그 수정: 매 rerun마다 내용이 사라지던 문제] ──────────────────────────
+# Streamlit은 상호작용(버튼 클릭, st.rerun() 등)이 있을 때마다 스크립트 파일 전체를
+# 처음부터 다시 실행한다. 그런데 이 저장소가 그냥 `_DEBUG_STORE = {}`처럼 모듈
+# 최상단에 평범한 전역 변수로 선언되어 있으면, 이 줄 자체도 매 rerun마다 다시
+# 실행되어 매번 새로운 빈 딕셔너리로 초기화된다. 반면 백그라운드 스레드는 자신이
+# "시작될 때(=이전 rerun)의 객체"를 계속 붙잡고 쓰기 때문에, 다음 rerun에서 메인
+# 스크립트가 읽는 객체와 실제로 값이 쓰이는 객체가 서로 다른 개체가 되어버려
+# 값이 항상 비어 보이는 문제가 있었다. 아래 스레드풀들(get_shared_executor 등)과
+# 동일하게 @st.cache_resource로 감싸서, 이 줄이 매 rerun마다 다시 실행되더라도
+# 항상 "동일한" 딕셔너리 객체를 돌려받도록 고친다.
+@st.cache_resource(show_spinner=False)
+def _get_debug_store():
+    return {}
+
+_DEBUG_STORE = _get_debug_store()
 
 # 스크리너 데이터도 관심종목 병렬조회(백그라운드 스레드)에서 읽히므로, session_state와
 # 별개로 여기에도 항상 최신값을 미러링해두고 스레드에서는 이쪽만 사용한다.
-_SCREENER_DF_CACHE = {"df": None}
+# (마찬가지로 매 rerun마다 리셋되지 않도록 @st.cache_resource로 유지한다.)
+@st.cache_resource(show_spinner=False)
+def _get_screener_df_cache():
+    return {"df": None}
+
+_SCREENER_DF_CACHE = _get_screener_df_cache()
 
 def _set_shared_screener_df(df):
     """스크리너 결과 df를 session_state(메인 스레드용)와 모듈 캐시(백그라운드 스레드용)에 동시 반영."""
@@ -540,7 +560,15 @@ def fetch_market_index_table():
 # 돌려준다. _SPARKLINE_LAST_GOOD은 모듈 전역(프로세스 생존 기간 동안 유지)이라,
 # 한 번이라도 성공한 적이 있는 종목은 이후 일시적 실패가 있어도 차트가 비어 보이지
 # 않는다(값이 하루 정도 오래된 것일 수는 있지만, 완전히 비는 것보다 훨씬 낫다).
-_SPARKLINE_LAST_GOOD = {}
+#
+# ── [버그 수정] ── 이것도 평범한 전역 변수였다면 위 _DEBUG_STORE와 똑같은 이유로
+# 매 rerun마다 초기화되어 "마지막으로 성공했던 값"을 절대 기억하지 못했을 것이다.
+# @st.cache_resource로 감싸 프로세스 생존 기간 동안 동일 객체가 유지되게 한다.
+@st.cache_resource(show_spinner=False)
+def _get_sparkline_last_good_store():
+    return {}
+
+_SPARKLINE_LAST_GOOD = _get_sparkline_last_good_store()
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_sparkline_data():
@@ -3052,7 +3080,24 @@ def run_unified_market_scan():
 # session_state 최종 반영(shared_screener_df / reco_raw_data)도 반드시 메인
 # 스레드에서만 수행해서, "백그라운드 스레드가 세션 상태를 직접 확정 짓는" 상황을
 # 피한다.
-_SCAN_JOB_STATE = {}
+# ── [핵심 버그 수정] "스캔 실패: 알 수 없음, 0%"가 항상 뜨던 진짜 원인 ──────────
+# 이전에는 이 줄이 `_SCAN_JOB_STATE = {}`처럼 평범한 전역 변수였다. Streamlit은
+# 상호작용이 있을 때마다(특히 아래 폴링 프래그먼트가 거는 st.rerun()마다) 스크립트
+# 파일 전체를 처음부터 다시 실행하므로, 이 대입문도 매번 다시 실행되어 매 rerun마다
+# _SCAN_JOB_STATE가 새로운 빈 딕셔너리로 초기화되고 있었다. 반면 백그라운드에서
+# 실제로 스캔을 수행하는 _unified_scan_worker 스레드는 자신이 "시작될 때(=이전
+# rerun)의" _SCAN_JOB_STATE 객체에 진행률을 계속 기록한다. 그 결과 폴링 후 다시
+# 실행된 스크립트가 state = _SCAN_JOB_STATE.get(job_id, {})를 읽으면, 실제 진행
+# 상황이 담긴 "옛날" 객체가 아니라 방금 새로 만들어진 "텅 빈" 객체를 보게 되어
+# 항상 text="알 수 없음", pct=0으로 나타났다 — 스캔이 실제로는 잘 진행/완료되고
+# 있었어도 절대 그 사실을 알 수 없었던 것.
+# 해결: 아래 스레드풀들과 동일하게 @st.cache_resource로 감싸서, 이 줄이 매
+# rerun마다 다시 실행되더라도 항상 "동일한" 딕셔너리 객체를 반환하게 한다.
+@st.cache_resource(show_spinner=False)
+def _get_scan_job_state_store():
+    return {}
+
+_SCAN_JOB_STATE = _get_scan_job_state_store()
 
 def _unified_scan_worker(job_id):
     """run_unified_market_scan()의 1+2단계 로직을 그대로 수행하되, st.* 위젯 호출
@@ -6024,9 +6069,22 @@ def render_dashboard():
             # 하나씩 주기적 fragment를 만들기 때문에, 코스피/코스닥을 동시에 열어두면
             # 그 순간 2개가 동시에 돌면서 이 버그에 걸린다. 그래서 한 번에 하나만
             # 열리도록 강제한다(새로 여는 시장 외에는 전부 닫음).
+            #
+            # ── [토글 반복 클릭 시 멈춤 추가 대응] ────────────────────────────
+            # 위 대응만으로는 "아직 데이터 로딩(=백그라운드 job)이 안 끝난 시장을
+            # 닫자마자 바로 다른 시장을 여는" 경우가 막히지 않는다. 이때 방금 닫은
+            # 시장의 render_async_multi job이 st.session_state["_bg_jobs"]에 그대로
+            # 남아있으면, 그 job에 딸려있던 주기적(run_every) 프래그먼트가 화면에서는
+            # 사라졌는데도 백엔드에서는 계속 스케줄링되고 있을 수 있다. 여기서 곧바로
+            # 다른 시장을 열어 새 프래그먼트가 또 뜨면 두 프래그먼트가 겹치면서
+            # 위와 동일한 Streamlit 버그(#10719)에 걸릴 수 있다. 그래서 시장을 닫는
+            # 순간, 그 시장에 대해 진행 중이던 백그라운드 job을 명시적으로 지워서
+            # "닫혔는데 뒤에서 계속 폴링되는" 상태 자체를 없앤다.
             opening = not is_open
             if opening:
                 st.session_state["investor_open"] = {k: False for k in st.session_state["investor_open"]}
+            else:
+                st.session_state.get("_bg_jobs", {}).pop(f"investor_monthly_{market_key}", None)
             st.session_state["investor_open"][market_key] = opening
             st.rerun()
 
