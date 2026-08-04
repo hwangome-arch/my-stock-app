@@ -5323,8 +5323,7 @@ def render_dashboard():
         </div>
         """
         with col:
-            import streamlit.components.v1 as components
-            components.html(html, height=230 if show_volume else 210, scrolling=False)
+            st.markdown(html, unsafe_allow_html=True)
 
     c1, c2, c3 = st.columns(3)
     for col, key in [(c1, "kospi"), (c2, "kosdaq"), (c3, "nasdaq")]:
