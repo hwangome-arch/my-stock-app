@@ -45,20 +45,11 @@ socket.setdefaulttimeout(20)
 # 값이 항상 비어 보이는 문제가 있었다. 아래 스레드풀들(get_shared_executor 등)과
 # 동일하게 @st.cache_resource로 감싸서, 이 줄이 매 rerun마다 다시 실행되더라도
 # 항상 "동일한" 딕셔너리 객체를 돌려받도록 고친다.
-@st.cache_resource(show_spinner=False)
-def _get_debug_store():
-    return {}
-
-_DEBUG_STORE = _get_debug_store()
-
-# 스크리너 데이터도 관심종목 병렬조회(백그라운드 스레드)에서 읽히므로, session_state와
-# 별개로 여기에도 항상 최신값을 미러링해두고 스레드에서는 이쪽만 사용한다.
-# (마찬가지로 매 rerun마다 리셋되지 않도록 @st.cache_resource로 유지한다.)
-@st.cache_resource(show_spinner=False)
-def _get_screener_df_cache():
-    return {"df": None}
-
-_SCREENER_DF_CACHE = _get_screener_df_cache()
+# (⚠️ @st.cache_resource는 streamlit을 import한 뒤에만 쓸 수 있어서, 실제 정의는
+# 파일 아래쪽 "import streamlit as st" 직후로 옮겨뒀다. 여기서는 아직 st가 없으므로
+# 나중에 정의될 함수 이름만 미리 적어둔다.)
+_DEBUG_STORE = None       # ← import streamlit as st 직후 블록에서 실제 값 채움
+_SCREENER_DF_CACHE = None  # ← import streamlit as st 직후 블록에서 실제 값 채움
 
 def _set_shared_screener_df(df):
     """스크리너 결과 df를 session_state(메인 스레드용)와 모듈 캐시(백그라운드 스레드용)에 동시 반영."""
@@ -94,6 +85,21 @@ import requests
 import gspread
 from google.oauth2.service_account import Credentials
 from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+
+# ── _DEBUG_STORE / _SCREENER_DF_CACHE 실제 정의 (st 임포트 직후) ──────────────
+# 위쪽(파일 상단)에서 이 두 이름을 None으로 미리 선언해둔 이유는 @st.cache_resource가
+# streamlit이 import된 뒤에만 쓸 수 있기 때문이다. 여기서 진짜 값을 채운다.
+@st.cache_resource(show_spinner=False)
+def _get_debug_store():
+    return {}
+
+_DEBUG_STORE = _get_debug_store()
+
+@st.cache_resource(show_spinner=False)
+def _get_screener_df_cache():
+    return {"df": None}
+
+_SCREENER_DF_CACHE = _get_screener_df_cache()
 
 # =========================
 # ⚙️ 페이지 설정
