@@ -16,6 +16,7 @@ import hmac
 import base64
 import difflib
 import numpy as np
+import faulthandler
 from itertools import zip_longest
 
 # ── 전역 소켓 기본 타임아웃 ──────────────────────────────────────────────
@@ -184,7 +185,18 @@ def _run_with_ctx(_ctx, _fn, *_args, **_kwargs):
         add_script_run_ctx(threading.current_thread(), _ctx)
     except Exception:
         pass  # 컨텍스트를 못 붙이더라도 최소한 함수 자체는 시도한다
-    return _fn(*_args, **_kwargs)
+    try:
+        return _fn(*_args, **_kwargs)
+    finally:
+        # ── [워커 스레드 재사용 시 컨텍스트 오염 방지] ──────────────────────
+        # 공유/오케스트레이션 풀은 워커 스레드를 계속 재사용한다. 작업이 끝난
+        # 뒤 이 스레드에 심어둔 ScriptRunContext를 지우지 않으면, 다음번에 이
+        # 물리 스레드가 (완전히 다른 세션의) 다른 작업을 처리할 때 방금 세션의
+        # 컨텍스트가 그대로 남아있게 되어 세션 간 상태가 뒤섞일 수 있다.
+        try:
+            add_script_run_ctx(threading.current_thread(), None)
+        except Exception:
+            pass
 
 def submit_with_ctx(executor, fn, *args, **kwargs):
     """executor.submit(fn, *args, **kwargs)와 동일하지만, 호출 시점(메인 스레드)의
@@ -5426,13 +5438,31 @@ def main():
     # "진입"만 있고 "완료"가 없는 페이지가 바로 멈춘 지점이다.
     print(f"[DEBUG {datetime.datetime.now().strftime('%H:%M:%S')}] 페이지 진입: {selected}", file=sys.stderr, flush=True)
 
-    if   selected == "대시보드 홈":      render_dashboard()
-    elif selected == "추천 종목":        render_recommendations()
-    elif selected == "종목 스크리너":    render_screener()
-    elif selected == "기업 재무 분석":   render_fnguide()
-    elif selected == "실시간 배당 순위": render_dividend()
-    elif selected == "관심종목":         render_watchlist()
-    elif selected == "비밀번호 변경":     render_change_password()
+    # ── [멈춤 원인 확정 진단용 워치독] ──────────────────────────────────────
+    # 지금까지 건 timeout들(overall_timeout/per_result_timeout 등)은 전부
+    # "우리가 짠 코드 안에서" future.result()를 기다리는 지점에만 적용된다.
+    # 만약 진짜 원인이 그 바깥(예: 서드파티 라이브러리 내부의 진짜 소켓/락 대기,
+    # 혹은 우리가 미처 못 찾은 다른 블로킹 지점)에 있다면 그 어떤 timeout도
+    # 안 걸리고 이 스크립트 실행 자체가 영원히 멈춘다 — 지금 겪고 있는 정확히
+    # 그 증상이다.
+    # faulthandler.dump_traceback_later(45)는 "지금부터 45초 안에 아래
+    # cancel이 호출되지 않으면, 그 순간 살아있는 모든 스레드의 파이썬 콜스택을
+    # 통째로 stderr(=Streamlit Cloud 로그)에 자동으로 찍어라"는 뜻이다. 정상
+    # 렌더링은 몇 초~십몇 초 안에 끝나므로 cancel이 항상 먼저 호출되어 아무
+    # 일도 안 일어나지만, 다음에 또 멈추면 그 순간 정확히 어느 스레드가 어느
+    # 파일의 몇 번째 줄에서 멎어있는지가 로그에 그대로 남는다. 이러면 더 이상
+    # 추측 없이 정확한 원인을 특정할 수 있다.
+    faulthandler.dump_traceback_later(45, file=sys.stderr)
+    try:
+        if   selected == "대시보드 홈":      render_dashboard()
+        elif selected == "추천 종목":        render_recommendations()
+        elif selected == "종목 스크리너":    render_screener()
+        elif selected == "기업 재무 분석":   render_fnguide()
+        elif selected == "실시간 배당 순위": render_dividend()
+        elif selected == "관심종목":         render_watchlist()
+        elif selected == "비밀번호 변경":     render_change_password()
+    finally:
+        faulthandler.cancel_dump_traceback_later()
 
     print(f"[DEBUG {datetime.datetime.now().strftime('%H:%M:%S')}] 페이지 렌더링 완료: {selected}", file=sys.stderr, flush=True)
 
