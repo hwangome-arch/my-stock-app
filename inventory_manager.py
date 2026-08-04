@@ -2169,24 +2169,69 @@ def render_disclosure_tab(code):
         )
 
 
+def _parse_screener_page_html(res_text, sosok):
+    """네이버 시가총액 페이지 HTML → DataFrame 파싱 (fetch_page_data와 마지막페이지
+    사전탐지(_detect_screener_last_page)가 이 로직을 공유하기 위해 분리함)."""
+    code_matches = re.findall(r'href="/item/main\.naver\?code=(\d+)" class="tltle">(.*?)</a>', res_text)
+    name_to_code = {name: code for code, name in code_matches}
+    if not name_to_code: return None
+    dfs = pd.read_html(io.StringIO(res_text))
+    main_df = next((df for df in dfs if '종목명' in df.columns), None)
+    if main_df is None or main_df.empty: return None
+    main_df = main_df.dropna(subset=['종목명'])
+    main_df['종목코드'] = main_df['종목명'].map(name_to_code)
+    main_df['시장'] = "코스피" if sosok == 0 else "코스닥"
+    return main_df
+
+def _extract_screener_current_page(res_text):
+    """[진단용] 응답 HTML의 네이버 페이지네이터에서 실제 활성 페이지 번호를 추출한다.
+    네이버가 마크업을 바꿔서 못 찾으면 None을 반환하며, 호출부는 이 경우 검증을
+    건너뛴다 — 이 추출 실패 자체가 정상 페이지를 실패로 오판시키지 않도록 하기 위함."""
+    m = re.search(r'<td class="on">\s*<a[^>]*>(\d+)</a>', res_text)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    return None
+
 def fetch_page_data(sosok, page, headers, cookies):
     time.sleep(random.uniform(0.1, 0.3))
     url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
     try:
         res = requests.get(url, headers=headers, cookies=cookies, timeout=10)
         res.encoding = res.apparent_encoding or 'euc-kr'
-        code_matches = re.findall(r'href="/item/main\.naver\?code=(\d+)" class="tltle">(.*?)</a>', res.text)
-        name_to_code = {name: code for code, name in code_matches}
-        if not name_to_code: return None
-        dfs = pd.read_html(io.StringIO(res.text))
-        main_df = next((df for df in dfs if '종목명' in df.columns), None)
-        if main_df is None or main_df.empty: return None
-        main_df = main_df.dropna(subset=['종목명'])
-        main_df['종목코드'] = main_df['종목명'].map(name_to_code)
-        main_df['시장'] = "코스피" if sosok == 0 else "코스닥"
-        return main_df
+
+        # ── [진단] "실패"로는 안 잡히지만 요청한 페이지와 다른 내용이 온 경우 로그 ──
+        # 레이트리밋/캐시 등으로 엉뚱한 페이지 내용이 200 OK로 오면 기존 로직은 이걸
+        # 그냥 "성공"으로 처리해서 조용히 병합해버린다. 아직 이 불일치를 페이지 실패로
+        # 처리하지는 않는다(마크업 추정에 대한 확신이 100%가 아니라, 이 체크 때문에
+        # 정상 페이지까지 실패 처리되는 부작용을 피하려는 것). 우선 얼마나 자주
+        # 발생하는지 _DEBUG_STORE에 쌓아서 다음 스캔에서 확인한다.
+        returned_page = _extract_screener_current_page(res.text)
+        if returned_page is not None and returned_page != page:
+            mismatches = _DEBUG_STORE.setdefault("_screener_page_mismatches", [])
+            mismatches.append({
+                "요청": (sosok, page),
+                "실제응답페이지": returned_page,
+                "시각": datetime.datetime.now().strftime("%H:%M:%S"),
+            })
+
+        return _parse_screener_page_html(res.text, sosok)
     except Exception:
         return None
+
+def _detect_screener_last_page(res_text, default_last=44):
+    """네이버 페이지네이터의 '맨뒤' 링크(class="pgRR")에서 실제 마지막 페이지 번호를
+    추출한다. 못 찾으면 기존 하드코딩 값(default_last)으로 안전하게 폴백한다.
+    → 존재하지 않는 페이지를 매 스캔마다 요청/재시도하다 '실패'로 잡히는 것을 방지."""
+    m = re.search(r'class="pgRR"[^>]*href="[^"]*[?&]page=(\d+)"', res_text)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            pass
+    return default_last
 
 def fetch_screener_data_generator():
     session = requests.Session()
@@ -2208,11 +2253,36 @@ def fetch_screener_data_generator():
     except Exception:
         pass
     cookies = session.cookies.get_dict()
-    
+
+    # ── 실제 마지막 페이지 자동 감지 (하드코딩 44 제거) ──────────────────────
+    # 문제: range(1, 45)로 코스피/코스닥 둘 다 무조건 44페이지까지 요청했는데,
+    # 코스닥은 상장 종목 수가 더 적어서 실제 마지막 페이지가 44보다 작을 수 있다.
+    # 존재하지 않는 페이지는 매 스캔마다 3라운드 재시도를 다 태우고도 결국
+    # "실패 페이지"로 잡혀 사용자에게 경고가 뜬다(코스닥 뒤쪽 페이지들이 항상
+    # 실패 목록에 나오는 원인 중 하나로 추정). 각 시장의 1페이지 응답에서
+    # 페이지네이터의 '맨뒤' 링크를 읽어 실제 마지막 페이지를 구하고, 그 이후
+    # 페이지는 애초에 요청 목록에서 제외한다. 이미 받은 1페이지 응답은 버리지
+    # 않고 그대로 결과에 재사용해 중복 요청도 줄인다.
     all_data = []
-    urls = [(sosok, page) for sosok in [0, 1] for page in range(1, 45)]
-    total_pages = len(urls)
-    completed = 0
+    last_page_by_sosok = {}
+    for sosok in [0, 1]:
+        try:
+            res0 = requests.get(
+                f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page=1",
+                headers=headers, cookies=cookies, timeout=10
+            )
+            res0.encoding = res0.apparent_encoding or 'euc-kr'
+            last_page_by_sosok[sosok] = _detect_screener_last_page(res0.text, default_last=44)
+            df0 = _parse_screener_page_html(res0.text, sosok)
+            if df0 is not None and not df0.empty:
+                all_data.append(df0)
+        except Exception:
+            last_page_by_sosok[sosok] = 44
+        _DEBUG_STORE[f"_screener_last_page_sosok{sosok}"] = last_page_by_sosok[sosok]
+
+    urls = [(sosok, page) for sosok in [0, 1] for page in range(2, last_page_by_sosok[sosok] + 1)]
+    total_pages = len(urls) + 2  # 이미 처리한 1페이지 2건 포함
+    completed = 2  # 위에서 이미 처리한 1페이지 2건
     failed_pages = []
 
     _executor = get_shared_executor()
@@ -2330,6 +2400,17 @@ def fetch_screener_data_generator():
         final_df = final_df[['종목코드', '종목명', '시장', '현재가', '52주고점', '고점대비(%)', 'PER', 'PBR', '배당수익률', 'ROE', '부채비율']]
     else:
         final_df = final_df[['종목코드', '종목명', '시장', '현재가', 'PER', 'PBR', '배당수익률', 'ROE', '부채비율']]
+
+    # ── 병합 후 종목코드 중복 검사 ────────────────────────────────────────────
+    # "실패 페이지" 경고에는 안 잡히지만, 레이트리밋/캐시 등으로 엉뚱한 페이지
+    # 내용이 200 OK로 와서 조용히 병합되는 경우 여기서 중복 종목코드로 드러난다.
+    # 이 경우 전에는 아무 경고 없이 중복 행이 그대로 섞여 들어갔다.
+    dup_mask = final_df['종목코드'].duplicated(keep=False)
+    if dup_mask.any():
+        st.session_state["_screener_dup_codes"] = sorted(final_df.loc[dup_mask, '종목코드'].dropna().unique().tolist())
+    else:
+        st.session_state["_screener_dup_codes"] = []
+
     yield final_df, 100
 
 @st.cache_data(ttl=3600*12, show_spinner=False)
@@ -2636,6 +2717,15 @@ def run_unified_market_scan():
         if st.session_state.get("_screener_missing_pages"):
             st.warning(f"⚠️ 이번 스캔에서 끝내 실패한 페이지 (시장구분, 페이지번호): {st.session_state['_screener_missing_pages']}")
             st.session_state["_screener_missing_pages"] = []
+
+        if st.session_state.get("_screener_dup_codes"):
+            st.warning(f"⚠️ 병합 결과에서 중복된 종목코드 발견 (엉뚱한 페이지 내용이 섞였을 가능성): {st.session_state['_screener_dup_codes']}")
+            st.session_state["_screener_dup_codes"] = []
+
+        _page_mismatches = _DEBUG_STORE.get("_screener_page_mismatches")
+        if _page_mismatches:
+            st.warning(f"⚠️ 요청한 페이지와 실제 응답 페이지가 다른 경우 {len(_page_mismatches)}건 발견: {_page_mismatches}")
+            _DEBUG_STORE["_screener_page_mismatches"] = []
     except Exception as e:
         pb.empty()
         st.error(f"스캔 실패: {e}")
