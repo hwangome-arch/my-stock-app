@@ -5660,7 +5660,32 @@ def render_dashboard():
         """, unsafe_allow_html=True)
 
         if is_open:
-            monthly = run_with_progress(f"{market_label} 월별 수급 불러오는 중...", fetch_investor_trend_monthly, sosok)
+            # ── [수급 토글 반복 클릭 시 완전 멈춤 수정] ──────────────────────────
+            # 이전에는 run_with_progress(...)가 fetch_investor_trend_monthly를
+            # "메인 스크립트 스레드에서 직접" 동기 호출했다. 이 함수는 내부적으로
+            # 22개의 날짜별 요청을 공유 스레드풀에 던지고 최대 12초간 그 자리에서
+            # 기다리는데, 그동안 Streamlit은 새로운 클릭(토글을 또 누르는 것 포함)을
+            # 전혀 받아줄 수 없다. 사용자가 토글을 반복해서 누르면 이런 블로킹 호출이
+            # 계속 쌓이고, 공유 풀(32개 워커)에 요청이 몰리면서 결국 앱 전체가
+            # 완전히 멈추는(리붓 전에는 회복 안 되는) 상태로 이어졌다.
+            # 해결: 대시보드의 다른 카드들과 동일하게 render_async_multi(논블로킹 +
+            # 짧은 간격 폴링) 패턴으로 바꾼다. 이러면 메인 스레드가 절대 막히지 않고,
+            # 토글을 반복해서 눌러도 매번 즉시 다음 상호작용을 받을 수 있다. 또한
+            # render_async_multi에 이미 추가된 "짧은 재사용 캐시" 덕분에, 같은 시장을
+            # 짧은 시간 안에 다시 열었다 닫았다 해도 재조회 자체가 일어나지 않는다.
+            _monthly_result, _monthly_ready = render_async_multi(
+                job_key=f"investor_monthly_{market_key}",
+                submit_fn=lambda: {"monthly": get_orchestration_executor().submit(fetch_investor_trend_monthly, sosok)},
+                collect_fn=lambda futures: {
+                    "monthly": (futures["monthly"].result(timeout=0.1) if futures["monthly"].done() else None) or []
+                },
+                default_result={"monthly": []},
+                spinner_text=f"{market_label} 월별 수급 불러오는 중...",
+                overall_timeout=15,
+            )
+            if not _monthly_ready:
+                return  # 폴링 프래그먼트가 알아서 이어감 — 준비되면 자동으로 다시 그림
+            monthly = _monthly_result.get("monthly") or []
             if not monthly:
                 st.markdown(
                     '<div style="border:1px solid #E2E8F0;border-top:none;border-radius:0 0 8px 8px;'
