@@ -3175,7 +3175,20 @@ def run_unified_market_scan_async(job_key="unified_scan", overall_timeout=150):
     state = _SCAN_JOB_STATE.get(job_id, {})
     timed_out = (time.time() - job["started_at"]) > overall_timeout
 
-    if not future.done() and not timed_out:
+    # ── [진행률 정체 감지] "죽지도 않고 응답도 안 오는" 소켓/DNS 행에 대한 방어 ──
+    # concurrent.futures 타임아웃은 대부분의 경우를 막아주지만, DNS 조회 단계처럼
+    # socket.setdefaulttimeout도 적용 안 되는 지점에서 워커 스레드 자체가 통째로
+    # 멎어버리면 future.done()이 영원히 False로 남는다. 이런 경우 overall_timeout까지
+    # 마냥 기다리게 두는 대신, "진행률(%)이 stall_threshold초 이상 전혀 안 바뀌면"
+    # 조기에 중단하고 다음 재시도를 위해 스레드풀 자체를 새로 갈아치운다.
+    _now = time.time()
+    _last_pct = state.get("pct", 0)
+    if state.get("_last_pct_seen") != _last_pct:
+        state["_last_pct_seen"] = _last_pct
+        state["_last_pct_change_at"] = _now
+    _stalled = (_now - state.get("_last_pct_change_at", job["started_at"])) > 50
+
+    if not future.done() and not timed_out and not _stalled:
         st.progress(min(state.get("pct", 0), 100), text=f"🔄 {state.get('text', '스캔 중...')}")
 
         @st.fragment(run_every=0.4)
@@ -3183,7 +3196,8 @@ def run_unified_market_scan_async(job_key="unified_scan", overall_timeout=150):
             faulthandler.dump_traceback_later(8, file=sys.stderr)
             try:
                 _st = _SCAN_JOB_STATE.get(job_id, {})
-                if future.done() or (time.time() - job["started_at"]) > overall_timeout:
+                _stall_now = (time.time() - _st.get("_last_pct_change_at", job["started_at"])) > 50
+                if future.done() or (time.time() - job["started_at"]) > overall_timeout or _stall_now:
                     st.rerun()
                 else:
                     st.info(f"🔄 {_st.get('text', '스캔 중...')} ({min(_st.get('pct', 0), 100)}%)")
@@ -3192,11 +3206,41 @@ def run_unified_market_scan_async(job_key="unified_scan", overall_timeout=150):
         _poll()
         return
 
-    # 완료(또는 상한 시간 초과) → 결과를 메인 스레드에서 session_state에 반영
+    # 완료(또는 상한 시간 초과 / 진행률 정체) → 결과를 메인 스레드에서 session_state에 반영
     jobs.pop(job_key, None)
 
     if not state.get("success"):
-        st.error(state.get("error") or "스캔 실패: 시간이 너무 오래 걸려 중단했습니다. 다시 시도해주세요.")
+        _last_text = state.get("text", "알 수 없음")
+        _last_pct = state.get("pct", 0)
+        if _stalled and not future.done():
+            # ── [죽은 스레드풀 강제 교체] ────────────────────────────────
+            # 이 future가 물려있던 풀(공유풀/오케스트레이션풀)에 진짜 좀비 스레드가
+            # 있다는 뜻이므로, 다음 재시도가 또 같은 죽은 풀 뒤에 줄서지 않도록
+            # 지금 바로 두 풀을 전부 새것으로 교체해둔다. 이미 던져진 이 future
+            # 자체는 복구가 안 되지만(파이썬은 실행 중 스레드를 못 죽인다), 최소한
+            # "다시 시도" 버튼을 눌렀을 때는 깨끗한 풀에서 새로 시작하게 된다.
+            print(f"[SCAN STALL {datetime.datetime.now().strftime('%H:%M:%S')}] "
+                  f"진행률이 50초 이상 멈춰 강제 종료 후 스레드풀 교체 "
+                  f"(마지막 상태: {_last_text} {_last_pct}%)", file=sys.stderr, flush=True)
+            try:
+                _get_shared_executor_raw.clear()
+            except Exception:
+                pass
+            try:
+                _get_orchestration_executor_raw.clear()
+            except Exception:
+                pass
+            future.cancel()
+            st.error(
+                f"스캔 실패: 진행이 멈춰서 중단했습니다 (마지막 상태: {_last_text}, {_last_pct}%). "
+                "네이버 서버 응답이 완전히 끊긴 것으로 보입니다. 스레드풀을 새로 정리했으니 "
+                "잠시 후 다시 시도해주세요."
+            )
+        else:
+            st.error(
+                state.get("error")
+                or f"스캔 실패: 시간이 너무 오래 걸려 중단했습니다 (마지막 상태: {_last_text}, {_last_pct}%). 다시 시도해주세요."
+            )
         _SCAN_JOB_STATE.pop(job_id, None)
         return
 
