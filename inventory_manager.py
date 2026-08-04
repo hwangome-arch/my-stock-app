@@ -467,7 +467,7 @@ def fetch_investor_trend():
             today = datetime.datetime.now().strftime("%Y%m%d")
             url = f"https://finance.naver.com/sise/investorDealTrendDay.naver?bizdate={today}&sosok={sosok}"
             res = requests.get(url, headers=headers, timeout=7)
-            res.encoding = res.apparent_encoding or 'euc-kr'
+            res.encoding = 'euc-kr'  # 네이버금융(finance.naver.com)은 euc-kr 고정 — apparent_encoding 추측에 의존하면 특정 종목명 바이트 패턴에서 오탐(예: 키릴 계열로 오판)해 파싱이 깨진다
             dfs = pd.read_html(io.StringIO(res.text))
 
             target = None
@@ -530,7 +530,7 @@ def fetch_investor_trend_monthly(sosok):
             date_str = date.strftime("%Y%m%d")
             url = f"https://finance.naver.com/sise/investorDealTrendDay.naver?bizdate={date_str}&sosok={sosok}"
             res = requests.get(url, headers=headers, timeout=5)
-            res.encoding = res.apparent_encoding or 'euc-kr'
+            res.encoding = 'euc-kr'  # 네이버금융(finance.naver.com)은 euc-kr 고정 — apparent_encoding 추측에 의존하면 특정 종목명 바이트 패턴에서 오탐(예: 키릴 계열로 오판)해 파싱이 깨진다
             dfs = pd.read_html(io.StringIO(res.text))
             target = None
             for df in dfs:
@@ -797,7 +797,7 @@ def fetch_dividend_ranking():
         try:
             _dbg(f"페이지 {page} 요청 시작")
             res = requests.get(f"{base_url}?page={page}", headers=headers, timeout=10)
-            res.encoding = res.apparent_encoding or 'euc-kr'
+            res.encoding = 'euc-kr'  # 네이버금융(finance.naver.com)은 euc-kr 고정 — apparent_encoding 추측에 의존하면 특정 종목명 바이트 패턴에서 오탐(예: 키릴 계열로 오판)해 파싱이 깨진다
             _dbg(f"페이지 {page} 응답 수신, read_html 파싱 시작")
 
             # ✅ 정규식으로 href 속성에서 종목코드 추출 후 딕셔너리에 저장
@@ -822,7 +822,7 @@ def fetch_dividend_ranking():
         import re as _re
         _dbg("첫 페이지(전체 페이지 수 파악) 요청 시작")
         res0 = requests.get(base_url, headers=headers, timeout=10)
-        res0.encoding = res0.apparent_encoding or 'euc-kr'
+        res0.encoding = 'euc-kr'  # 네이버금융 euc-kr 고정
         _dbg("첫 페이지 응답 수신")
         page_nums = [int(p) for p in _re.findall(r'[?&]page=(\d+)', res0.text)]
         max_page = max(page_nums) if page_nums else 10
@@ -1046,8 +1046,10 @@ def fetch_company_info_fnguide(code):
         res = requests.get(nv_url, headers=naver_headers, timeout=6)
         name_debug["status"] = res.status_code
         # 네이버금융 응답 인코딩이 euc-kr 고정이 아닌 경우가 생겨 자동감지로 변경
-        # (apparent_encoding이 실패하면 euc-kr을 최후 fallback으로 사용)
-        res.encoding = res.apparent_encoding or 'euc-kr'
+        # 네이버금융 응답 인코딩이 euc-kr 고정이 아닌 경우가 생겨 자동감지로 변경했었으나,
+        # apparent_encoding 자동감지가 오히려 특정 종목명에서 오탐(키릴 계열 등으로 오판)해
+        # 파싱이 깨지는 문제가 확인되어 다시 euc-kr 고정으로 되돌림.
+        res.encoding = 'euc-kr'  # 네이버금융(finance.naver.com)은 euc-kr 고정 — apparent_encoding 추측에 의존하면 특정 종목명 바이트 패턴에서 오탐(예: 키릴 계열로 오판)해 파싱이 깨진다
         html = res.text
         name_debug["resp_len"] = len(html)
 
@@ -1191,7 +1193,7 @@ def fetch_investor_trend_by_code(code, days=20):
             debug["last_url"] = url
             res = requests.get(url, headers=naver_headers, timeout=8)
             debug["last_status"] = res.status_code
-            res.encoding = res.apparent_encoding or 'euc-kr'
+            res.encoding = 'euc-kr'  # 네이버금융(finance.naver.com)은 euc-kr 고정 — apparent_encoding 추측에 의존하면 특정 종목명 바이트 패턴에서 오탐(예: 키릴 계열로 오판)해 파싱이 깨진다
             debug["resp_len"] = len(res.text)
             debug["resp_snippet"] = res.text[:300]
 
@@ -2201,7 +2203,7 @@ def fetch_page_data(sosok, page, headers, cookies):
     url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
     try:
         res = requests.get(url, headers=headers, cookies=cookies, timeout=10)
-        res.encoding = res.apparent_encoding or 'euc-kr'
+        res.encoding = 'euc-kr'  # 네이버금융(finance.naver.com)은 euc-kr 고정 — apparent_encoding 추측에 의존하면 특정 종목명 바이트 패턴에서 오탐(예: 키릴 계열로 오판)해 파싱이 깨진다
 
         # ── [진단] 상태코드가 200이 아닌 경우 원인 기록 ──────────────────────
         # 기존에는 status_code를 전혀 확인하지 않아서, 네이버가 429/403/503 등을
@@ -2281,7 +2283,7 @@ def _detect_screener_last_page_by_probe(headers, cookies, sosok, default_last=44
             f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page=999",
             headers=headers, cookies=cookies, timeout=10
         )
-        res.encoding = res.apparent_encoding or 'euc-kr'
+        res.encoding = 'euc-kr'  # 네이버금융(finance.naver.com)은 euc-kr 고정 — apparent_encoding 추측에 의존하면 특정 종목명 바이트 패턴에서 오탐(예: 키릴 계열로 오판)해 파싱이 깨진다
         detected = _extract_screener_current_page(res.text)
         return detected if detected else default_last
     except Exception:
@@ -2327,7 +2329,7 @@ def fetch_screener_data_generator():
                 f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page=1",
                 headers=headers, cookies=cookies, timeout=10
             )
-            res0.encoding = res0.apparent_encoding or 'euc-kr'
+            res0.encoding = 'euc-kr'  # 네이버금융 euc-kr 고정
             df0 = _parse_screener_page_html(res0.text, sosok)
             if df0 is not None and not df0.empty:
                 all_data.append(df0)
@@ -6837,7 +6839,7 @@ def search_naver_stock_by_name(query):
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         url = f"https://finance.naver.com/search/searchList.naver?query={requests.utils.quote(query)}"
         res = requests.get(url, headers=headers, timeout=6)
-        res.encoding = res.apparent_encoding or 'euc-kr'
+        res.encoding = 'euc-kr'  # 네이버금융(finance.naver.com)은 euc-kr 고정 — apparent_encoding 추측에 의존하면 특정 종목명 바이트 패턴에서 오탐(예: 키릴 계열로 오판)해 파싱이 깨진다
         matches = re.findall(r'href="/item/main\.naver\?code=(\d+)"[^>]*>\s*([^<]+?)\s*</a>', res.text)
         seen = {}
         for code, name in matches:
