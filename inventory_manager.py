@@ -6018,7 +6018,16 @@ def render_dashboard():
         st.markdown(row_html, unsafe_allow_html=True)
         
         if st.button(" ", key=f"inv_btn_{market_key}", use_container_width=True, help=f"{market_label} 수급 추이 토글하기"):
-            st.session_state["investor_open"][market_key] = not is_open
+            # ── [Streamlit 확인된 버그(#10719) 회피] 동시에 여러 개의 run_every
+            # fragment가 뜨면 "fragment does not exist anymore" 에러와 함께 세션이
+            # 멈추는 게 Streamlit 팀이 인정한 버그다. render_async_multi가 토글마다
+            # 하나씩 주기적 fragment를 만들기 때문에, 코스피/코스닥을 동시에 열어두면
+            # 그 순간 2개가 동시에 돌면서 이 버그에 걸린다. 그래서 한 번에 하나만
+            # 열리도록 강제한다(새로 여는 시장 외에는 전부 닫음).
+            opening = not is_open
+            if opening:
+                st.session_state["investor_open"] = {k: False for k in st.session_state["investor_open"]}
+            st.session_state["investor_open"][market_key] = opening
             st.rerun()
 
         br_css = "8px 8px 0 0" if is_open else "8px"
@@ -6045,7 +6054,20 @@ def render_dashboard():
         </style>
         """, unsafe_allow_html=True)
 
-        if is_open:
+        if is_open and "unified_scan" in st.session_state.get("_scan_jobs", {}):
+            # ── [Streamlit 확인된 버그(#10719) 회피] 전체 시장 스캔이 진행 중이면
+            # 이미 스캔 진행률용 주기적(run_every) fragment가 하나 떠 있는 상태다.
+            # 여기서 또 render_async_multi가 두 번째 주기적 fragment를 만들면,
+            # 두 fragment의 자동 재실행 타이밍이 겹치면서 "does not exist anymore"
+            # 에러와 함께 세션이 멈추는 Streamlit 자체 버그(github.com/streamlit/
+            # streamlit/issues/10719)에 걸린다. 그래서 스캔이 끝날 때까지는 이
+            # 수급 추이 조회 자체를 잠깐 미뤄둔다(스캔이 끝나면 자연히 다시 열림).
+            st.markdown(
+                '<div style="border:1px solid #E2E8F0;border-top:none;border-radius:0 0 8px 8px;'
+                'padding:12px 16px;font-size:12px;color:#94A3B8;">⏳ 전체 시장 스캔이 진행 중이라 잠시 후 표시됩니다.</div>',
+                unsafe_allow_html=True
+            )
+        elif is_open:
             # ── [수급 토글 반복 클릭 시 완전 멈춤 수정] ──────────────────────────
             # 이전에는 run_with_progress(...)가 fetch_investor_trend_monthly를
             # "메인 스크립트 스레드에서 직접" 동기 호출했다. 이 함수는 내부적으로
