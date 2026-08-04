@@ -5323,7 +5323,16 @@ def render_dashboard():
         </div>
         """
         with col:
-            st.markdown(html, unsafe_allow_html=True)
+            # [환율/금/원유 카드에서 HTML 태그가 그대로 텍스트로 보이는 문제 수정]
+            # show_volume=False일 때 vol_html이 빈 문자열이 되는데, 위 f-string은
+            # Python 소스 들여쓰기가 그대로 살아있는 여러 줄짜리 문자열이라
+            # "공백만 있는 줄"(빈 vol_html 자리) 바로 다음에 "4칸 이상 들여쓰인 줄"
+            # (chart_section)이 오게 된다. 마크다운 문법에서는 이 조합을 "들여쓰기
+            # 코드블록"으로 해석해서, 그 아래 HTML을 그대로 이스케이프된 텍스트로
+            # 보여준다(정확히 스크린샷에서 보인 증상). 줄마다 앞뒤 공백을 지워서
+            # 이 오인식 자체가 안 일어나게 한다.
+            html_stripped = "\n".join(line.strip() for line in html.split("\n"))
+            st.markdown(html_stripped, unsafe_allow_html=True)
 
     c1, c2, c3 = st.columns(3)
     for col, key in [(c1, "kospi"), (c2, "kosdaq"), (c3, "nasdaq")]:
