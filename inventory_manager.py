@@ -471,7 +471,6 @@ def fetch_market_index_table():
             # 받아온 가격/등락률까지 통째로 날아가지 않도록 완전히 분리된 try/except로
             # 감싼다. 실패하면 그냥 거래량만 N/A로 남고 카드의 나머지는 정상 표시된다.
             vol = "N/A"
-            vol_debug = {}
             try:
                 vol_headers = {**headers, "Referer": "https://m.stock.naver.com/"}
                 vol_url = f"https://polling.finance.naver.com/api/realtime/domestic/index/{meta['symbol']}"
@@ -479,31 +478,16 @@ def fetch_market_index_table():
                 vpayload = vres.json()
                 vdatas = vpayload.get("datas") or []
                 vdata = vdatas[0] if vdatas else {}
-                # ── [진짜 원인] ────────────────────────────────────────────────
-                # accumulatedTradingVolume 필드는 "301,494천주"처럼 "천주" 단위
-                # 접미사가 붙은 표시용 문자열이라, 콤마만 지우고 int()로 바꾸면
-                # 한글이 남아있어 매번 예외가 나고 있었다(그래서 항상 N/A).
-                # 응답에 접미사 없는 순수 숫자 문자열인 accumulatedTradingVolumeRaw
-                # 필드가 별도로 있으므로 이걸 우선 사용한다.
+                # accumulatedTradingVolume 필드는 "301,494천주"처럼 "천주" 단위 접미사가
+                # 붙은 표시용 문자열이라, 접미사 없는 순수 숫자 문자열인
+                # accumulatedTradingVolumeRaw 필드를 우선 사용한다.
                 vol_raw = vdata.get("accumulatedTradingVolumeRaw", None)
                 if vol_raw in (None, ""):
-                    # Raw 필드가 없는 경우를 대비해, 표시용 필드에서 숫자만 남기는 방식으로 대체
                     vol_raw = re.sub(r"[^\d]", "", str(vdata.get("accumulatedTradingVolume", ""))) or None
                 if vol_raw:
                     vol = f"{int(str(vol_raw).replace(',', '')):,}"
-                vol_debug = {
-                    "url": vol_url,
-                    "http_status": vres.status_code,
-                    "accumulatedTradingVolume_raw": vol_raw,
-                    "response_keys": list(vdata.keys()) if isinstance(vdata, dict) else type(vdata).__name__,
-                    "response_full": vdata,
-                }
-            except Exception as ve:
-                vol_debug = {
-                    "예외": f"{type(ve).__name__}: {ve}",
-                    "response_text_head": (vres.text[:300] if 'vres' in locals() else None),
-                }
-            _DEBUG_STORE[f"_index_vol_debug_{key}"] = vol_debug
+            except Exception:
+                pass  # 실패하면 거래량만 N/A로 남고 카드의 나머지(가격/등락률)는 정상 표시
 
             return key, {
                 "name": meta["name"], "subtitle": meta["subtitle"],
@@ -514,7 +498,6 @@ def fetch_market_index_table():
                 "volume": vol,
             }
         except Exception as e:
-            _DEBUG_STORE[f"_index_vol_debug_{key}"] = {"예외(가격 조회 자체 실패)": f"{type(e).__name__}: {e}"}
             return key, None
 
     def get_yfinance(key, meta):
@@ -6002,17 +5985,7 @@ def render_dashboard():
     for col, key in [(c1, "kospi"), (c2, "kosdaq"), (c3, "nasdaq")]:
         render_index_card(col, key, indices.get(key, {}), show_volume=True)
 
-    # ── [진단] 코스피/코스닥 거래량 N/A 원인 확인용 ──────────────────────────
-    # 나스닥은 yfinance 경로라 거래량이 항상 하드코딩 N/A(별개 이슈)이고, 코스피/
-    # 코스닥은 네이버 API에서 실제 값이 와야 정상이다. N/A로 빠진 경우 원본 응답을
-    # 펼쳐서 바로 확인할 수 있게 한다.
-    _vol_debug_items = {
-        k: _DEBUG_STORE[f"_index_vol_debug_{k}"]
-        for k in ("kospi", "kosdaq") if f"_index_vol_debug_{k}" in _DEBUG_STORE
-    }
-    if _vol_debug_items:
-        with st.expander("🔍 [진단] 코스피/코스닥 거래량 원본 API 응답 보기"):
-            st.write(_vol_debug_items)
+    # 코스피/코스닥 거래량 정상 확인 완료 (진단용 expander 제거됨)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
