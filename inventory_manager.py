@@ -349,6 +349,16 @@ def fetch_market_index_table():
             sign = "+" if diff >= 0 else ""
             vol_raw = data.get("accumulatedTradingVolume", None)
             vol = f"{int(str(vol_raw).replace(',', '')):,}" if vol_raw else "N/A"
+            # ── [진단] 거래량이 N/A로 빠질 때 원인을 바로 확인할 수 있도록 원본 응답 저장 ──
+            # accumulatedTradingVolume 필드가 실제로 없는지, 이름이 바뀌었는지, 값이
+            # 0/None인지 등을 API 응답 원본(JSON 키 목록 + 전체 값)으로 바로 확인한다.
+            _DEBUG_STORE[f"_index_vol_debug_{key}"] = {
+                "url": url,
+                "http_status": res.status_code,
+                "accumulatedTradingVolume_raw": vol_raw,
+                "response_keys": list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+                "response_full": data,
+            }
             return key, {
                 "name": meta["name"], "subtitle": meta["subtitle"],
                 "value": f"{price:,.2f}",
@@ -357,7 +367,8 @@ def fetch_market_index_table():
                 "status": "up" if diff > 0 else ("down" if diff < 0 else "neutral"),
                 "volume": vol,
             }
-        except Exception:
+        except Exception as e:
+            _DEBUG_STORE[f"_index_vol_debug_{key}"] = {"예외": f"{type(e).__name__}: {e}"}
             return key, None
 
     def get_yfinance(key, meta):
@@ -5511,6 +5522,18 @@ def render_dashboard():
     c1, c2, c3 = st.columns(3)
     for col, key in [(c1, "kospi"), (c2, "kosdaq"), (c3, "nasdaq")]:
         render_index_card(col, key, indices.get(key, {}), show_volume=True)
+
+    # ── [진단] 코스피/코스닥 거래량 N/A 원인 확인용 ──────────────────────────
+    # 나스닥은 yfinance 경로라 거래량이 항상 하드코딩 N/A(별개 이슈)이고, 코스피/
+    # 코스닥은 네이버 API에서 실제 값이 와야 정상이다. N/A로 빠진 경우 원본 응답을
+    # 펼쳐서 바로 확인할 수 있게 한다.
+    _vol_debug_items = {
+        k: _DEBUG_STORE[f"_index_vol_debug_{k}"]
+        for k in ("kospi", "kosdaq") if f"_index_vol_debug_{k}" in _DEBUG_STORE
+    }
+    if _vol_debug_items:
+        with st.expander("🔍 [진단] 코스피/코스닥 거래량 원본 API 응답 보기"):
+            st.write(_vol_debug_items)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
