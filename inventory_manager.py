@@ -276,7 +276,7 @@ def run_with_progress(text, func, *args, **kwargs):
 # 버전이면 이 헬퍼 대신 기존 방식을 유지해야 한다 (streamlit --version으로 확인).
 def render_async_multi(job_key, submit_fn, collect_fn, default_result,
                         spinner_text="데이터를 불러오는 중...",
-                        poll_interval=0.4, overall_timeout=20):
+                        poll_interval=0.4, overall_timeout=20, result_ttl=45):
     """
     job_key     : 이 로딩 작업을 구분하는 고유 문자열 키 (페이지마다 겹치지 않게 지정)
     submit_fn() : 인자 없이 호출하면 {"이름": future, ...} 형태의 dict를 반환해야 함
@@ -285,6 +285,7 @@ def render_async_multi(job_key, submit_fn, collect_fn, default_result,
                   실제 결과 dict로 변환하는 함수. future.done()이 False인 항목은
                   건드리지 말고 default 값으로 채워서 반환할 것.
     default_result : 아직 하나도 준비 안 됐을 때 렌더링에 쓸 기본값
+    result_ttl  : 마지막으로 성공한 결과를 몇 초까지 그대로 재사용할지 (초)
     반환값: (result, ready)
       - ready=False  → 아직 로딩 중. 호출부는 이 시점에 바로 return 해서
                         이후의 무거운 렌더링을 건너뛰어야 한다.
@@ -292,7 +293,22 @@ def render_async_multi(job_key, submit_fn, collect_fn, default_result,
     """
     jobs = st.session_state.setdefault("_bg_jobs", {})
     job = jobs.get(job_key)
+
+    # ── [수급 추이 토글 등에서 매번 "불러오는 중..."으로 되돌아가는 문제 수정] ──
+    # 이전에는 작업이 한 번 끝나면 바로 jobs.pop()으로 지워버렸다. 그런데 이 페이지
+    # 안의 아주 사소한 상호작용(예: 투자자별 수급 추이 펼치기/접기 버튼)도 Streamlit
+    # 입장에서는 "스크립트 전체를 처음부터 다시 실행"이라서, job이 없어진 상태로 매번
+    # 여기 다시 도달해 4개 API를 새 비동기 작업으로 또 던지고, 최소 한 번의 폴링
+    # 주기 동안 화면 전체가 "불러오는 중..." 문구로 바뀌어버렸다(실제 데이터는
+    # st.cache_data로 이미 캐싱돼 있어 다시 받아올 필요가 없었는데도).
+    # 해결: 마지막으로 성공한 결과를 session_state에 타임스탬프와 함께 남겨두고,
+    # result_ttl 이내에 다시 여기 도달하면(=job이 없어도) 그 결과를 바로 재사용해서
+    # 불필요한 재조회/로딩 화면 깜빡임 자체를 건너뛴다.
+    results_cache = st.session_state.setdefault("_bg_job_results", {})
     if job is None:
+        cached = results_cache.get(job_key)
+        if cached is not None and (time.time() - cached["ts"]) < result_ttl:
+            return cached["result"], True
         job = {"futures": submit_fn(), "started_at": time.time()}
         jobs[job_key] = job
 
@@ -316,7 +332,8 @@ def render_async_multi(job_key, submit_fn, collect_fn, default_result,
     for f in futures.values():
         if not f.done():
             f.cancel()  # 이미 실행 중이면 취소는 안 되지만, 큐 대기중이었다면 자리를 비워준다
-    jobs.pop(job_key, None)  # 다음 방문 때는 (캐시 TTL이 지났다면) 새로 조회
+    jobs.pop(job_key, None)
+    results_cache[job_key] = {"result": result, "ts": time.time()}  # 짧은 재사용 캐시 갱신
     return result, True
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -340,9 +357,16 @@ def fetch_market_index_table():
 
     def get_naver(key, meta):
         try:
-            url = f"https://m.stock.naver.com/api/index/{meta['symbol']}/basic"
+            # ── [거래량 N/A 수정] ──────────────────────────────────────────────
+            # 기존 m.stock.naver.com/api/index/{symbol}/basic 엔드포인트는 가격/
+            # 등락률만 내려주고 accumulatedTradingVolume(거래량) 필드 자체가 응답에
+            # 없어서 거래량이 항상 N/A로 빠졌다. 거래량까지 포함된 realtime 엔드포인트로
+            # 교체한다. 이 엔드포인트는 데이터가 datas[] 배열의 첫 번째 항목에 담겨 온다.
+            url = f"https://polling.finance.naver.com/api/realtime/domestic/index/{meta['symbol']}"
             res = requests.get(url, headers=headers, timeout=6)
-            data = res.json()
+            payload = res.json()
+            datas = payload.get("datas") or []
+            data = datas[0] if datas else {}
             price = float(str(data.get("closePrice", "0")).replace(",", ""))
             diff = float(str(data.get("compareToPreviousClosePrice", "0")).replace(",", ""))
             diff_pct = float(str(data.get("fluctuationsRatio", "0")).replace(",", ""))
@@ -5383,6 +5407,9 @@ def render_dashboard():
             fetch_sector_ranking.clear()
             fetch_fed_rate_data.clear()
             fetch_bok_rate_data.clear()
+            # render_async_multi의 짧은 재사용 캐시도 같이 비워야, 새로고침 직후에
+            # 방금까지 쓰던 옛 결과가 다시 그대로 재사용되는 일이 없다.
+            st.session_state.get("_bg_job_results", {}).pop("dashboard_main_data", None)
             st.rerun()
     with col_scan:
         if st.button("종목 스캔 (스크리너+추천)", use_container_width=True, key="dash_unified_scan_btn"):
