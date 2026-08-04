@@ -3033,6 +3033,214 @@ def run_unified_market_scan():
 
     return True
 
+# ── [스캔 버튼 멈춤 수정] 전체 시장 스캔을 백그라운드 스레드 + 논블로킹 폴링으로 전환 ──
+# 문제: 기존 run_unified_market_scan()은 fetch_screener_data_generator()를 "메인
+# 스크립트 실행 스레드"에서 그대로 for문으로 소비했다. 내부적으로 1단계만 최대 35초
+# 대기 + 실패 페이지 재시도 최대 3라운드(라운드마다 최대 2~10초 대기 + 최대 18초
+# 응답 대기)가 있어서, 최악의 경우 1분~1분 반 가까이 메인 스레드가 통째로 막혔다.
+# 이 동안 Streamlit은 같은 세션에서 오는 어떤 클릭(탭 이동 포함)도 받지 못했고,
+# "멈춘 줄 알고" 사용자가 반복 클릭/새로고침을 하면 스캔이 중복 실행되어 공유
+# 스레드풀에 부하가 더 쏠리는 악순환까지 생겼다(스레드 좀비 누적 → 결국 프로세스
+# 전체가 응답 없음 상태로 이어지는 원인 중 하나).
+#
+# 해결: 다른 비동기 로딩 지점(render_async_multi)과 동일한 철학으로, 실제 스캔
+# 작업(1단계 스크리너 스캔 + 2단계 52주 고점 매칭)을 오케스트레이션 풀의 백그라운드
+# 스레드에 통째로 던지고, 메인 스크립트는 st.fragment(run_every=...)로 진행률만
+# 짧은 간격(0.4초)으로 폴링한다. 백그라운드 스레드 안에서는 st.progress/st.error 같은
+# 위젯 호출이 안전하지 않으므로, 진행률/에러/경고는 전부 모듈 전역 dict
+# (_SCAN_JOB_STATE)에 기록해두고 메인 스레드가 폴링 시점에 그 값을 읽어 그린다.
+# session_state 최종 반영(shared_screener_df / reco_raw_data)도 반드시 메인
+# 스레드에서만 수행해서, "백그라운드 스레드가 세션 상태를 직접 확정 짓는" 상황을
+# 피한다.
+_SCAN_JOB_STATE = {}
+
+def _unified_scan_worker(job_id):
+    """run_unified_market_scan()의 1+2단계 로직을 그대로 수행하되, st.* 위젯 호출
+    대신 _SCAN_JOB_STATE[job_id]에 진행률/결과를 기록한다. 오케스트레이션 풀의
+    백그라운드 스레드에서 submit_with_ctx로 실행되는 것을 전제로 한다."""
+    state = _SCAN_JOB_STATE[job_id]
+
+    def set_progress(text, pct):
+        state["text"] = text
+        state["pct"] = pct
+
+    # 1단계: 전체 시장 스캔 (종목 스크리너 데이터)
+    set_progress("[1/2] 전체 시장 데이터 스캔 준비 중...", 0)
+    try:
+        fetch_and_cache_screener_data.clear()
+        temp_df = pd.DataFrame()
+        for status_msg, pct in fetch_screener_data_generator():
+            if isinstance(status_msg, str):
+                set_progress(f"[1/2] 전체 시장 스캔 중: {status_msg}", pct)
+            else:
+                temp_df = status_msg
+
+        if temp_df.empty:
+            state["done"] = True
+            state["success"] = False
+            state["error"] = "통신 지연으로 시장 스캔에 실패했습니다. 다시 시도해주세요."
+            return
+
+        temp_df = _safe_save_screener_df(temp_df, "saved_screener_data.csv")
+        state["screener_df"] = temp_df
+
+        # fetch_screener_data_generator 내부에서 이미 session_state에 채워둔
+        # 진단 정보를 그대로 옮겨 담아둔다 (최종 표시는 메인 스레드에서).
+        state["missing_pages"] = st.session_state.get("_screener_missing_pages") or []
+        state["dup_codes"] = st.session_state.get("_screener_dup_codes") or []
+        state["page_mismatches"] = list(_DEBUG_STORE.get("_screener_page_mismatches") or [])
+        state["fetch_failures"] = list(_DEBUG_STORE.get("_screener_fetch_failures") or [])
+        st.session_state["_screener_missing_pages"] = []
+        st.session_state["_screener_dup_codes"] = []
+        _DEBUG_STORE["_screener_page_mismatches"] = []
+        _DEBUG_STORE["_screener_fetch_failures"] = []
+    except Exception as e:
+        state["done"] = True
+        state["success"] = False
+        state["error"] = f"스캔 실패: {e}"
+        return
+
+    # 2단계: 52주 고점 매칭 → 추천 종목 후보 산출
+    load_high52_map.clear()
+    high52_map = load_high52_map()
+
+    df = temp_df.copy()
+    finance_keywords = '금융|은행|증권|보험|캐피탈|지주|투자|저축'
+    cond = (
+        (df['PER'] > 0) & (df['PER'] <= 40) &
+        (df['PBR'] > 0) & (df['PBR'] <= 4.0) &
+        (df['ROE'] >= 0) &
+        (df['부채비율'] >= 0) & (df['부채비율'] <= 300) &
+        (~df['종목명'].astype(str).str.contains(finance_keywords, regex=True, na=False))
+    )
+    val_df = df[cond].copy()
+
+    if val_df.empty:
+        set_progress("✨ 시장 스캔 완료!", 100)
+        state["done"] = True
+        state["success"] = True
+        state["reco_df"] = None
+        state["warning"] = "현재 시장 데이터 기준, 최소 요건(D급)을 통과한 종목조차 없습니다. 추천 종목 후보 산출은 건너뜁니다."
+        return
+
+    val_df = val_df.sort_values('ROE', ascending=False).head(150)
+    rows = []
+    dict_records = val_df.to_dict('records')
+    total = len(dict_records)
+    progress_text = "⚡ CSV 고점 데이터 매칭 중..." if high52_map else "⚡ 네이버 실시간 API 스캔 중..."
+    completed = 0
+
+    _executor = get_shared_executor()
+    _futures = {_executor.submit(check_naver_52w_robust, r): r for r in dict_records}
+    try:
+        for future in concurrent.futures.as_completed(_futures, timeout=25):
+            completed += 1
+            set_progress(f"[2/2] {progress_text} ({completed}/{total})", int((completed / total) * 100))
+            try:
+                res = future.result(timeout=8)
+            except Exception:
+                res = None
+            if res:
+                rows.append(res)
+    except concurrent.futures.TimeoutError:
+        pass  # 전체 상한(25초) 초과 → 지금까지 모인 결과로 계속 진행
+    finally:
+        for f in _futures:
+            f.cancel()
+
+    set_progress("✨ 스캔 완료! (스크리너 + 추천 종목 데이터가 함께 갱신되었습니다)", 100)
+    state["done"] = True
+    state["success"] = True
+    state["reco_df"] = pd.DataFrame(rows) if rows else None
+
+
+def run_unified_market_scan_async(job_key="unified_scan", overall_timeout=150):
+    """run_unified_market_scan()의 논블로킹 버전. 버튼 클릭 시 이 함수를 호출하면
+    백그라운드 스레드에서 스캔이 진행되는 동안에도 메인 스크립트가 절대 멈추지 않고,
+    사용자는 다른 탭 이동이나 다른 버튼 클릭을 그대로 계속할 수 있다.
+    (동일 세션 안에서 여러 곳에서 호출해도 job_key가 같으면 중복 스캔이 아니라
+    이미 진행 중인 스캔의 진행률을 같이 보여준다.)"""
+    jobs = st.session_state.setdefault("_scan_jobs", {})
+    job = jobs.get(job_key)
+
+    if job is None:
+        job_id = f"{job_key}_{time.time()}"
+        _SCAN_JOB_STATE[job_id] = {"text": "스캔 준비 중...", "pct": 0, "done": False}
+        future = submit_with_ctx(get_orchestration_executor(), _unified_scan_worker, job_id)
+        job = {"job_id": job_id, "future": future, "started_at": time.time()}
+        jobs[job_key] = job
+
+    job_id = job["job_id"]
+    future = job["future"]
+    state = _SCAN_JOB_STATE.get(job_id, {})
+    timed_out = (time.time() - job["started_at"]) > overall_timeout
+
+    if not future.done() and not timed_out:
+        st.progress(min(state.get("pct", 0), 100), text=f"🔄 {state.get('text', '스캔 중...')}")
+
+        @st.fragment(run_every=0.4)
+        def _poll():
+            faulthandler.dump_traceback_later(8, file=sys.stderr)
+            try:
+                _st = _SCAN_JOB_STATE.get(job_id, {})
+                if future.done() or (time.time() - job["started_at"]) > overall_timeout:
+                    st.rerun()
+                else:
+                    st.info(f"🔄 {_st.get('text', '스캔 중...')} ({min(_st.get('pct', 0), 100)}%)")
+            finally:
+                faulthandler.cancel_dump_traceback_later()
+        _poll()
+        return
+
+    # 완료(또는 상한 시간 초과) → 결과를 메인 스레드에서 session_state에 반영
+    jobs.pop(job_key, None)
+
+    if not state.get("success"):
+        st.error(state.get("error") or "스캔 실패: 시간이 너무 오래 걸려 중단했습니다. 다시 시도해주세요.")
+        _SCAN_JOB_STATE.pop(job_id, None)
+        return
+
+    screener_df = state.get("screener_df")
+    if screener_df is not None:
+        st.session_state['shared_screener_df'] = screener_df
+
+    if state.get("missing_pages"):
+        st.warning(f"⚠️ 이번 스캔에서 끝내 실패한 페이지 (시장구분, 페이지번호): {state['missing_pages']}")
+    if state.get("dup_codes"):
+        st.warning(f"⚠️ 병합 결과에서 중복된 종목코드 발견 (엉뚱한 페이지 내용이 섞였을 가능성): {state['dup_codes']}")
+    if state.get("page_mismatches"):
+        st.warning(f"⚠️ 요청한 페이지와 실제 응답 페이지가 다른 경우 {len(state['page_mismatches'])}건 발견: {state['page_mismatches']}")
+    if state.get("fetch_failures"):
+        from collections import Counter
+        reason_counts = Counter(f["원인"] for f in state["fetch_failures"])
+        st.warning(
+            f"🔍 [진단] 이번 스캔 중 발생한 개별 요청 실패 {len(state['fetch_failures'])}건 "
+            f"(재시도로 회복된 것 포함) — 원인별 집계: {dict(reason_counts)}"
+        )
+        with st.expander("실패 상세 로그 보기"):
+            st.write(state["fetch_failures"])
+
+    reco_df = state.get("reco_df")
+    if reco_df is not None and not reco_df.empty:
+        st.session_state['reco_raw_data'] = reco_df
+        try:
+            reco_df.to_csv(RECO_PATH, index=False, encoding='utf-8-sig')
+        except Exception:
+            pass
+    else:
+        st.session_state.pop('reco_raw_data', None)
+        if os.path.exists(RECO_PATH):
+            try:
+                os.remove(RECO_PATH)
+            except Exception:
+                pass
+        st.warning(state.get("warning") or "분석 결과 고점 대비 유의미하게 하락한 종목이 없습니다.")
+
+    st.success("✨ 스캔 완료! (스크리너 + 추천 종목 데이터가 함께 갱신되었습니다)")
+    _SCAN_JOB_STATE.pop(job_id, None)
+    st.rerun()
+
+
 def estimate_simple_target_price(current_price, per=None, pbr=None):
     """PER 15배 환산 → PBR 1.3배 환산 → 현재가 +25% 순으로 간이 목표가를 추정.
     '전략 계산'에서 이미 쓰는 방식과 동일한 우선순위를 따른다 (일관성 유지 목적)."""
@@ -5561,9 +5769,9 @@ def render_dashboard():
             st.session_state.get("_bg_job_results", {}).pop("dashboard_main_data", None)
             st.rerun()
     with col_scan:
-        if st.button("종목 스캔 (스크리너+추천)", use_container_width=True, key="dash_unified_scan_btn"):
-            run_unified_market_scan()
-            st.rerun()
+        _dash_scan_clicked = st.button("종목 스캔 (스크리너+추천)", use_container_width=True, key="dash_unified_scan_btn")
+    if _dash_scan_clicked or "unified_scan" in st.session_state.get("_scan_jobs", {}):
+        run_unified_market_scan_async()
     with col_rate_strip:
         render_rate_strip()
 
@@ -6522,8 +6730,8 @@ def render_recommendations():
         if warn_text:
             st.markdown(f"<div style='font-size:12.5px; color:#B45309; line-height:1.5; margin-top:2px;'>{warn_text}</div>", unsafe_allow_html=True)
 
-    if btn_scan:
-        run_unified_market_scan()
+    if btn_scan or "unified_scan" in st.session_state.get("_scan_jobs", {}):
+        run_unified_market_scan_async()
 
     _reco_df = load_reco_df()
     if not _reco_df.empty:
@@ -6785,8 +6993,9 @@ def render_screener():
         </div>
     """, unsafe_allow_html=True)
 
-    if st.button("실시간 데이터 ⚡초고속 스캔 실행"):
-        run_unified_market_scan()
+    _screener_scan_clicked = st.button("실시간 데이터 ⚡초고속 스캔 실행")
+    if _screener_scan_clicked or "unified_scan" in st.session_state.get("_scan_jobs", {}):
+        run_unified_market_scan_async()
 
     col_h52_title, col_h52_help = st.columns([9, 1])
     with col_h52_title:
