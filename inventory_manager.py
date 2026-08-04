@@ -2236,8 +2236,25 @@ def fetch_page_data(sosok, page, headers, cookies):
         parsed = _parse_screener_page_html(res.text, sosok)
         if parsed is None:
             fails = _DEBUG_STORE.setdefault("_screener_fetch_failures", [])
+            # ── [진단] 왜 파싱이 실패했는지 원인을 눈으로 볼 수 있게 스냅샷 저장 ──
+            # HTTP 200인데도 파싱이 실패하는 건 네트워크 문제가 아니라 정규식/파싱
+            # 로직이 실제 HTML 구조와 안 맞는 경우일 가능성이 높다. 얼마나 안 맞는지
+            # 판단할 수 있도록 최소한의 단서를 남긴다: 페이지 길이, 핵심 키워드 존재
+            # 여부, class="tltle" 요구 없이 느슨하게 찾은 종목코드 개수, 실제 HTML
+            # 일부 발췌.
+            loose_codes = re.findall(r'href="/item/main\.naver\?code=(\d+)"', res.text)
+            snippet_idx = res.text.find('종목명')
+            if snippet_idx == -1:
+                snippet_idx = res.text.find('<table')
+            snippet = res.text[max(0, snippet_idx - 100): snippet_idx + 500] if snippet_idx != -1 else res.text[:500]
             fails.append({
-                "요청": (sosok, page), "원인": f"HTTP {res.status_code}, 종목테이블 파싱 실패(빈 응답 또는 예상 못한 구조)",
+                "요청": (sosok, page),
+                "원인": f"HTTP {res.status_code}, 종목테이블 파싱 실패",
+                "응답길이": len(res.text),
+                "'종목명'문자열있음": '종목명' in res.text,
+                "'tltle'문자열있음": 'tltle' in res.text,
+                "느슨한매칭_종목코드개수": len(loose_codes),
+                "html_snippet": snippet,
                 "시각": datetime.datetime.now().strftime("%H:%M:%S"),
             })
         return parsed
