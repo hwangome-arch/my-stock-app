@@ -6807,17 +6807,33 @@ def render_fnguide():
     if active_code:
         code = active_code
         cache_key = f'fnguide_result_{code}'
-        
+
         if search_btn or cache_key not in st.session_state:
-            with st.spinner("에프앤가이드(FnGuide) 서버에서 데이터를 분석 중입니다..."):
+            # [재무분석 버튼 클릭 시 멈춤 대응] 이 블록만 유일하게 call_with_timeout 같은
+            # 보호장치 없이 fetch_company_info_fnguide → fetch_financial_data를 메인
+            # 스레드에서 순차적으로 직접 호출하고 있었다. 개별 요청엔 timeout이 있지만
+            # 여러 개가 순서대로 실행되니 다 더해지고, FnGuide·네이버 같은 국내 사이트는
+            # 해외 리전 서버에서 접속이 느려지는 경우가 잦아서(코드 곳곳의 DART 우회
+            # 프록시 사례처럼) 체감상 "완전히 멈춘" 것처럼 보일 수 있었다.
+            # 전체를 call_with_timeout으로 감싸서 상한(25초)을 명확히 강제한다.
+            def _do_fnguide_fetch():
                 _info = fetch_company_info_fnguide(code)
                 _df_annual, _, _ = fetch_financial_data(code)
                 _per_ai, _pbr_ai, _roe_ai, _debt_ai, _drop_pct_ai, _div_ai = get_ai_diagnosis_inputs(code, _df_annual)
-                st.session_state[cache_key] = {
+                return {
                     'info': _info,
                     'per_ai': _per_ai, 'pbr_ai': _pbr_ai, 'roe_ai': _roe_ai,
                     'debt_ai': _debt_ai, 'drop_pct_ai': _drop_pct_ai, 'div_ai': _div_ai,
                 }
+
+            with st.spinner("에프앤가이드(FnGuide) 서버에서 데이터를 분석 중입니다..."):
+                _fnguide_result = call_with_timeout(_do_fnguide_fetch, timeout=25)
+
+            if _fnguide_result is None:
+                st.error("⏱️ 데이터 조회가 너무 오래 걸려 중단했습니다. FnGuide/네이버 서버 응답이 느리거나 네트워크가 불안정한 것 같습니다. 잠시 후 다시 시도해주세요.")
+                st.stop()
+
+            st.session_state[cache_key] = _fnguide_result
 
         cached = st.session_state[cache_key]
         info        = cached['info']
