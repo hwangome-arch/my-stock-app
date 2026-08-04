@@ -2118,14 +2118,15 @@ def render_disclosure_tab(code):
 
     col_range, col_refresh = st.columns([5, 1])
     with col_range:
-        period_choice = st.radio(
+        period_choice = st.pills(
             "조회 기간",
             ["최근 30일", "최근 90일", "최근 180일", "최근 1년"],
-            index=1,
-            horizontal=True,
+            default="최근 90일",
             key=f"dart_period_{code}",
             label_visibility="collapsed",
         )
+        if period_choice is None:  # pills는 다시 누르면 선택 해제가 되므로 기본값으로 되돌림
+            period_choice = "최근 90일"
         days = {"최근 30일": 30, "최근 90일": 90, "최근 180일": 180, "최근 1년": 365}[period_choice]
     with col_refresh:
         if st.button("새로고침", key=f"dart_refresh_{code}", use_container_width=True):
@@ -2972,14 +2973,15 @@ def draw_fnguide_details(code):
             unsafe_allow_html=True,
         )
 
-        period_choice = st.radio(
+        period_choice = st.pills(
             "조회 기간",
             ["2주 (14일)", "4주 (1개월)", "24주 (6개월)"],
-            index=1,
-            horizontal=True,
+            default="4주 (1개월)",
             key=f"trend_period_{code}",
             label_visibility="collapsed",
         )
+        if period_choice is None:
+            period_choice = "4주 (1개월)"
         _period_days = {"2주 (14일)": 10, "4주 (1개월)": 20, "24주 (6개월)": 120}[period_choice]
         _period_label = f"{period_choice} · {_period_days}거래일"
 
@@ -6140,12 +6142,14 @@ def render_recommendations():
             strict_debt = st.toggle("부채비율 '엄격 기준' 적용 (권장)", value=True, help="해제 시 모든 등급의 부채비율 허들을 300%로 완화하여 더 많은 종목을 탐색합니다.")
 
         st.markdown("<br>", unsafe_allow_html=True)
-        selected_grade = st.radio(
-            "등급 필터", 
-            ["전체보기", "💎 S급", "🥇 A급", "🥈 B급", "🥉 C급", "👀 D급"], 
-            horizontal=True, 
+        selected_grade = st.pills(
+            "등급 필터",
+            ["전체보기", "💎 S급", "🥇 A급", "🥈 B급", "🥉 C급", "👀 D급"],
+            default="전체보기",
             label_visibility="collapsed"
         )
+        if selected_grade is None:
+            selected_grade = "전체보기"
 
         def assign_grade(row, is_strict):
             per, pbr, roe, debt, drop, div = row['PER'], row['PBR'], row['ROE'], row['부채비율'], row['고점 / 하락률'], row['배당수익률']
@@ -6186,116 +6190,149 @@ def render_recommendations():
         if display_df.empty:
             st.info(f"현재 설정된 필터({market_filter}, {selected_grade})에 부합하는 종목이 없습니다. 조건을 완화해보세요.")
         else:
-            for _, row in display_df.iterrows():
-                name  = row['종목명']
-                code  = str(row['종목코드']).zfill(6)
-                market_str = row.get('시장', '')
-                price = row['현재가_num']
-                drop_pct = row['고점 / 하락률']
-                per, pbr, roe, debt = row['PER'], row['PBR'], row['ROE'], row['부채비율']
-                div = row.get('배당수익률', 0.0)
-                grade_label = row['등급']
-                source_badge = row.get('데이터출처', '🌐 실시간')
+            PAGE_SIZE = 15
+            total_n = len(display_df)
+            _reco_filter_sig = (market_filter, strict_debt, selected_grade, total_n)
+            if st.session_state.get('_reco_filter_sig') != _reco_filter_sig:
+                st.session_state['_reco_filter_sig'] = _reco_filter_sig
+                st.session_state['_reco_shown'] = False
+                st.session_state['_reco_page_count'] = 1
 
-                entry_2nd, entry_3rd = calc_entry_points(price, pbr, drop_pct, price)
-                entry_2nd_pct = round((entry_2nd / price - 1) * 100, 1) if price else 0.0
-                entry_3rd_pct = round((entry_3rd / price - 1) * 100, 1) if price else 0.0
+            if not st.session_state.get('_reco_shown', False):
+                # [클릭 게이트] 탭 진입/필터 변경 즉시 종목 카드를 전부 그리면(많을 때는
+                # 수십~백 개) 매번 렌더링 부하가 커서 탭 전환이 버벅였다. 그래서 결과를
+                # 미리 그리지 않고, 사용자가 직접 "결과 보기"를 눌렀을 때만 그리기 시작한다.
+                if st.button(f"🔽 결과 보기 ({total_n}건)", use_container_width=True, key="reco_show_btn"):
+                    st.session_state['_reco_shown'] = True
+                    st.rerun()
+            else:
+                if st.button("🔼 결과 접기", key="reco_hide_btn"):
+                    st.session_state['_reco_shown'] = False
+                    st.rerun()
 
-                if "S급" in grade_label: bg_color = "#EEF2FF"
-                elif "A급" in grade_label: bg_color = "#F0FDF4"
-                elif "B급" in grade_label: bg_color = "#FEFCE8"
-                elif "C급" in grade_label: bg_color = "#FFF5F5"
-                else: bg_color = "#F8FAFC"
+                # [페이지네이션] 결과 보기를 눌렀어도 한 번에 다 쏟아내지 않고
+                # PAGE_SIZE(15)개씩 나눠서 그린다 — 조건에 맞는 종목이 많을 때의
+                # 렌더링 부하를 완화한다.
+                page_count = st.session_state.get('_reco_page_count', 1)
+                n_show = min(page_count * PAGE_SIZE, total_n)
+                page_df = display_df.iloc[:n_show]
 
-                is_saved = is_in_watchlist(username, code)
+                for _, row in page_df.iterrows():
+                    name  = row['종목명']
+                    code  = str(row['종목코드']).zfill(6)
+                    market_str = row.get('시장', '')
+                    price = row['현재가_num']
+                    drop_pct = row['고점 / 하락률']
+                    per, pbr, roe, debt = row['PER'], row['PBR'], row['ROE'], row['부채비율']
+                    div = row.get('배당수익률', 0.0)
+                    grade_label = row['등급']
+                    source_badge = row.get('데이터출처', '🌐 실시간')
 
-                with st.container(key=f"reco_card_{code}"):
-                    st.markdown(f"""
-                        <style>
-                        .st-key-reco_card_{code} {{
-                            background:{bg_color}; border:1px solid #E2E8F0; border-radius:8px;
-                            padding:16px 20px 4px 20px; margin-bottom:5px; margin-top:12px;
-                        }}
-                        .st-key-reco_card_{code} div[data-testid="stButton"] {{
-                            margin-top:6px; display:flex; justify-content:flex-end;
-                        }}
-                        .st-key-reco_card_{code} div[data-testid="stButton"] button {{
-                            background-color:transparent !important; border:none !important;
-                            outline:none !important; box-shadow:none !important;
-                            padding:0 !important; margin:0 !important; min-height:auto !important;
-                            line-height:1 !important; font-size:19px !important; color:#F59E0B !important;
-                        }}
-                        .st-key-reco_card_{code} div[data-testid="stButton"] button:hover,
-                        .st-key-reco_card_{code} div[data-testid="stButton"] button:focus,
-                        .st-key-reco_card_{code} div[data-testid="stButton"] button:focus:not(:active),
-                        .st-key-reco_card_{code} div[data-testid="stButton"] button:active {{
-                            background-color:transparent !important; border:none !important;
-                            outline:none !important; box-shadow:none !important; color:#D97706 !important;
-                        }}
-                        </style>
-                    """, unsafe_allow_html=True)
+                    entry_2nd, entry_3rd = calc_entry_points(price, pbr, drop_pct, price)
+                    entry_2nd_pct = round((entry_2nd / price - 1) * 100, 1) if price else 0.0
+                    entry_3rd_pct = round((entry_3rd / price - 1) * 100, 1) if price else 0.0
 
-                    col_content, col_star = st.columns([25, 1])
-                    with col_content:
+                    if "S급" in grade_label: bg_color = "#EEF2FF"
+                    elif "A급" in grade_label: bg_color = "#F0FDF4"
+                    elif "B급" in grade_label: bg_color = "#FEFCE8"
+                    elif "C급" in grade_label: bg_color = "#FFF5F5"
+                    else: bg_color = "#F8FAFC"
+
+                    is_saved = is_in_watchlist(username, code)
+
+                    with st.container(key=f"reco_card_{code}"):
                         st.markdown(f"""
-                            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; padding-top:6px;">
-                                <div>
-                                    <span style="font-size:15px; font-weight:700; color:#0F172A;">{name}</span>
-                                    <span style="font-size:11px; color:#94A3B8; margin-left:6px;">{code} | {market_str}</span>
-                                    <span style="font-size:11px; font-weight:700; color:#111827; background:#FFFFFF; border: 1px solid #D1D5DB; padding:2px 10px; border-radius:10px; margin-left:8px;">{grade_label}</span>
-                                    <span style="font-size:10px; color:#94A3B8; background:#F1F5F9; border: 1px solid #E2E8F0; padding:2px 7px; border-radius:8px; margin-left:6px;">{source_badge}</span>
+                            <style>
+                            .st-key-reco_card_{code} {{
+                                background:{bg_color}; border:1px solid #E2E8F0; border-radius:8px;
+                                padding:16px 20px 4px 20px; margin-bottom:5px; margin-top:12px;
+                            }}
+                            .st-key-reco_card_{code} div[data-testid="stButton"] {{
+                                margin-top:6px; display:flex; justify-content:flex-end;
+                            }}
+                            .st-key-reco_card_{code} div[data-testid="stButton"] button {{
+                                background-color:transparent !important; border:none !important;
+                                outline:none !important; box-shadow:none !important;
+                                padding:0 !important; margin:0 !important; min-height:auto !important;
+                                line-height:1 !important; font-size:19px !important; color:#F59E0B !important;
+                            }}
+                            .st-key-reco_card_{code} div[data-testid="stButton"] button:hover,
+                            .st-key-reco_card_{code} div[data-testid="stButton"] button:focus,
+                            .st-key-reco_card_{code} div[data-testid="stButton"] button:focus:not(:active),
+                            .st-key-reco_card_{code} div[data-testid="stButton"] button:active {{
+                                background-color:transparent !important; border:none !important;
+                                outline:none !important; box-shadow:none !important; color:#D97706 !important;
+                            }}
+                            </style>
+                        """, unsafe_allow_html=True)
+
+                        col_content, col_star = st.columns([25, 1])
+                        with col_content:
+                            st.markdown(f"""
+                                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; padding-top:6px;">
+                                    <div>
+                                        <span style="font-size:15px; font-weight:700; color:#0F172A;">{name}</span>
+                                        <span style="font-size:11px; color:#94A3B8; margin-left:6px;">{code} | {market_str}</span>
+                                        <span style="font-size:11px; font-weight:700; color:#111827; background:#FFFFFF; border: 1px solid #D1D5DB; padding:2px 10px; border-radius:10px; margin-left:8px;">{grade_label}</span>
+                                        <span style="font-size:10px; color:#94A3B8; background:#F1F5F9; border: 1px solid #E2E8F0; padding:2px 7px; border-radius:8px; margin-left:6px;">{source_badge}</span>
+                                    </div>
+                                    <div style="text-align:right;">
+                                        <span style="font-size:15px; font-weight:700; color:#0F172A;">{int(price):,}</span>
+                                        <span style="font-size:12px; font-weight:700; color:#16A34A; background:#FFFFFF; border: 1px solid #D1D5DB; padding:2px 8px; border-radius:12px; margin-left:8px;">52주최고 대비 {drop_pct:.1f}%</span>
+                                    </div>
                                 </div>
-                                <div style="text-align:right;">
-                                    <span style="font-size:15px; font-weight:700; color:#0F172A;">{int(price):,}</span>
-                                    <span style="font-size:12px; font-weight:700; color:#16A34A; background:#FFFFFF; border: 1px solid #D1D5DB; padding:2px 8px; border-radius:12px; margin-left:8px;">52주최고 대비 {drop_pct:.1f}%</span>
+                            """, unsafe_allow_html=True)
+                        with col_star:
+                            if st.button("⭐" if is_saved else "☆", key=f"reco_star_{code}", help="관심종목에서 제거" if is_saved else "관심종목에 추가"):
+                                if is_saved:
+                                    remove_from_watchlist(username, code)
+                                    st.toast(f"'{name}'을(를) 관심종목에서 제거했습니다.")
+                                else:
+                                    add_to_watchlist(username, code, name)
+                                    st.toast(f"'{name}'을(를) 관심종목에 추가했습니다.")
+                                st.rerun()
+
+                        st.markdown(f"""
+                            <div style="display:flex; gap:18px; font-size:12px; color:#64748B; margin:8px 0 12px 0; flex-wrap:wrap;">
+                                <span>PER <b style="color:#1E293B;">{per:.2f}배</b></span>
+                                <span>PBR <b style="color:#1E293B;">{pbr:.2f}배</b></span>
+                                <span>ROE <b style="color:#1E293B;">{roe:.1f}%</b></span>
+                                <span>부채비율 <b style="color:#1E293B;">{debt:.1f}%</b></span>
+                                <span>배당수익률 <b style="color:#DC2626;">{div:.1f}%</b></span>
+                            </div>
+                            <div style="display:flex; gap:10px; padding-bottom:16px;">
+                                <div style="flex:1; background:#FFFFFF; border:1px solid #E2E8F0; border-radius:6px; padding:8px 4px; text-align:center;">
+                                    <div style="font-size:11px; color:#94A3B8; margin-bottom:2px;">1차 진입 (비중 25%)</div>
+                                    <div style="font-size:13px; font-weight:700; color:#5A4EE5;">{int(price):,}</div>
+                                </div>
+                                <div style="flex:1; background:#FFFFFF; border:1px solid #E2E8F0; border-radius:6px; padding:8px 4px; text-align:center;">
+                                    <div style="font-size:11px; color:#94A3B8; margin-bottom:2px;">2차 진입 ({entry_2nd_pct:+.1f}% / 35%)</div>
+                                    <div style="font-size:13px; font-weight:700; color:#1E293B;">{int(entry_2nd):,}</div>
+                                </div>
+                                <div style="flex:1; background:#FFFFFF; border:1px solid #E2E8F0; border-radius:6px; padding:8px 4px; text-align:center;">
+                                    <div style="font-size:11px; color:#94A3B8; margin-bottom:2px;">3차 진입 ({entry_3rd_pct:+.1f}% / 40%)</div>
+                                    <div style="font-size:13px; font-weight:700; color:#1E293B;">{int(entry_3rd):,}</div>
                                 </div>
                             </div>
                         """, unsafe_allow_html=True)
-                    with col_star:
-                        if st.button("⭐" if is_saved else "☆", key=f"reco_star_{code}", help="관심종목에서 제거" if is_saved else "관심종목에 추가"):
-                            if is_saved:
-                                remove_from_watchlist(username, code)
-                                st.toast(f"'{name}'을(를) 관심종목에서 제거했습니다.")
-                            else:
-                                add_to_watchlist(username, code, name)
-                                st.toast(f"'{name}'을(를) 관심종목에 추가했습니다.")
-                            st.rerun()
-
-                    st.markdown(f"""
-                        <div style="display:flex; gap:18px; font-size:12px; color:#64748B; margin:8px 0 12px 0; flex-wrap:wrap;">
-                            <span>PER <b style="color:#1E293B;">{per:.2f}배</b></span>
-                            <span>PBR <b style="color:#1E293B;">{pbr:.2f}배</b></span>
-                            <span>ROE <b style="color:#1E293B;">{roe:.1f}%</b></span>
-                            <span>부채비율 <b style="color:#1E293B;">{debt:.1f}%</b></span>
-                            <span>배당수익률 <b style="color:#DC2626;">{div:.1f}%</b></span>
-                        </div>
-                        <div style="display:flex; gap:10px; padding-bottom:16px;">
-                            <div style="flex:1; background:#FFFFFF; border:1px solid #E2E8F0; border-radius:6px; padding:8px 4px; text-align:center;">
-                                <div style="font-size:11px; color:#94A3B8; margin-bottom:2px;">1차 진입 (비중 25%)</div>
-                                <div style="font-size:13px; font-weight:700; color:#5A4EE5;">{int(price):,}</div>
-                            </div>
-                            <div style="flex:1; background:#FFFFFF; border:1px solid #E2E8F0; border-radius:6px; padding:8px 4px; text-align:center;">
-                                <div style="font-size:11px; color:#94A3B8; margin-bottom:2px;">2차 진입 ({entry_2nd_pct:+.1f}% / 35%)</div>
-                                <div style="font-size:13px; font-weight:700; color:#1E293B;">{int(entry_2nd):,}</div>
-                            </div>
-                            <div style="flex:1; background:#FFFFFF; border:1px solid #E2E8F0; border-radius:6px; padding:8px 4px; text-align:center;">
-                                <div style="font-size:11px; color:#94A3B8; margin-bottom:2px;">3차 진입 ({entry_3rd_pct:+.1f}% / 40%)</div>
-                                <div style="font-size:13px; font-weight:700; color:#1E293B;">{int(entry_3rd):,}</div>
-                            </div>
-                        </div>
-                    """, unsafe_allow_html=True)
                 
-                with st.expander(f"{name} · AI 진단 · 재무분석"):
-                    render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_label)
-                    st.markdown("<hr style='margin:16px 0 12px 0; border-color:#E5E7EB;'>", unsafe_allow_html=True)
+                    with st.expander(f"{name} · AI 진단 · 재무분석"):
+                        render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_label)
+                        st.markdown("<hr style='margin:16px 0 12px 0; border-color:#E5E7EB;'>", unsafe_allow_html=True)
 
-                    btn_key = f"reco_fn_{code}"
-                    data_key = f"reco_fn_data_{code}"
-                    if st.button(f"📊 실시간 재무 데이터 불러오기 (FnGuide)", key=btn_key):
-                        with st.spinner(f"'{name}'의 최신 기업 개요와 재무제표를 가져오는 중입니다..."):
-                            st.session_state[data_key] = True
-                    if st.session_state.get(data_key):
-                        draw_fnguide_details(code)
+                        btn_key = f"reco_fn_{code}"
+                        data_key = f"reco_fn_data_{code}"
+                        if st.button(f"📊 실시간 재무 데이터 불러오기 (FnGuide)", key=btn_key):
+                            with st.spinner(f"'{name}'의 최신 기업 개요와 재무제표를 가져오는 중입니다..."):
+                                st.session_state[data_key] = True
+                        if st.session_state.get(data_key):
+                            draw_fnguide_details(code)
+
+
+                if n_show < total_n:
+                    if st.button(f"➕ 더 보기 ({n_show}/{total_n}건 표시 중)", use_container_width=True, key="reco_more_btn"):
+                        st.session_state['_reco_page_count'] = page_count + 1
+                        st.rerun()
 
 SCREENER_PRESETS = {
     "1단계 · 배당형 저평가": {
@@ -6321,7 +6358,9 @@ def render_screener():
     st.markdown("<hr style='margin: 10px 0 15px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
 
     preset_names = list(SCREENER_PRESETS.keys())
-    selected_preset = st.radio("필터 단계", preset_names, horizontal=True, key="screener_preset", label_visibility="collapsed")
+    selected_preset = st.pills("필터 단계", preset_names, default=preset_names[0], key="screener_preset", label_visibility="collapsed")
+    if selected_preset is None:
+        selected_preset = preset_names[0]
     preset = SCREENER_PRESETS[selected_preset]
 
     if preset:
@@ -6519,7 +6558,9 @@ KRX 정보데이터시스템의 **[12004] 종목 시세 추이(월/연도)** 화
         col_tools1, col_tools2 = st.columns([3, 2])
         with col_tools1:
             with st.container(key="market_filter_box"):
-                market_filter = st.radio("시장", ["전체", "코스피", "코스닥"], horizontal=True, key="screener_market", label_visibility="collapsed")
+                market_filter = st.pills("시장", ["전체", "코스피", "코스닥"], default="전체", key="screener_market", label_visibility="collapsed")
+                if market_filter is None:
+                    market_filter = "전체"
             
             t1, t2 = st.columns(2)
             with t1:
@@ -6870,14 +6911,15 @@ def render_fnguide():
             "🛡️ 보수형 (20:40:40)": (20, 40, 40),
             "✏️ 직접 입력":          None,
         }
-        preset_choice = st.radio(
+        preset_choice = st.pills(
             "분할 비중 프리셋",
             list(_PRESETS.keys()),
-            index=0,
-            horizontal=True,
+            default=list(_PRESETS.keys())[0],
             key=f"preset_{code}",
             help="3차까지 하락이 왔을 때 실탄이 가장 많은 공격형(20:30:50)이 평균단가 절감 효과가 가장 큽니다."
         )
+        if preset_choice is None:
+            preset_choice = list(_PRESETS.keys())[0]
 
         if _PRESETS[preset_choice] is not None:
             _pw1, _pw2, _pw3 = _PRESETS[preset_choice]
