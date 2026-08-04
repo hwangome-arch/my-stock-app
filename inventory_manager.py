@@ -16,6 +16,7 @@ import hmac
 import base64
 import difflib
 import numpy as np
+from itertools import zip_longest
 
 # ── 전역 소켓 기본 타임아웃 ──────────────────────────────────────────────
 # gspread(Google Sheets API)처럼 자체적으로 timeout 파라미터를 노출하지 않는
@@ -2202,6 +2203,16 @@ def fetch_page_data(sosok, page, headers, cookies):
         res = requests.get(url, headers=headers, cookies=cookies, timeout=10)
         res.encoding = res.apparent_encoding or 'euc-kr'
 
+        # ── [진단] 상태코드가 200이 아닌 경우 원인 기록 ──────────────────────
+        # 기존에는 status_code를 전혀 확인하지 않아서, 네이버가 429/403/503 등을
+        # 줘도 그냥 파싱 실패로 뭉개져서 "왜 실패했는지"를 알 수 없었다.
+        if res.status_code != 200:
+            fails = _DEBUG_STORE.setdefault("_screener_fetch_failures", [])
+            fails.append({
+                "요청": (sosok, page), "원인": f"HTTP {res.status_code}",
+                "시각": datetime.datetime.now().strftime("%H:%M:%S"),
+            })
+
         # ── [진단] "실패"로는 안 잡히지만 요청한 페이지와 다른 내용이 온 경우 로그 ──
         # 레이트리밋/캐시 등으로 엉뚱한 페이지 내용이 200 OK로 오면 기존 로직은 이걸
         # 그냥 "성공"으로 처리해서 조용히 병합해버린다. 아직 이 불일치를 페이지 실패로
@@ -2222,8 +2233,23 @@ def fetch_page_data(sosok, page, headers, cookies):
             if returned_page < page:
                 _DEBUG_STORE.setdefault("_screener_overflow_pages", set()).add((sosok, page))
 
-        return _parse_screener_page_html(res.text, sosok)
-    except Exception:
+        parsed = _parse_screener_page_html(res.text, sosok)
+        if parsed is None:
+            fails = _DEBUG_STORE.setdefault("_screener_fetch_failures", [])
+            fails.append({
+                "요청": (sosok, page), "원인": f"HTTP {res.status_code}, 종목테이블 파싱 실패(빈 응답 또는 예상 못한 구조)",
+                "시각": datetime.datetime.now().strftime("%H:%M:%S"),
+            })
+        return parsed
+    except requests.exceptions.Timeout:
+        _DEBUG_STORE.setdefault("_screener_fetch_failures", []).append({
+            "요청": (sosok, page), "원인": "타임아웃(10초)", "시각": datetime.datetime.now().strftime("%H:%M:%S"),
+        })
+        return None
+    except Exception as e:
+        _DEBUG_STORE.setdefault("_screener_fetch_failures", []).append({
+            "요청": (sosok, page), "원인": f"예외: {type(e).__name__}", "시각": datetime.datetime.now().strftime("%H:%M:%S"),
+        })
         return None
 
 def _detect_screener_last_page_by_probe(headers, cookies, sosok, default_last=44):
@@ -2274,6 +2300,7 @@ def fetch_screener_data_generator():
     # 페이지는 애초에 요청 목록에서 제외한다. 1페이지 응답은 그대로 결과에 재사용.
     _DEBUG_STORE["_screener_page_mismatches"] = []
     _DEBUG_STORE["_screener_overflow_pages"] = set()
+    _DEBUG_STORE["_screener_fetch_failures"] = []
 
     all_data = []
     last_page_by_sosok = {}
@@ -2292,7 +2319,14 @@ def fetch_screener_data_generator():
         last_page_by_sosok[sosok] = _detect_screener_last_page_by_probe(headers, cookies, sosok, default_last=44)
         _DEBUG_STORE[f"_screener_last_page_sosok{sosok}"] = last_page_by_sosok[sosok]
 
-    urls = [(sosok, page) for sosok in [0, 1] for page in range(2, last_page_by_sosok[sosok] + 1)]
+    # 코스피를 전부 먼저, 코스닥을 나중에 순서대로 나열하면(기존 방식) 같은 세션
+    # 쿠키로 나가는 요청 중 코스닥 쪽이 항상 시간상 뒤에 실행되어, 네이버가 세션
+    # 단위로 누적 요청 수를 추적해 레이트리밋을 건다면 코스닥에만 실패가 몰릴 수
+    # 있다(실제로 관측된 패턴과 일치). 두 시장 페이지를 번갈아 섞어서 제출 순서상
+    # 어느 한쪽에만 부하가 쏠리지 않게 한다.
+    _urls_0 = [(0, page) for page in range(2, last_page_by_sosok[0] + 1)]
+    _urls_1 = [(1, page) for page in range(2, last_page_by_sosok[1] + 1)]
+    urls = [u for pair in zip_longest(_urls_0, _urls_1) for u in pair if u is not None]
     total_pages = len(urls) + 2  # 이미 처리한 1페이지 2건 포함
     completed = 2  # 위에서 이미 처리한 1페이지 2건
     failed_pages = []
@@ -2743,6 +2777,18 @@ def run_unified_market_scan():
         if _page_mismatches:
             st.warning(f"⚠️ 요청한 페이지와 실제 응답 페이지가 다른 경우 {len(_page_mismatches)}건 발견: {_page_mismatches}")
             _DEBUG_STORE["_screener_page_mismatches"] = []
+
+        _fetch_failures = _DEBUG_STORE.get("_screener_fetch_failures")
+        if _fetch_failures:
+            from collections import Counter
+            reason_counts = Counter(f["원인"] for f in _fetch_failures)
+            st.warning(
+                f"🔍 [진단] 이번 스캔 중 발생한 개별 요청 실패 {len(_fetch_failures)}건 "
+                f"(재시도로 회복된 것 포함) — 원인별 집계: {dict(reason_counts)}"
+            )
+            with st.expander("실패 상세 로그 보기"):
+                st.write(_fetch_failures)
+            _DEBUG_STORE["_screener_fetch_failures"] = []
     except Exception as e:
         pb.empty()
         st.error(f"스캔 실패: {e}")
