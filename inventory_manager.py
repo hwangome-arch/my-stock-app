@@ -2216,22 +2216,33 @@ def fetch_page_data(sosok, page, headers, cookies):
                 "실제응답페이지": returned_page,
                 "시각": datetime.datetime.now().strftime("%H:%M:%S"),
             })
+            # 요청한 페이지가 실제보다 커서(존재하지 않는 페이지) 마지막 페이지로
+            # 클램프되어 온 경우 → 진짜 실패가 아니라 "범위 초과"이므로 별도 표시.
+            # (사전 감지가 어떤 이유로든 빗나갔을 때를 대비한 이중 안전장치)
+            if returned_page < page:
+                _DEBUG_STORE.setdefault("_screener_overflow_pages", set()).add((sosok, page))
 
         return _parse_screener_page_html(res.text, sosok)
     except Exception:
         return None
 
-def _detect_screener_last_page(res_text, default_last=44):
-    """네이버 페이지네이터의 '맨뒤' 링크(class="pgRR")에서 실제 마지막 페이지 번호를
-    추출한다. 못 찾으면 기존 하드코딩 값(default_last)으로 안전하게 폴백한다.
-    → 존재하지 않는 페이지를 매 스캔마다 요청/재시도하다 '실패'로 잡히는 것을 방지."""
-    m = re.search(r'class="pgRR"[^>]*href="[^"]*[?&]page=(\d+)"', res_text)
-    if m:
-        try:
-            return int(m.group(1))
-        except Exception:
-            pass
-    return default_last
+def _detect_screener_last_page_by_probe(headers, cookies, sosok, default_last=44):
+    """실제 마지막 페이지를 확실하게 찾기 위해, 절대 존재하지 않을 만큼 큰 페이지
+    번호(999)를 일부러 요청한다. 네이버는 이런 초과 요청에도 에러를 내지 않고
+    실제 마지막 페이지로 클램프해서 응답하며, 페이지네이터의 활성 페이지(class="on")
+    표시도 그 진짜 마지막 페이지 번호를 그대로 보여준다 — 이건 실제 진단 로그로
+    확인된 동작이다(코스닥 38~44 요청 → 매번 '실제응답페이지: 37'로 관측됨).
+    이전에 시도했던 '맨뒤(pgRR)' 링크 파싱은 마크업 추정이 틀려 항상 실패했었다."""
+    try:
+        res = requests.get(
+            f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page=999",
+            headers=headers, cookies=cookies, timeout=10
+        )
+        res.encoding = res.apparent_encoding or 'euc-kr'
+        detected = _extract_screener_current_page(res.text)
+        return detected if detected else default_last
+    except Exception:
+        return default_last
 
 def fetch_screener_data_generator():
     session = requests.Session()
@@ -2256,13 +2267,14 @@ def fetch_screener_data_generator():
 
     # ── 실제 마지막 페이지 자동 감지 (하드코딩 44 제거) ──────────────────────
     # 문제: range(1, 45)로 코스피/코스닥 둘 다 무조건 44페이지까지 요청했는데,
-    # 코스닥은 상장 종목 수가 더 적어서 실제 마지막 페이지가 44보다 작을 수 있다.
-    # 존재하지 않는 페이지는 매 스캔마다 3라운드 재시도를 다 태우고도 결국
-    # "실패 페이지"로 잡혀 사용자에게 경고가 뜬다(코스닥 뒤쪽 페이지들이 항상
-    # 실패 목록에 나오는 원인 중 하나로 추정). 각 시장의 1페이지 응답에서
-    # 페이지네이터의 '맨뒤' 링크를 읽어 실제 마지막 페이지를 구하고, 그 이후
-    # 페이지는 애초에 요청 목록에서 제외한다. 이미 받은 1페이지 응답은 버리지
-    # 않고 그대로 결과에 재사용해 중복 요청도 줄인다.
+    # 코스닥은 상장 종목 수가 더 적어서 실제 마지막 페이지가 44보다 작다(진단 결과: 37).
+    # 존재하지 않는 페이지를 요청하면 네이버가 200 OK를 주지만 종목 테이블은 비어 있어
+    # 매 스캔마다 3라운드 재시도를 다 태우고도 결국 "실패 페이지"로 잡혔다.
+    # _detect_screener_last_page_by_probe로 실제 마지막 페이지를 구하고, 그 이후
+    # 페이지는 애초에 요청 목록에서 제외한다. 1페이지 응답은 그대로 결과에 재사용.
+    _DEBUG_STORE["_screener_page_mismatches"] = []
+    _DEBUG_STORE["_screener_overflow_pages"] = set()
+
     all_data = []
     last_page_by_sosok = {}
     for sosok in [0, 1]:
@@ -2272,12 +2284,12 @@ def fetch_screener_data_generator():
                 headers=headers, cookies=cookies, timeout=10
             )
             res0.encoding = res0.apparent_encoding or 'euc-kr'
-            last_page_by_sosok[sosok] = _detect_screener_last_page(res0.text, default_last=44)
             df0 = _parse_screener_page_html(res0.text, sosok)
             if df0 is not None and not df0.empty:
                 all_data.append(df0)
         except Exception:
-            last_page_by_sosok[sosok] = 44
+            pass
+        last_page_by_sosok[sosok] = _detect_screener_last_page_by_probe(headers, cookies, sosok, default_last=44)
         _DEBUG_STORE[f"_screener_last_page_sosok{sosok}"] = last_page_by_sosok[sosok]
 
     urls = [(sosok, page) for sosok in [0, 1] for page in range(2, last_page_by_sosok[sosok] + 1)]
@@ -2345,6 +2357,11 @@ def fetch_screener_data_generator():
                 f.cancel()
         failed_pages = still_failed
         retry_round += 1
+
+    # 범위 초과(존재하지 않는 페이지라 마지막 페이지로 클램프된 경우)로 확인된 건
+    # 진짜 실패가 아니므로 사용자 경고 대상에서 제외한다.
+    _overflow = _DEBUG_STORE.get("_screener_overflow_pages", set())
+    failed_pages = [p for p in failed_pages if p not in _overflow]
 
     if failed_pages:
         st.session_state["_screener_missing_pages"] = failed_pages
