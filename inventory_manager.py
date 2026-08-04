@@ -72,6 +72,7 @@ import pandas as pd
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
+from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 
 # =========================
 # ⚙️ 페이지 설정
@@ -158,6 +159,39 @@ def _get_or_heal_executor(raw_getter, name, max_workers, stuck_threshold=25):
 
 def get_shared_executor():
     return _get_or_heal_executor(_get_shared_executor_raw, "공유", 32)
+
+# ── [진짜 원인] ScriptRunContext 없이 st.cache_data 함수를 스레드에서 호출하면
+# 세션이 통째로 영원히 멈춘다 ─────────────────────────────────────────────────
+# 문제: fetch_market_index_table/fetch_investor_trend/fetch_sparkline_data/
+# fetch_sector_ranking/fetch_investor_trend_monthly는 전부 @st.cache_data가
+# 붙어있는데, 이걸 순수 ThreadPoolExecutor 워커 스레드(=Streamlit의
+# ScriptRunContext가 없는 스레드) 안에서 직접 호출하고 있었다. st.cache_data는
+# 동일 캐시 키로 동시에 여러 번 불리면 "먼저 온 호출이 계산하는 동안 나머지는
+# 내부 락으로 대기"하는 구조인데, 이 락 대기에는 우리가 건 어떤
+# overall_timeout/per_result_timeout도 적용되지 않는다. ScriptRunContext가 없는
+# 스레드에서 이 내부 락/캐시 로직이 꼬이면 해당 세션의 스크립트 실행 스레드가
+# 말 그대로 영원히 멈춘다 — 서버 프로세스(healthz)는 멀쩡하니 다른 세션에는
+# 영향이 없고, 딱 그 세션만 "리붓 아니면 답이 없는" 상태가 된다(로그로 실측 확인:
+# healthz는 200을 계속 내려주는데 그 세션의 "페이지 렌더링 완료" 로그만 다시는
+# 안 찍힘).
+# 해결: 메인 스레드(=정상적인 ScriptRunContext를 가진 스레드)에서 submit하는
+# 시점에 현재 컨텍스트를 캡처해서, 실제로 워커 스레드에서 실행될 때 그 스레드에
+# 컨텍스트를 심어준다. Streamlit 공식 문서가 권장하는 "백그라운드 스레드에서
+# Streamlit API(캐시 포함)를 쓰려면 add_script_run_ctx로 컨텍스트를 넘겨야 한다"
+# 패턴을 그대로 적용한 것.
+def _run_with_ctx(_ctx, _fn, *_args, **_kwargs):
+    try:
+        add_script_run_ctx(threading.current_thread(), _ctx)
+    except Exception:
+        pass  # 컨텍스트를 못 붙이더라도 최소한 함수 자체는 시도한다
+    return _fn(*_args, **_kwargs)
+
+def submit_with_ctx(executor, fn, *args, **kwargs):
+    """executor.submit(fn, *args, **kwargs)와 동일하지만, 호출 시점(메인 스레드)의
+    ScriptRunContext를 워커 스레드에 심어준 채로 실행한다. st.cache_data가 붙은
+    함수를 스레드풀에 던질 때는 반드시 이 함수를 통해서만 던져야 한다."""
+    ctx = get_script_run_ctx()
+    return executor.submit(_run_with_ctx, ctx, fn, *args, **kwargs)
 
 # ── 메인 스레드 직접 호출 보호용 헬퍼 ──────────────────────────────────────
 # 문제: yfinance(내부적으로 curl_cffi 사용)에 timeout=8을 넘겨도, 클라우드 환경에서
@@ -3900,7 +3934,7 @@ def render_watchlist_portfolio_summary(df):
     codes = holdings["종목코드"].tolist()
     current_prices = {}
     _executor = get_shared_executor()
-    _futures = {_executor.submit(fetch_live_price_change, code): code for code in codes}
+    _futures = {submit_with_ctx(_executor, fetch_live_price_change, code): code for code in codes}
     try:
         for future in concurrent.futures.as_completed(_futures, timeout=12):
             code = _futures[future]
@@ -4188,7 +4222,7 @@ def render_watchlist():
         if _wl_missing_codes:
             def _submit_wl_jobs():
                 _wl_executor = get_shared_executor()
-                return {c: _wl_executor.submit(_wl_prefetch_one, c) for c in _wl_missing_codes}
+                return {c: submit_with_ctx(_wl_executor, _wl_prefetch_one, c) for c in _wl_missing_codes}
 
             def _collect_wl_results(futures):
                 out = {"price": {}, "spark": {}, "ai": {}, "hitprob": {}}
@@ -4227,7 +4261,7 @@ def render_watchlist():
             _wl_executor = get_shared_executor()
             for c in _wl_stale_codes:
                 if c not in _wl_bg_jobs or _wl_bg_jobs[c].done():
-                    _wl_bg_jobs[c] = _wl_executor.submit(_wl_prefetch_one, c)
+                    _wl_bg_jobs[c] = submit_with_ctx(_wl_executor, _wl_prefetch_one, c)
 
         # 예전에 백그라운드로 던져놓은 작업 중 그 사이 끝난 게 있으면 조용히 캐시에 반영
         _wl_bg_jobs = st.session_state.get("_wl_bg_jobs", {})
@@ -5495,10 +5529,10 @@ def render_dashboard():
     def _submit_dash_jobs():
         _dash_executor = get_orchestration_executor()
         return {
-            "indices":    _dash_executor.submit(fetch_market_index_table),
-            "sparklines": _dash_executor.submit(fetch_sparkline_data),
-            "trend":      _dash_executor.submit(fetch_investor_trend),
-            "df_sector":  _dash_executor.submit(fetch_sector_ranking),
+            "indices":    submit_with_ctx(_dash_executor, fetch_market_index_table),
+            "sparklines": submit_with_ctx(_dash_executor, fetch_sparkline_data),
+            "trend":      submit_with_ctx(_dash_executor, fetch_investor_trend),
+            "df_sector":  submit_with_ctx(_dash_executor, fetch_sector_ranking),
         }
 
     def _collect_dash_results(futures):
@@ -5718,7 +5752,7 @@ def render_dashboard():
             # 짧은 시간 안에 다시 열었다 닫았다 해도 재조회 자체가 일어나지 않는다.
             _monthly_result, _monthly_ready = render_async_multi(
                 job_key=f"investor_monthly_{market_key}",
-                submit_fn=lambda: {"monthly": get_orchestration_executor().submit(fetch_investor_trend_monthly, sosok)},
+                submit_fn=lambda: {"monthly": submit_with_ctx(get_orchestration_executor(), fetch_investor_trend_monthly, sosok)},
                 collect_fn=lambda futures: {
                     "monthly": (futures["monthly"].result(timeout=0.1) if futures["monthly"].done() else None) or []
                 },
