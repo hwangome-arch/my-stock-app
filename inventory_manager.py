@@ -379,10 +379,22 @@ def render_async_multi(job_key, submit_fn, collect_fn, default_result,
     if not all_done and not timed_out:
         @st.fragment(run_every=poll_interval)
         def _poll():
-            if all(f.done() for f in futures.values()) or (time.time() - job["started_at"]) > overall_timeout:
-                st.rerun()  # 준비 완료 → 프래그먼트가 아니라 앱 전체를 다시 그려서 실제 데이터를 반영
-            else:
-                st.info(f"🔄 {spinner_text}")
+            # ── [프래그먼트 전용 워치독] ────────────────────────────────────
+            # 이 함수는 main()을 다시 타지 않고 Streamlit이 자체적으로
+            # poll_interval마다 스케줄링해서 실행한다. 즉 main() 쪽에 걸어둔
+            # 워치독의 감시망 밖이다. 만약 멈춤이 main() 진입 로그("페이지
+            # 진입") 없이 발생한다면, 바로 이 프래그먼트 실행 도중일 가능성이
+            # 높다 — 그래서 여기에도 독립적인 짧은 워치독을 건다. 정상 실행은
+            # done() 체크 + st.info/st.rerun 뿐이라 순식간에 끝나야 하므로
+            # 8초면 충분히 넉넉하다.
+            faulthandler.dump_traceback_later(8, file=sys.stderr)
+            try:
+                if all(f.done() for f in futures.values()) or (time.time() - job["started_at"]) > overall_timeout:
+                    st.rerun()  # 준비 완료 → 프래그먼트가 아니라 앱 전체를 다시 그려서 실제 데이터를 반영
+                else:
+                    st.info(f"🔄 {spinner_text}")
+            finally:
+                faulthandler.cancel_dump_traceback_later()
         _poll()
         return default_result, False
 
@@ -5124,6 +5136,21 @@ def _show_debug_memory():
 
 
 def main():
+    # ── [main() 전체를 감싸는 워치독] ────────────────────────────────────
+    # 기존에는 페이지 디스패치(render_dashboard 등 호출) 구간에만 워치독을
+    # 걸어뒀는데, 로그를 보니 "페이지 진입" 로그조차 안 찍히고 멈춘 사례가
+    # 있었다 — 즉 멈춤이 디스패치 이전(세션 초기화, 사이드바, 메모리 표시 등)
+    # 이나, main()을 아예 거치지 않는 폴링 프래그먼트 안에서도 일어날 수 있다는
+    # 뜻이다. main() 전체(로그인 처리부터 끝까지)를 감싸서, 어디서 멈추든
+    # 다음번엔 반드시 스택이 찍히게 한다.
+    faulthandler.dump_traceback_later(60, file=sys.stderr)
+    try:
+        _main_impl()
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+
+
+def _main_impl():
     if 'auth_user' not in st.session_state:
         st.session_state.auth_user = None
 
