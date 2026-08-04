@@ -381,7 +381,16 @@ def fetch_market_index_table():
                 vpayload = vres.json()
                 vdatas = vpayload.get("datas") or []
                 vdata = vdatas[0] if vdatas else {}
-                vol_raw = vdata.get("accumulatedTradingVolume", None)
+                # ── [진짜 원인] ────────────────────────────────────────────────
+                # accumulatedTradingVolume 필드는 "301,494천주"처럼 "천주" 단위
+                # 접미사가 붙은 표시용 문자열이라, 콤마만 지우고 int()로 바꾸면
+                # 한글이 남아있어 매번 예외가 나고 있었다(그래서 항상 N/A).
+                # 응답에 접미사 없는 순수 숫자 문자열인 accumulatedTradingVolumeRaw
+                # 필드가 별도로 있으므로 이걸 우선 사용한다.
+                vol_raw = vdata.get("accumulatedTradingVolumeRaw", None)
+                if vol_raw in (None, ""):
+                    # Raw 필드가 없는 경우를 대비해, 표시용 필드에서 숫자만 남기는 방식으로 대체
+                    vol_raw = re.sub(r"[^\d]", "", str(vdata.get("accumulatedTradingVolume", ""))) or None
                 if vol_raw:
                     vol = f"{int(str(vol_raw).replace(',', '')):,}"
                 vol_debug = {
