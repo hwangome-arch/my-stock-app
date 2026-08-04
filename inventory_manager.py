@@ -126,10 +126,24 @@ def _get_or_heal_executor(raw_getter, name, max_workers, stuck_threshold=25):
     tracker = _get_pool_stuck_tracker()
     now = time.time()
 
-    if active >= max_workers and queued > 0:
+    # ── [자가치유 무한 리셋 버그 수정] ──────────────────────────────────
+    # 기존에는 "queued > 0"이 아니면 곧바로 tracker.pop()으로 감시 타이머를
+    # 지워버렸다. 그런데 풀이 좀비 스레드로 완전히 막힌 뒤 사용자가 클릭을
+    # 멈추면(=새로 쌓이는 대기 작업이 없어짐) queued는 0으로 떨어지지만,
+    # active는 여전히 max_workers에 머물러 있다(죽은 스레드가 슬롯을 영원히
+    # 점유). 이 순간 매번 타이머가 리셋되어 stuck_threshold에 절대 도달하지
+    # 못했고, 그 결과 자가치유가 사실상 한 번도 발동하지 않았다(=수동 리붓
+    # 이외에는 회복 방법이 없는 상태로 이어진 진짜 원인).
+    # 해결: "막힘 의심" 타이머는 active가 max_workers 밑으로 내려왔을 때만
+    # (=실제로 워커가 하나라도 정상적으로 반환됐을 때만) 리셋한다. queued가
+    # 일시적으로 0이 되는 것만으로는 리셋하지 않는다. 단, 타이머 시작 자체는
+    # 여전히 queued > 0인 순간(=진짜로 밀린 대기열이 있었던 순간)에만 건다 —
+    # 그래야 "일시적으로 바쁘기만 한" 정상 상태를 오탐하지 않는다.
+    if active >= max_workers:
         since = tracker.get(name)
         if since is None:
-            tracker[name] = now
+            if queued > 0:
+                tracker[name] = now
         elif now - since >= stuck_threshold:
             print(f"[POOL HEAL {datetime.datetime.now().strftime('%H:%M:%S')}] "
                   f"'{name}' 풀이 {stuck_threshold}초 이상 완전히 막혀있어 새 풀로 교체함 "
