@@ -448,6 +448,19 @@ def fetch_market_index_table():
     return {k: result.get(k, {"name": all_targets[k]["name"], "value": "-", "status": "neutral"})
             for k in all_targets.keys()}
 
+# ── [로그인 직후 스파크라인 차트가 가끔 통째로 빈 상태로 굳어버리는 문제 수정] ────
+# 문제: fetch_sparkline_data()는 st.cache_data(ttl=86400)로 하루 종일 캐싱되는데,
+# 야후 파이낸스(yfinance) 쪽이 그 순간 일시적으로 느리거나(클라우드 IP 레이트리밋 등)
+# df.empty로 응답하면 그 종목은 빈 리스트([])로 채워지고, 그 "빈 결과"가 그대로
+# 하루 종일 캐싱되어버린다. 그래서 로그인 시점에 우연히 한 번 실패한 지수(코스피/
+# 코스닥 등)는 캐시가 갱신되는 다음 날까지 계속 차트 없는 카드로 보였다.
+# 해결: (1) 첫 시도가 실패하면 짧게 대기 후 한 번 더 재시도해서 순간적인 실패 자체를
+# 줄이고, (2) 그래도 실패하면 완전히 빈 값 대신 "마지막으로 성공했던 값"을 대신
+# 돌려준다. _SPARKLINE_LAST_GOOD은 모듈 전역(프로세스 생존 기간 동안 유지)이라,
+# 한 번이라도 성공한 적이 있는 종목은 이후 일시적 실패가 있어도 차트가 비어 보이지
+# 않는다(값이 하루 정도 오래된 것일 수는 있지만, 완전히 비는 것보다 훨씬 낫다).
+_SPARKLINE_LAST_GOOD = {}
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_sparkline_data():
     """시장 지수 카드용 180일 스파크라인 데이터를 yfinance로 수집."""
@@ -461,23 +474,30 @@ def fetch_sparkline_data():
     }
 
     def get_history(key, symbol):
-        try:
-            import yfinance as yf
-            df = yf.Ticker(symbol).history(period="180d", interval="1d", timeout=8)
-            if df.empty or "Close" not in df.columns:
-                return key, []
-            closes = df["Close"].dropna().tolist()
-            return key, closes
-        except:
-            return key, []
+        for attempt in range(2):  # 일시적 실패 대비 1회 재시도
+            try:
+                import yfinance as yf
+                df = yf.Ticker(symbol).history(period="180d", interval="1d", timeout=8)
+                if not df.empty and "Close" in df.columns:
+                    closes = df["Close"].dropna().tolist()
+                    if closes:
+                        _SPARKLINE_LAST_GOOD[key] = closes  # 성공한 값만 "마지막 성공값"으로 갱신
+                        return key, closes
+            except Exception:
+                pass
+            if attempt == 0:
+                time.sleep(0.5)
+        # 이번 조회가 끝내 실패했으면, 진짜 빈 리스트 대신 마지막 성공값으로 대체한다.
+        # (한 번도 성공한 적이 없으면 어쩔 수 없이 빈 리스트 — 카드 자체는 정상 렌더링됨)
+        return key, _SPARKLINE_LAST_GOOD.get(key, [])
 
     result = run_parallel_safe(
         lambda kv: get_history(kv[0], kv[1]), list(targets.items()),
         max_workers=6, overall_timeout=12, per_result_timeout=6,
     )
-    # 실패/타임아웃난 종목은 빈 리스트로 채워서 카드가 항상 렌더링되게 함
+    # 실패/타임아웃난 종목은 마지막 성공값(없으면 빈 리스트)으로 채워서 카드가 항상 렌더링되게 함
     for k in targets.keys():
-        result.setdefault(k, [])
+        result.setdefault(k, _SPARKLINE_LAST_GOOD.get(k, []))
     return result
 
 
