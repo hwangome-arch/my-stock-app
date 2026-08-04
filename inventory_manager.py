@@ -357,32 +357,47 @@ def fetch_market_index_table():
 
     def get_naver(key, meta):
         try:
-            # ── [거래량 N/A 수정] ──────────────────────────────────────────────
-            # 기존 m.stock.naver.com/api/index/{symbol}/basic 엔드포인트는 가격/
-            # 등락률만 내려주고 accumulatedTradingVolume(거래량) 필드 자체가 응답에
-            # 없어서 거래량이 항상 N/A로 빠졌다. 거래량까지 포함된 realtime 엔드포인트로
-            # 교체한다. 이 엔드포인트는 데이터가 datas[] 배열의 첫 번째 항목에 담겨 온다.
-            url = f"https://polling.finance.naver.com/api/realtime/domestic/index/{meta['symbol']}"
+            # 가격/등락률은 원래부터 안정적으로 동작하던 /basic 엔드포인트를 그대로 사용.
+            url = f"https://m.stock.naver.com/api/index/{meta['symbol']}/basic"
             res = requests.get(url, headers=headers, timeout=6)
-            payload = res.json()
-            datas = payload.get("datas") or []
-            data = datas[0] if datas else {}
+            data = res.json()
             price = float(str(data.get("closePrice", "0")).replace(",", ""))
             diff = float(str(data.get("compareToPreviousClosePrice", "0")).replace(",", ""))
             diff_pct = float(str(data.get("fluctuationsRatio", "0")).replace(",", ""))
             sign = "+" if diff >= 0 else ""
-            vol_raw = data.get("accumulatedTradingVolume", None)
-            vol = f"{int(str(vol_raw).replace(',', '')):,}" if vol_raw else "N/A"
-            # ── [진단] 거래량이 N/A로 빠질 때 원인을 바로 확인할 수 있도록 원본 응답 저장 ──
-            # accumulatedTradingVolume 필드가 실제로 없는지, 이름이 바뀌었는지, 값이
-            # 0/None인지 등을 API 응답 원본(JSON 키 목록 + 전체 값)으로 바로 확인한다.
-            _DEBUG_STORE[f"_index_vol_debug_{key}"] = {
-                "url": url,
-                "http_status": res.status_code,
-                "accumulatedTradingVolume_raw": vol_raw,
-                "response_keys": list(data.keys()) if isinstance(data, dict) else type(data).__name__,
-                "response_full": data,
-            }
+
+            # ── [거래량 수정] ──────────────────────────────────────────────────
+            # /basic 엔드포인트는 애초에 accumulatedTradingVolume 필드를 안 내려줘서
+            # 거래량이 항상 N/A였다. 거래량은 realtime 엔드포인트에서 "별도로" 시도하되,
+            # 이 호출이 실패하더라도(예: Referer 체크, 응답 형식 차이 등) 위에서 이미
+            # 받아온 가격/등락률까지 통째로 날아가지 않도록 완전히 분리된 try/except로
+            # 감싼다. 실패하면 그냥 거래량만 N/A로 남고 카드의 나머지는 정상 표시된다.
+            vol = "N/A"
+            vol_debug = {}
+            try:
+                vol_headers = {**headers, "Referer": "https://m.stock.naver.com/"}
+                vol_url = f"https://polling.finance.naver.com/api/realtime/domestic/index/{meta['symbol']}"
+                vres = requests.get(vol_url, headers=vol_headers, timeout=6)
+                vpayload = vres.json()
+                vdatas = vpayload.get("datas") or []
+                vdata = vdatas[0] if vdatas else {}
+                vol_raw = vdata.get("accumulatedTradingVolume", None)
+                if vol_raw:
+                    vol = f"{int(str(vol_raw).replace(',', '')):,}"
+                vol_debug = {
+                    "url": vol_url,
+                    "http_status": vres.status_code,
+                    "accumulatedTradingVolume_raw": vol_raw,
+                    "response_keys": list(vdata.keys()) if isinstance(vdata, dict) else type(vdata).__name__,
+                    "response_full": vdata,
+                }
+            except Exception as ve:
+                vol_debug = {
+                    "예외": f"{type(ve).__name__}: {ve}",
+                    "response_text_head": (vres.text[:300] if 'vres' in locals() else None),
+                }
+            _DEBUG_STORE[f"_index_vol_debug_{key}"] = vol_debug
+
             return key, {
                 "name": meta["name"], "subtitle": meta["subtitle"],
                 "value": f"{price:,.2f}",
@@ -392,7 +407,7 @@ def fetch_market_index_table():
                 "volume": vol,
             }
         except Exception as e:
-            _DEBUG_STORE[f"_index_vol_debug_{key}"] = {"예외": f"{type(e).__name__}: {e}"}
+            _DEBUG_STORE[f"_index_vol_debug_{key}"] = {"예외(가격 조회 자체 실패)": f"{type(e).__name__}: {e}"}
             return key, None
 
     def get_yfinance(key, meta):
