@@ -395,33 +395,20 @@ def render_async_multi(job_key, submit_fn, collect_fn, default_result,
         cached = results_cache.get(job_key)
         if cached is not None and (time.time() - cached["ts"]) < result_ttl:
             return cached["result"], True
-        job = {"futures": submit_fn(), "started_at": time.time()}
+        job = {"futures": submit_fn(), "started_at": time.time(), "overall_timeout": overall_timeout}
         jobs[job_key] = job
 
     futures = job["futures"]
     all_done = all(f.done() for f in futures.values())
-    timed_out = (time.time() - job["started_at"]) > overall_timeout
+    timed_out = (time.time() - job["started_at"]) > job.get("overall_timeout", overall_timeout)
 
     if not all_done and not timed_out:
-        @st.fragment(run_every=poll_interval)
-        def _poll():
-            # ── [프래그먼트 전용 워치독] ────────────────────────────────────
-            # 이 함수는 main()을 다시 타지 않고 Streamlit이 자체적으로
-            # poll_interval마다 스케줄링해서 실행한다. 즉 main() 쪽에 걸어둔
-            # 워치독의 감시망 밖이다. 만약 멈춤이 main() 진입 로그("페이지
-            # 진입") 없이 발생한다면, 바로 이 프래그먼트 실행 도중일 가능성이
-            # 높다 — 그래서 여기에도 독립적인 짧은 워치독을 건다. 정상 실행은
-            # done() 체크 + st.info/st.rerun 뿐이라 순식간에 끝나야 하므로
-            # 8초면 충분히 넉넉하다.
-            faulthandler.dump_traceback_later(8, file=sys.stderr)
-            try:
-                if all(f.done() for f in futures.values()) or (time.time() - job["started_at"]) > overall_timeout:
-                    st.rerun()  # 준비 완료 → 프래그먼트가 아니라 앱 전체를 다시 그려서 실제 데이터를 반영
-                else:
-                    st.info(f"🔄 {spinner_text}")
-            finally:
-                faulthandler.cancel_dump_traceback_later()
-        _poll()
+        # ── [fragment #10719 회피] 여기서 직접 st.fragment(run_every=...)를 만들지
+        # 않는다. 대신 job을 _bg_jobs에 남겨둔 채로 그냥 "아직" 상태를 반환하면,
+        # _main_impl()이 페이지 렌더링 뒤 호출하는 maybe_run_global_poller() →
+        # 세션 전체에 단 하나뿐인 _global_poll_fragment()가 이 job을 포함해 모든
+        # 대기 중인 작업을 함께 감시한다. spinner_text는 더 이상 여기서 개별
+        # 표시하지 않고, 전역 fragment가 진행 중인 작업 개수로 통합해서 보여준다.
         return default_result, False
 
     # 다 끝났거나 상한 시간을 넘김 → 끝난 것만 회수, 안 끝난 항목은 collect_fn이
@@ -433,6 +420,74 @@ def render_async_multi(job_key, submit_fn, collect_fn, default_result,
     jobs.pop(job_key, None)
     results_cache[job_key] = {"result": result, "ts": time.time()}  # 짧은 재사용 캐시 갱신
     return result, True
+
+# ── [근본 수정] 세션당 폴링 fragment는 딱 1개만 존재하도록 통합 ──────────────
+# Streamlit 확인된 버그(#10719, github.com/streamlit/streamlit/issues/10719):
+# run_every로 자동 재실행되는 fragment가 세션 안에 2개 이상 동시에 존재하면,
+# 어느 한쪽의 재실행 타이밍이 겹치는 순간 "The fragment with id ... does not
+# exist anymore" 예외와 함께 그 세션이 죽는다. 이건 파이썬 스레드가 블로킹되는
+# 게 아니라 Streamlit 프레임워크 내부에서 예외로 죽는 것이라, faulthandler
+# 워치독(멈춘 스레드의 콜스택을 찍는 도구)에는 아무것도 안 잡힌다 — 애초에
+# "멈춰있는" 스레드가 없기 때문이다.
+#
+# 기존에는 render_async_multi/run_unified_market_scan_async를 호출하는 곳마다
+# 각자 자기 fragment를 만들었다(대시보드 카드, 수급 추이 토글, 관심종목 프리페치,
+# 전체 스캔 등). 이 중 두 곳이 동시에 "아직 완료 안 됨" 상태가 되면(예: 스캔이
+# 도는 중에 관심종목 탭으로 이동) 정확히 이 버그 조건이 만들어졌다. 일부 호출부는
+# "스캔 중이면 건너뛰기" 식으로 개별 가드를 달아뒀지만, 새 호출부가 생길 때마다
+# 매번 수동으로 챙겨야 해서 재발 여지가 있었다(실제로 대시보드 자체 데이터 로딩과
+# 관심종목 프리페치 두 곳은 이 가드가 빠져 있었다).
+#
+# 해결: fragment 정의/호출 지점을 앱 전체에서 이 함수 하나로 통합한다. 개별
+# render_async_multi/run_unified_market_scan_async 호출은 더 이상 자기 fragment를
+# 만들지 않고, 그저 "완료 안 됨" 상태만 반환한다. 실제 폴링은 _main_impl()이
+# 페이지 렌더링을 마친 뒤 딱 한 번 호출하는 이 전역 fragment가 _bg_jobs와
+# _scan_jobs를 전부 훑어서 담당한다 — 물리적으로 fragment 호출이 세션당 항상
+# 최대 1개이므로, 정의상 #10719가 재현될 수 없다.
+def _all_jobs_settled():
+    """_bg_jobs / _scan_jobs에 아직 완료되지도, 시간 초과되지도 않은 작업이
+    하나라도 남아있으면 False."""
+    now = time.time()
+    for job in list(st.session_state.get("_bg_jobs", {}).values()):
+        futures = job.get("futures", {})
+        done = all(f.done() for f in futures.values())
+        timed_out = (now - job["started_at"]) > job.get("overall_timeout", 20)
+        if not done and not timed_out:
+            return False
+    for job in list(st.session_state.get("_scan_jobs", {}).values()):
+        future = job.get("future")
+        if future is None:
+            continue
+        timed_out = (now - job["started_at"]) > job.get("overall_timeout", 150)
+        stalled = (now - job.get("_last_pct_change_at", job["started_at"])) > 50
+        if not future.done() and not timed_out and not stalled:
+            return False
+    return True
+
+
+@st.fragment(run_every=0.4)
+def _global_poll_fragment():
+    """세션 전체를 통틀어 유일하게 존재하는 주기적(run_every) fragment.
+    _bg_jobs/_scan_jobs에 대기 중인 작업이 하나라도 있을 때만 main()에서 호출된다."""
+    faulthandler.dump_traceback_later(8, file=sys.stderr)
+    try:
+        if _all_jobs_settled():
+            st.rerun()  # 전부 끝남 → 전체 rerun으로 실제 데이터를 반영
+        else:
+            n_bg = len(st.session_state.get("_bg_jobs", {}))
+            n_scan = len(st.session_state.get("_scan_jobs", {}))
+            st.info(f"🔄 데이터를 불러오는 중... (백그라운드 작업 {n_bg + n_scan}건 진행 중)")
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+
+
+def maybe_run_global_poller():
+    """_main_impl()의 페이지 디스패치 직후 딱 한 번 호출. 대기 중인 백그라운드
+    작업이 있을 때만 전역 폴링 fragment를 띄운다(없으면 아무것도 안 함)."""
+    has_pending = bool(st.session_state.get("_bg_jobs")) or bool(st.session_state.get("_scan_jobs"))
+    if has_pending:
+        _global_poll_fragment()
+# ────────────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_market_index_table():
@@ -3201,13 +3256,13 @@ def run_unified_market_scan_async(job_key="unified_scan", overall_timeout=150):
         job_id = f"{job_key}_{time.time()}"
         _SCAN_JOB_STATE[job_id] = {"text": "스캔 준비 중...", "pct": 0, "done": False}
         future = submit_with_ctx(get_orchestration_executor(), _unified_scan_worker, job_id)
-        job = {"job_id": job_id, "future": future, "started_at": time.time()}
+        job = {"job_id": job_id, "future": future, "started_at": time.time(), "overall_timeout": overall_timeout}
         jobs[job_key] = job
 
     job_id = job["job_id"]
     future = job["future"]
     state = _SCAN_JOB_STATE.get(job_id, {})
-    timed_out = (time.time() - job["started_at"]) > overall_timeout
+    timed_out = (time.time() - job["started_at"]) > job.get("overall_timeout", overall_timeout)
 
     # ── [진행률 정체 감지] "죽지도 않고 응답도 안 오는" 소켓/DNS 행에 대한 방어 ──
     # concurrent.futures 타임아웃은 대부분의 경우를 막아주지만, DNS 조회 단계처럼
@@ -3220,24 +3275,16 @@ def run_unified_market_scan_async(job_key="unified_scan", overall_timeout=150):
     if state.get("_last_pct_seen") != _last_pct:
         state["_last_pct_seen"] = _last_pct
         state["_last_pct_change_at"] = _now
+    # 전역 폴링 fragment(_all_jobs_settled)가 이 job의 정체 여부를 판단할 수 있도록
+    # job dict 자체에도 최신 정체-시각을 반영해둔다.
+    job["_last_pct_change_at"] = state.get("_last_pct_change_at", job["started_at"])
     _stalled = (_now - state.get("_last_pct_change_at", job["started_at"])) > 50
 
     if not future.done() and not timed_out and not _stalled:
         st.progress(min(state.get("pct", 0), 100), text=f"🔄 {state.get('text', '스캔 중...')}")
-
-        @st.fragment(run_every=0.4)
-        def _poll():
-            faulthandler.dump_traceback_later(8, file=sys.stderr)
-            try:
-                _st = _SCAN_JOB_STATE.get(job_id, {})
-                _stall_now = (time.time() - _st.get("_last_pct_change_at", job["started_at"])) > 50
-                if future.done() or (time.time() - job["started_at"]) > overall_timeout or _stall_now:
-                    st.rerun()
-                else:
-                    st.info(f"🔄 {_st.get('text', '스캔 중...')} ({min(_st.get('pct', 0), 100)}%)")
-            finally:
-                faulthandler.cancel_dump_traceback_later()
-        _poll()
+        # ── [fragment #10719 회피] 여기서도 자체 fragment를 만들지 않는다. job이
+        # _scan_jobs에 남아있으면, 페이지 렌더링 뒤 호출되는 maybe_run_global_poller()의
+        # 전역 fragment가 이어서 감시하고 완료 시 st.rerun()으로 갱신해준다.
         return
 
     # 완료(또는 상한 시간 초과 / 진행률 정체) → 결과를 메인 스레드에서 session_state에 반영
@@ -5778,6 +5825,16 @@ def _main_impl():
         faulthandler.cancel_dump_traceback_later()
 
     print(f"[DEBUG {datetime.datetime.now().strftime('%H:%M:%S')}] 페이지 렌더링 완료: {selected}", file=sys.stderr, flush=True)
+
+    # ── [전역 폴링 fragment 호출 — 세션당 이 한 곳에서만] ─────────────────────
+    # 위에서 렌더링한 페이지가 render_async_multi/run_unified_market_scan_async를
+    # 통해 _bg_jobs 또는 _scan_jobs에 작업을 남겨뒀을 수 있다. 그 작업들의 완료
+    # 여부를 감시하는 주기적(run_every) fragment는 앱 전체에서 이 호출 단 한 곳에서만
+    # 만들어진다 — 어떤 페이지·어떤 카드가 몇 개의 백그라운드 작업을 걸어뒀든
+    # 물리적으로 fragment는 세션당 최대 1개만 존재하므로, Streamlit #10719
+    # ("2개 이상의 run_every fragment 동시 존재 시 세션 다운")가 구조적으로
+    # 재현될 수 없다.
+    maybe_run_global_poller()
 
 
 def render_rate_strip():
