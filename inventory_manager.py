@@ -29,6 +29,27 @@ from itertools import zip_longest
 socket.setdefaulttimeout(20)
 # ────────────────────────────────────────────────────────────────────────
 
+# ── [워치독 근본 수정] dump_traceback_later는 프로세스 전역(세션 공유) 알람이다 ──
+# faulthandler.dump_traceback_later(N) / cancel_dump_traceback_later()는 파이썬
+# 공식 문서상 스레드별/세션별이 아니라 "프로세스 전체에서 딱 하나만 존재하는"
+# 전역 알람이다 — 두 번째 호출은 첫 번째 예약을 그냥 덮어쓰고 취소한다.
+# Streamlit은 한 프로세스 안에서 여러 세션(여러 탭·사용자)의 스크립트를 동시에
+# 실행하고, 폴링 fragment는 0.4초마다 자기 몫의 dump_traceback_later(8)→cancel을
+# 반복한다. 그래서 어떤 세션이 실제로 멈춰서 45초/60초짜리 워치독을 걸어놔도,
+# 곧바로 다른 세션(또는 다른 fragment 틱)이 그 전역 알람을 덮어쓰고 즉시
+# 취소해버려서, 진짜로 멈춰도 트레이스백이 "절대" 안 찍히는 상태였다.
+# (지금까지 "워치독에도 안 찍힌다"던 미스터리의 정체 — 실측 로그로 확인됨:
+# "페이지 진입" 로그만 있고 "페이지 렌더링 완료"가 끝내 안 찍혔는데도 dump가 없었음)
+#
+# 해결: 여기저기서 개별적으로 걸었다 취소했다 하지 않는다. 프로세스가 시작될 때
+# 딱 한 번, repeat=True로 영구 등록한다. 이러면 몇 초마다 무조건(멈췄든 안
+# 멈췄든) 그 순간 살아있는 모든 스레드의 파이썬 콜스택을 stderr(Streamlit Cloud
+# 로그)에 찍는다. 평소엔 로그가 조금 시끄러워지지만, 실제로 멈추는 순간의
+# 스택트레이스를 이번엔 확실히 잡아낼 수 있다. 원인을 특정한 뒤에는 interval을
+# 늘리거나(예: 120초) 제거해도 된다.
+faulthandler.dump_traceback_later(30, repeat=True, file=sys.stderr)
+# ────────────────────────────────────────────────────────────────────────
+
 # ── 백그라운드 스레드(ThreadPoolExecutor)에서도 안전하게 쓸 수 있는 디버그 정보 저장소 ──
 # st.session_state는 스크립트를 실행하는 메인 스레드 밖(예: 관심종목 페이지의 병렬 조회
 # 워커 스레드)에서 접근하면 Streamlit 공식 문서상 지원되지 않으며, 실제로 이로 인해
@@ -468,17 +489,27 @@ def _all_jobs_settled():
 @st.fragment(run_every=0.4)
 def _global_poll_fragment():
     """세션 전체를 통틀어 유일하게 존재하는 주기적(run_every) fragment.
-    _bg_jobs/_scan_jobs에 대기 중인 작업이 하나라도 있을 때만 main()에서 호출된다."""
-    faulthandler.dump_traceback_later(8, file=sys.stderr)
-    try:
-        if _all_jobs_settled():
-            st.rerun()  # 전부 끝남 → 전체 rerun으로 실제 데이터를 반영
-        else:
-            n_bg = len(st.session_state.get("_bg_jobs", {}))
-            n_scan = len(st.session_state.get("_scan_jobs", {}))
-            st.info(f"🔄 데이터를 불러오는 중... (백그라운드 작업 {n_bg + n_scan}건 진행 중)")
-    finally:
-        faulthandler.cancel_dump_traceback_later()
+    _bg_jobs/_scan_jobs에 대기 중인 작업이 하나라도 있을 때만 main()에서 호출된다.
+    ⚠️ 여기서 dump_traceback_later를 걸었다 취소하면 안 된다 — 이 함수는 0.4초마다
+    실행되므로, 그러면 파일 상단에서 걸어둔 영구(repeat=True) 워치독을 계속
+    덮어쓰고 취소해버려서 다른 세션이 실제로 멈췄을 때 트레이스백이 안 찍히게 된다
+    (실제로 이게 원인이었던 사례가 있었다)."""
+    if _all_jobs_settled():
+        st.rerun()  # 전부 끝남 → 전체 rerun으로 실제 데이터를 반영
+    else:
+        n_bg = len(st.session_state.get("_bg_jobs", {}))
+        scan_jobs = st.session_state.get("_scan_jobs", {})
+        # 스캔이 진행 중이면(가장 오래 걸리는 작업이므로) 그 실시간 %를 우선 보여준다.
+        # 이게 없으면 사용자 입장에서 게이지가 그대로 멈춘 것처럼 보인다.
+        scan_pct_text = ""
+        for job in scan_jobs.values():
+            _job_id = job.get("job_id")
+            _st = _SCAN_JOB_STATE.get(_job_id, {})
+            if _st:
+                scan_pct_text = f" — {_st.get('text', '스캔 중...')} ({min(_st.get('pct', 0), 100)}%)"
+            break
+        n_total = n_bg + len(scan_jobs)
+        st.info(f"🔄 데이터를 불러오는 중... (백그라운드 작업 {n_total}건 진행 중){scan_pct_text}")
 
 
 def maybe_run_global_poller():
@@ -5469,18 +5500,9 @@ def _show_debug_memory():
 
 
 def main():
-    # ── [main() 전체를 감싸는 워치독] ────────────────────────────────────
-    # 기존에는 페이지 디스패치(render_dashboard 등 호출) 구간에만 워치독을
-    # 걸어뒀는데, 로그를 보니 "페이지 진입" 로그조차 안 찍히고 멈춘 사례가
-    # 있었다 — 즉 멈춤이 디스패치 이전(세션 초기화, 사이드바, 메모리 표시 등)
-    # 이나, main()을 아예 거치지 않는 폴링 프래그먼트 안에서도 일어날 수 있다는
-    # 뜻이다. main() 전체(로그인 처리부터 끝까지)를 감싸서, 어디서 멈추든
-    # 다음번엔 반드시 스택이 찍히게 한다.
-    faulthandler.dump_traceback_later(60, file=sys.stderr)
-    try:
-        _main_impl()
-    finally:
-        faulthandler.cancel_dump_traceback_later()
+    # ── [워치독 통합] 개별 arm/cancel은 파일 상단의 영구(repeat=True) 워치독과
+    # 충돌하므로 여기서 더 이상 걸지 않는다 (자세한 이유는 파일 상단 주석 참고).
+    _main_impl()
 
 
 def _main_impl():
@@ -5798,31 +5820,17 @@ def _main_impl():
     # "진입"만 있고 "완료"가 없는 페이지가 바로 멈춘 지점이다.
     print(f"[DEBUG {datetime.datetime.now().strftime('%H:%M:%S')}] 페이지 진입: {selected}", file=sys.stderr, flush=True)
 
-    # ── [멈춤 원인 확정 진단용 워치독] ──────────────────────────────────────
-    # 지금까지 건 timeout들(overall_timeout/per_result_timeout 등)은 전부
-    # "우리가 짠 코드 안에서" future.result()를 기다리는 지점에만 적용된다.
-    # 만약 진짜 원인이 그 바깥(예: 서드파티 라이브러리 내부의 진짜 소켓/락 대기,
-    # 혹은 우리가 미처 못 찾은 다른 블로킹 지점)에 있다면 그 어떤 timeout도
-    # 안 걸리고 이 스크립트 실행 자체가 영원히 멈춘다 — 지금 겪고 있는 정확히
-    # 그 증상이다.
-    # faulthandler.dump_traceback_later(45)는 "지금부터 45초 안에 아래
-    # cancel이 호출되지 않으면, 그 순간 살아있는 모든 스레드의 파이썬 콜스택을
-    # 통째로 stderr(=Streamlit Cloud 로그)에 자동으로 찍어라"는 뜻이다. 정상
-    # 렌더링은 몇 초~십몇 초 안에 끝나므로 cancel이 항상 먼저 호출되어 아무
-    # 일도 안 일어나지만, 다음에 또 멈추면 그 순간 정확히 어느 스레드가 어느
-    # 파일의 몇 번째 줄에서 멎어있는지가 로그에 그대로 남는다. 이러면 더 이상
-    # 추측 없이 정확한 원인을 특정할 수 있다.
-    faulthandler.dump_traceback_later(45, file=sys.stderr)
-    try:
-        if   selected == "대시보드 홈":      render_dashboard()
-        elif selected == "추천 종목":        render_recommendations()
-        elif selected == "종목 스크리너":    render_screener()
-        elif selected == "기업 재무 분석":   render_fnguide()
-        elif selected == "실시간 배당 순위": render_dividend()
-        elif selected == "관심종목":         render_watchlist()
-        elif selected == "비밀번호 변경":     render_change_password()
-    finally:
-        faulthandler.cancel_dump_traceback_later()
+    # ── [워치독 통합] 개별 arm/cancel은 파일 상단의 영구(repeat=True) 워치독과
+    # 충돌하므로 여기서 더 이상 걸지 않는다 (자세한 이유는 파일 상단 주석 참고).
+    # "진입"/"완료" 로그 자체는 여전히 유용하므로(어느 페이지에서 안 돌아오는지
+    # 특정 가능) 그대로 남겨둔다.
+    if   selected == "대시보드 홈":      render_dashboard()
+    elif selected == "추천 종목":        render_recommendations()
+    elif selected == "종목 스크리너":    render_screener()
+    elif selected == "기업 재무 분석":   render_fnguide()
+    elif selected == "실시간 배당 순위": render_dividend()
+    elif selected == "관심종목":         render_watchlist()
+    elif selected == "비밀번호 변경":     render_change_password()
 
     print(f"[DEBUG {datetime.datetime.now().strftime('%H:%M:%S')}] 페이지 렌더링 완료: {selected}", file=sys.stderr, flush=True)
 
