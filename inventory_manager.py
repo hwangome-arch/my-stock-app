@@ -350,16 +350,27 @@ def run_with_progress(text, func, *args, **kwargs):
 #
 # 해결: 무거운 조회는 지금처럼 공유 스레드풀에 던져두되(get_shared_executor /
 # get_orchestration_executor는 그대로 재사용), 메인 스크립트는 그 결과를 절대
-# 한 번에 몰아서 기다리지 않는다. 대신 st.fragment(run_every=poll_interval)로
-# "다 됐는지"만 아주 짧은 간격(기본 0.4초)마다 확인하는 조각을 별도로 실행한다.
-# 이 프래그먼트가 쉬는 그 짧은 간격마다 Streamlit이 사용자의 새 클릭을 정상적으로
-# 받아 즉시 새 스크립트 실행으로 넘어갈 수 있다. 즉 탭 전환 시 최대 지연이
-# (기존) 최대 수십 초 → (개선) 대략 poll_interval 수준으로 줄어든다.
-# 작업(future)은 session_state에 보관되므로, 로딩 도중 다른 탭으로 갔다가 다시
-# 돌아와도 이미 던져둔 작업이 그대로 이어서 진행되며 처음부터 다시 조회하지 않는다.
+# 한 번에 몰아서 기다리지 않는다.
 #
-# ⚠️ st.fragment(run_every=...)는 Streamlit 1.37 이상이 필요하다. 그보다 낮은
-# 버전이면 이 헬퍼 대신 기존 방식을 유지해야 한다 (streamlit --version으로 확인).
+# ── [버그 수정: st.fragment(run_every=...) 완전 제거] ────────────────────────
+# 예전에는 여기서 st.fragment(run_every=poll_interval)로 "다 됐는지"를 아주 짧은
+# 간격마다 자동으로 확인하고 st.rerun()을 걸었다. 그런데 이 자동 폴링 프래그먼트가
+# Streamlit 자체의 확인된 버그(github.com/streamlit/streamlit/issues/10719 등 —
+# "The fragment with id ... does not exist anymore")를 유발했다. 토글을 반복하거나
+# 페이지를 빠르게 이동하면 화면에서 이미 사라진 프래그먼트가 백엔드에서는 계속
+# 스케줄링되고 있다가 다음 rerun과 겹치면서, 운이 나쁘면 그 세션의 스크립트
+# 실행 자체가 통째로 wedge되어 새로고침(재부팅) 말고는 복구할 방법이 없었다.
+# (faulthandler 워치독에도 아무 트레이스백이 안 찍혔던 것으로 봐서, 이건 우리
+# 파이썬 코드가 아니라 Streamlit 프레임워크 내부 스케줄링 레이어에서 죽는
+# 현상이라 우리 쪽에서 잡아낼 수도, 고칠 수도 없다.)
+#
+# 해결: run_every 자동 폴링을 완전히 없애고, "아직 준비 안 됨" 상태를 안내 문구 +
+# 수동 새로고침 버튼으로 대체한다. 백그라운드 스레드풀 작업 자체는 그대로
+# session_state에 남아서 계속 진행되므로(다른 탭에 갔다 와도 안 끊김), 사용자가
+# 버튼을 누르거나 다른 상호작용을 하는 순간(=어차피 Streamlit이 정상적으로
+# 처리하는 일반 rerun) 바로 최신 상태가 반영된다. 자동으로 몇 초마다 화면이
+# 저절로 바뀌는 "편의"는 포기하지만, 그 대가로 세션이 통째로 멈추는 버그
+# 자체가 원천적으로 발생하지 않는다.
 def render_async_multi(job_key, submit_fn, collect_fn, default_result,
                         spinner_text="데이터를 불러오는 중...",
                         poll_interval=0.4, overall_timeout=20, result_ttl=45):
@@ -403,25 +414,16 @@ def render_async_multi(job_key, submit_fn, collect_fn, default_result,
     timed_out = (time.time() - job["started_at"]) > overall_timeout
 
     if not all_done and not timed_out:
-        @st.fragment(run_every=poll_interval)
-        def _poll():
-            # ── [프래그먼트 전용 워치독] ────────────────────────────────────
-            # 이 함수는 main()을 다시 타지 않고 Streamlit이 자체적으로
-            # poll_interval마다 스케줄링해서 실행한다. 즉 main() 쪽에 걸어둔
-            # 워치독의 감시망 밖이다. 만약 멈춤이 main() 진입 로그("페이지
-            # 진입") 없이 발생한다면, 바로 이 프래그먼트 실행 도중일 가능성이
-            # 높다 — 그래서 여기에도 독립적인 짧은 워치독을 건다. 정상 실행은
-            # done() 체크 + st.info/st.rerun 뿐이라 순식간에 끝나야 하므로
-            # 8초면 충분히 넉넉하다.
-            faulthandler.dump_traceback_later(8, file=sys.stderr)
-            try:
-                if all(f.done() for f in futures.values()) or (time.time() - job["started_at"]) > overall_timeout:
-                    st.rerun()  # 준비 완료 → 프래그먼트가 아니라 앱 전체를 다시 그려서 실제 데이터를 반영
-                else:
-                    st.info(f"🔄 {spinner_text}")
-            finally:
-                faulthandler.cancel_dump_traceback_later()
-        _poll()
+        st.info(f"🔄 {spinner_text}")
+        st.button(
+            "🔄 새로고침 (준비되면 자동으로 아래 내용이 표시됩니다)",
+            key=f"_bg_refresh_{job_key}",
+            use_container_width=True,
+        )
+        # 위 버튼 클릭 자체가 일반적인 Streamlit 상호작용이라 자동으로 전체
+        # rerun이 걸린다 — 별도로 st.rerun()을 호출할 필요가 없다. 버튼을
+        # 누르지 않아도, 다른 곳을 클릭하는 등 다음 상호작용이 오면 그때
+        # 자연스럽게 최신 상태로 갱신된다.
         return default_result, False
 
     # 다 끝났거나 상한 시간을 넘김 → 끝난 것만 회수, 안 끝난 항목은 collect_fn이
@@ -3225,19 +3227,12 @@ def run_unified_market_scan_async(job_key="unified_scan", overall_timeout=150):
     if not future.done() and not timed_out and not _stalled:
         st.progress(min(state.get("pct", 0), 100), text=f"🔄 {state.get('text', '스캔 중...')}")
 
-        @st.fragment(run_every=0.4)
-        def _poll():
-            faulthandler.dump_traceback_later(8, file=sys.stderr)
-            try:
-                _st = _SCAN_JOB_STATE.get(job_id, {})
-                _stall_now = (time.time() - _st.get("_last_pct_change_at", job["started_at"])) > 50
-                if future.done() or (time.time() - job["started_at"]) > overall_timeout or _stall_now:
-                    st.rerun()
-                else:
-                    st.info(f"🔄 {_st.get('text', '스캔 중...')} ({min(_st.get('pct', 0), 100)}%)")
-            finally:
-                faulthandler.cancel_dump_traceback_later()
-        _poll()
+        # ── [버그 수정: st.fragment(run_every=...) 제거] ───────────────────
+        # render_async_multi와 동일한 이유로, 자동 폴링 프래그먼트 대신 수동
+        # 새로고침 버튼으로 대체한다. 스캔 자체는 백그라운드 스레드에서 계속
+        # 진행되므로(_SCAN_JOB_STATE에 진행률이 계속 갱신됨), 버튼을 누르거나
+        # 다른 상호작용을 하면 그 시점의 최신 진행률/완료 여부가 바로 반영된다.
+        st.button("🔄 진행률 새로고침", key=f"_scan_refresh_{job_id}", use_container_width=True)
         return
 
     # 완료(또는 상한 시간 초과 / 진행률 정체) → 결과를 메인 스레드에서 session_state에 반영
