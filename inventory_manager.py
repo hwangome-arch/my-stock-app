@@ -1366,6 +1366,46 @@ def fetch_current_price_info(code):
     return info
 
 
+# ── [종목명 폰트 깨짐 버그 수정 — 2026-08-06] ────────────────────────────────
+# 문제: finance.naver.com 응답 인코딩을 이 파일 전체에서 'euc-kr'로 고정해왔다
+# (apparent_encoding 자동감지가 특정 종목명 바이트 패턴을 키릴 계열 등으로
+# 오판해서 파싱이 깨졌던 전례 때문). 그런데 제이브이엠(054950)처럼 페이지가
+# 실제로는 utf-8로 내려오는 종목이 있으면, 그 utf-8 바이트를 euc-kr로 강제
+# 디코딩하게 되어 일부 바이트 시퀀스만 우연히 유효한 euc-kr 글자로 맞아떨어지고
+# (예: '대', '댁') 나머지는 디코딩 실패로 대체 문자(물음표)로 바뀐다 —
+# "????대????댁??"처럼 일부만 정상, 일부는 깨지는 정확히 그 증상이다.
+#
+# 해결: 확률적 추측(chardet/apparent_encoding)에 기대는 대신, HTML 문서 자체가
+# <meta charset="..."> 로 "명시적으로 선언한" 인코딩을 읽어서 그것만 신뢰한다.
+# charset 선언 자체는 항상 ASCII 문자이므로, 원본 바이트를 latin-1로 읽어도
+# (byte ↔ codepoint 1:1 매핑이라 절대 깨지지 않음) 그 선언값 자체는 안전하게
+# 찾아낼 수 있다. 선언을 못 찾은 페이지(예전 방식의 낡은 페이지)만 기존과 동일하게
+# euc-kr로 폴백한다 — 그래서 이전에 euc-kr 고정으로 고쳤던 종목들은 그대로
+# euc-kr을 계속 쓰고, 실제로 utf-8인 페이지만 올바르게 utf-8로 디코딩된다.
+def _decode_naver_html(res, fallback_encoding='euc-kr'):
+    """requests 응답 바이트를, 통계적 추측이 아니라 문서가 선언한 charset을
+    직접 읽어서 안전하게 str로 디코딩한다. 선언이 없으면 fallback_encoding 사용."""
+    raw = res.content
+    try:
+        probe = raw[:2048].decode('latin-1', errors='ignore')
+        m = re.search(r'charset\s*=\s*["\']?\s*([\w\-]+)', probe, re.IGNORECASE)
+        declared = m.group(1).lower().replace('_', '-') if m else None
+    except Exception:
+        declared = None
+
+    if declared in ('utf-8', 'utf8'):
+        chosen = 'utf-8'
+    elif declared in ('euc-kr', 'euckr', 'ks-c-5601-1987', 'cp949', 'ms949'):
+        chosen = 'euc-kr'
+    else:
+        chosen = fallback_encoding  # 선언을 못 찾았거나 못 알아보는 값 → 안전한 기존 기본값 유지
+
+    try:
+        return raw.decode(chosen, errors='replace')
+    except Exception:
+        return raw.decode(fallback_encoding, errors='replace')
+
+
 # 💡 모바일 페이지 기반 fetch_company_info_fnguide
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_company_info_fnguide(code):
@@ -1388,12 +1428,10 @@ def fetch_company_info_fnguide(code):
         nv_url = f"https://finance.naver.com/item/main.naver?code={code}"
         res = requests.get(nv_url, headers=naver_headers, timeout=6)
         name_debug["status"] = res.status_code
-        # 네이버금융 응답 인코딩이 euc-kr 고정이 아닌 경우가 생겨 자동감지로 변경
-        # 네이버금융 응답 인코딩이 euc-kr 고정이 아닌 경우가 생겨 자동감지로 변경했었으나,
-        # apparent_encoding 자동감지가 오히려 특정 종목명에서 오탐(키릴 계열 등으로 오판)해
-        # 파싱이 깨지는 문제가 확인되어 다시 euc-kr 고정으로 되돌림.
-        res.encoding = 'euc-kr'  # 네이버금융(finance.naver.com)은 euc-kr 고정 — apparent_encoding 추측에 의존하면 특정 종목명 바이트 패턴에서 오탐(예: 키릴 계열로 오판)해 파싱이 깨진다
-        html = res.text
+        # [종목명 폰트 깨짐 버그 수정] chardet 추측(apparent_encoding)도, 무조건
+        # euc-kr 고정도 아니라 — 문서가 실제로 선언한 charset을 직접 읽는다.
+        # 자세한 이유는 위 _decode_naver_html() 정의부 주석 참고.
+        html = _decode_naver_html(res, fallback_encoding='euc-kr')
         name_debug["resp_len"] = len(html)
 
         # 타이틀 포맷이 "종목명 : 네이버페이 증권" / "종목명 - 네이버 증권" 등으로 바뀔 수 있어
@@ -3822,6 +3860,20 @@ def draw_fnguide_details(code):
                     _freshness_badge = _quarter_freshness_badge(df_quarter)
                     if _freshness_badge:
                         st.markdown(_freshness_badge, unsafe_allow_html=True)
+                    # ── [분기(E) 컬럼 빈칸 안내 — 2026-08-06] ──────────────────────
+                    # "2026/06(E)"처럼 아직 마감되지 않은 분기는 FnGuide/네이버
+                    # 컨센서스 원본 자체가 매출액·영업이익률·성장률 같은 몇몇 항목만
+                    # 먼저 채워두고, 영업이익(금액)·당기순이익·ROE·PER·PBR·부채비율은
+                    # 분기가 실제로 마감돼 재무제표가 나오기 전까지 공란으로 두는
+                    # 경우가 흔하다(우리 쪽 파싱 실패가 아니라 원본 표 자체의 공백).
+                    # 그걸 그냥 "-"로만 보여주면 버그처럼 보이므로 안내를 덧붙인다.
+                    _latest_q = str(df_quarter['연도/분기'].iloc[-1])
+                    if '(E)' in _latest_q:
+                        st.caption(
+                            f"💡 **{_latest_q}**는 아직 마감되지 않은 분기(컨센서스 추정치)입니다. "
+                            "매출액·영업이익률 등 일부 항목만 먼저 제공되고, 영업이익(금액)·당기순이익·"
+                            "ROE·PER·PBR·부채비율은 분기 마감 후 채워지는 경우가 많습니다."
+                        )
                     df_quarter_display = df_quarter.iloc[::-1].reset_index(drop=True)
                     st.dataframe(format_and_style(df_quarter_display), use_container_width=True, hide_index=True)
                 else:
