@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import socket
 import threading
 import concurrent.futures
@@ -15,6 +16,8 @@ import hmac
 import base64
 import difflib
 import numpy as np
+import faulthandler
+from itertools import zip_longest
 
 # ── 전역 소켓 기본 타임아웃 ──────────────────────────────────────────────
 # gspread(Google Sheets API)처럼 자체적으로 timeout 파라미터를 노출하지 않는
@@ -26,16 +29,48 @@ import numpy as np
 socket.setdefaulttimeout(20)
 # ────────────────────────────────────────────────────────────────────────
 
+# ── [워치독 근본 수정] dump_traceback_later는 프로세스 전역(세션 공유) 알람이다 ──
+# faulthandler.dump_traceback_later(N) / cancel_dump_traceback_later()는 파이썬
+# 공식 문서상 스레드별/세션별이 아니라 "프로세스 전체에서 딱 하나만 존재하는"
+# 전역 알람이다 — 두 번째 호출은 첫 번째 예약을 그냥 덮어쓰고 취소한다.
+# Streamlit은 한 프로세스 안에서 여러 세션(여러 탭·사용자)의 스크립트를 동시에
+# 실행하고, 폴링 fragment는 0.4초마다 자기 몫의 dump_traceback_later(8)→cancel을
+# 반복한다. 그래서 어떤 세션이 실제로 멈춰서 45초/60초짜리 워치독을 걸어놔도,
+# 곧바로 다른 세션(또는 다른 fragment 틱)이 그 전역 알람을 덮어쓰고 즉시
+# 취소해버려서, 진짜로 멈춰도 트레이스백이 "절대" 안 찍히는 상태였다.
+# (지금까지 "워치독에도 안 찍힌다"던 미스터리의 정체 — 실측 로그로 확인됨:
+# "페이지 진입" 로그만 있고 "페이지 렌더링 완료"가 끝내 안 찍혔는데도 dump가 없었음)
+#
+# 해결: 여기저기서 개별적으로 걸었다 취소했다 하지 않는다. 프로세스가 시작될 때
+# 딱 한 번, repeat=True로 영구 등록한다. 이러면 몇 초마다 무조건(멈췄든 안
+# 멈췄든) 그 순간 살아있는 모든 스레드의 파이썬 콜스택을 stderr(Streamlit Cloud
+# 로그)에 찍는다. 평소엔 로그가 조금 시끄러워지지만, 실제로 멈추는 순간의
+# 스택트레이스를 이번엔 확실히 잡아낼 수 있다. 원인을 특정한 뒤에는 interval을
+# 늘리거나(예: 120초) 제거해도 된다.
+faulthandler.dump_traceback_later(30, repeat=True, file=sys.stderr)
+# ────────────────────────────────────────────────────────────────────────
+
 # ── 백그라운드 스레드(ThreadPoolExecutor)에서도 안전하게 쓸 수 있는 디버그 정보 저장소 ──
 # st.session_state는 스크립트를 실행하는 메인 스레드 밖(예: 관심종목 페이지의 병렬 조회
 # 워커 스레드)에서 접근하면 Streamlit 공식 문서상 지원되지 않으며, 실제로 이로 인해
 # 스크립트 실행이 멈춰버리는(무한 로딩) 문제가 발생했다. 단순 dict 대입/조회는 CPython의
 # GIL 덕분에 스레드에서 안전하므로, 디버그용 정보는 여기로 옮겨서 저장한다.
-_DEBUG_STORE = {}
-
-# 스크리너 데이터도 관심종목 병렬조회(백그라운드 스레드)에서 읽히므로, session_state와
-# 별개로 여기에도 항상 최신값을 미러링해두고 스레드에서는 이쪽만 사용한다.
-_SCREENER_DF_CACHE = {"df": None}
+#
+# ── [버그 수정: 매 rerun마다 내용이 사라지던 문제] ──────────────────────────
+# Streamlit은 상호작용(버튼 클릭, st.rerun() 등)이 있을 때마다 스크립트 파일 전체를
+# 처음부터 다시 실행한다. 그런데 이 저장소가 그냥 `_DEBUG_STORE = {}`처럼 모듈
+# 최상단에 평범한 전역 변수로 선언되어 있으면, 이 줄 자체도 매 rerun마다 다시
+# 실행되어 매번 새로운 빈 딕셔너리로 초기화된다. 반면 백그라운드 스레드는 자신이
+# "시작될 때(=이전 rerun)의 객체"를 계속 붙잡고 쓰기 때문에, 다음 rerun에서 메인
+# 스크립트가 읽는 객체와 실제로 값이 쓰이는 객체가 서로 다른 개체가 되어버려
+# 값이 항상 비어 보이는 문제가 있었다. 아래 스레드풀들(get_shared_executor 등)과
+# 동일하게 @st.cache_resource로 감싸서, 이 줄이 매 rerun마다 다시 실행되더라도
+# 항상 "동일한" 딕셔너리 객체를 돌려받도록 고친다.
+# (⚠️ @st.cache_resource는 streamlit을 import한 뒤에만 쓸 수 있어서, 실제 정의는
+# 파일 아래쪽 "import streamlit as st" 직후로 옮겨뒀다. 여기서는 아직 st가 없으므로
+# 나중에 정의될 함수 이름만 미리 적어둔다.)
+_DEBUG_STORE = None       # ← import streamlit as st 직후 블록에서 실제 값 채움
+_SCREENER_DF_CACHE = None  # ← import streamlit as st 직후 블록에서 실제 값 채움
 
 def _set_shared_screener_df(df):
     """스크리너 결과 df를 session_state(메인 스레드용)와 모듈 캐시(백그라운드 스레드용)에 동시 반영."""
@@ -70,6 +105,22 @@ import pandas as pd
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
+from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+
+# ── _DEBUG_STORE / _SCREENER_DF_CACHE 실제 정의 (st 임포트 직후) ──────────────
+# 위쪽(파일 상단)에서 이 두 이름을 None으로 미리 선언해둔 이유는 @st.cache_resource가
+# streamlit이 import된 뒤에만 쓸 수 있기 때문이다. 여기서 진짜 값을 채운다.
+@st.cache_resource(show_spinner=False)
+def _get_debug_store():
+    return {}
+
+_DEBUG_STORE = _get_debug_store()
+
+@st.cache_resource(show_spinner=False)
+def _get_screener_df_cache():
+    return {"df": None}
+
+_SCREENER_DF_CACHE = _get_screener_df_cache()
 
 # =========================
 # ⚙️ 페이지 설정
@@ -124,10 +175,24 @@ def _get_or_heal_executor(raw_getter, name, max_workers, stuck_threshold=25):
     tracker = _get_pool_stuck_tracker()
     now = time.time()
 
-    if active >= max_workers and queued > 0:
+    # ── [자가치유 무한 리셋 버그 수정] ──────────────────────────────────
+    # 기존에는 "queued > 0"이 아니면 곧바로 tracker.pop()으로 감시 타이머를
+    # 지워버렸다. 그런데 풀이 좀비 스레드로 완전히 막힌 뒤 사용자가 클릭을
+    # 멈추면(=새로 쌓이는 대기 작업이 없어짐) queued는 0으로 떨어지지만,
+    # active는 여전히 max_workers에 머물러 있다(죽은 스레드가 슬롯을 영원히
+    # 점유). 이 순간 매번 타이머가 리셋되어 stuck_threshold에 절대 도달하지
+    # 못했고, 그 결과 자가치유가 사실상 한 번도 발동하지 않았다(=수동 리붓
+    # 이외에는 회복 방법이 없는 상태로 이어진 진짜 원인).
+    # 해결: "막힘 의심" 타이머는 active가 max_workers 밑으로 내려왔을 때만
+    # (=실제로 워커가 하나라도 정상적으로 반환됐을 때만) 리셋한다. queued가
+    # 일시적으로 0이 되는 것만으로는 리셋하지 않는다. 단, 타이머 시작 자체는
+    # 여전히 queued > 0인 순간(=진짜로 밀린 대기열이 있었던 순간)에만 건다 —
+    # 그래야 "일시적으로 바쁘기만 한" 정상 상태를 오탐하지 않는다.
+    if active >= max_workers:
         since = tracker.get(name)
         if since is None:
-            tracker[name] = now
+            if queued > 0:
+                tracker[name] = now
         elif now - since >= stuck_threshold:
             print(f"[POOL HEAL {datetime.datetime.now().strftime('%H:%M:%S')}] "
                   f"'{name}' 풀이 {stuck_threshold}초 이상 완전히 막혀있어 새 풀로 교체함 "
@@ -142,6 +207,50 @@ def _get_or_heal_executor(raw_getter, name, max_workers, stuck_threshold=25):
 
 def get_shared_executor():
     return _get_or_heal_executor(_get_shared_executor_raw, "공유", 32)
+
+# ── [진짜 원인] ScriptRunContext 없이 st.cache_data 함수를 스레드에서 호출하면
+# 세션이 통째로 영원히 멈춘다 ─────────────────────────────────────────────────
+# 문제: fetch_market_index_table/fetch_investor_trend/fetch_sparkline_data/
+# fetch_sector_ranking/fetch_investor_trend_monthly는 전부 @st.cache_data가
+# 붙어있는데, 이걸 순수 ThreadPoolExecutor 워커 스레드(=Streamlit의
+# ScriptRunContext가 없는 스레드) 안에서 직접 호출하고 있었다. st.cache_data는
+# 동일 캐시 키로 동시에 여러 번 불리면 "먼저 온 호출이 계산하는 동안 나머지는
+# 내부 락으로 대기"하는 구조인데, 이 락 대기에는 우리가 건 어떤
+# overall_timeout/per_result_timeout도 적용되지 않는다. ScriptRunContext가 없는
+# 스레드에서 이 내부 락/캐시 로직이 꼬이면 해당 세션의 스크립트 실행 스레드가
+# 말 그대로 영원히 멈춘다 — 서버 프로세스(healthz)는 멀쩡하니 다른 세션에는
+# 영향이 없고, 딱 그 세션만 "리붓 아니면 답이 없는" 상태가 된다(로그로 실측 확인:
+# healthz는 200을 계속 내려주는데 그 세션의 "페이지 렌더링 완료" 로그만 다시는
+# 안 찍힘).
+# 해결: 메인 스레드(=정상적인 ScriptRunContext를 가진 스레드)에서 submit하는
+# 시점에 현재 컨텍스트를 캡처해서, 실제로 워커 스레드에서 실행될 때 그 스레드에
+# 컨텍스트를 심어준다. Streamlit 공식 문서가 권장하는 "백그라운드 스레드에서
+# Streamlit API(캐시 포함)를 쓰려면 add_script_run_ctx로 컨텍스트를 넘겨야 한다"
+# 패턴을 그대로 적용한 것.
+def _run_with_ctx(_ctx, _fn, *_args, **_kwargs):
+    try:
+        add_script_run_ctx(threading.current_thread(), _ctx)
+    except Exception:
+        pass  # 컨텍스트를 못 붙이더라도 최소한 함수 자체는 시도한다
+    try:
+        return _fn(*_args, **_kwargs)
+    finally:
+        # ── [워커 스레드 재사용 시 컨텍스트 오염 방지] ──────────────────────
+        # 공유/오케스트레이션 풀은 워커 스레드를 계속 재사용한다. 작업이 끝난
+        # 뒤 이 스레드에 심어둔 ScriptRunContext를 지우지 않으면, 다음번에 이
+        # 물리 스레드가 (완전히 다른 세션의) 다른 작업을 처리할 때 방금 세션의
+        # 컨텍스트가 그대로 남아있게 되어 세션 간 상태가 뒤섞일 수 있다.
+        try:
+            add_script_run_ctx(threading.current_thread(), None)
+        except Exception:
+            pass
+
+def submit_with_ctx(executor, fn, *args, **kwargs):
+    """executor.submit(fn, *args, **kwargs)와 동일하지만, 호출 시점(메인 스레드)의
+    ScriptRunContext를 워커 스레드에 심어준 채로 실행한다. st.cache_data가 붙은
+    함수를 스레드풀에 던질 때는 반드시 이 함수를 통해서만 던져야 한다."""
+    ctx = get_script_run_ctx()
+    return executor.submit(_run_with_ctx, ctx, fn, *args, **kwargs)
 
 # ── 메인 스레드 직접 호출 보호용 헬퍼 ──────────────────────────────────────
 # 문제: yfinance(내부적으로 curl_cffi 사용)에 timeout=8을 넘겨도, 클라우드 환경에서
@@ -274,7 +383,7 @@ def run_with_progress(text, func, *args, **kwargs):
 # 버전이면 이 헬퍼 대신 기존 방식을 유지해야 한다 (streamlit --version으로 확인).
 def render_async_multi(job_key, submit_fn, collect_fn, default_result,
                         spinner_text="데이터를 불러오는 중...",
-                        poll_interval=0.4, overall_timeout=20):
+                        poll_interval=0.4, overall_timeout=20, result_ttl=45):
     """
     job_key     : 이 로딩 작업을 구분하는 고유 문자열 키 (페이지마다 겹치지 않게 지정)
     submit_fn() : 인자 없이 호출하면 {"이름": future, ...} 형태의 dict를 반환해야 함
@@ -283,6 +392,7 @@ def render_async_multi(job_key, submit_fn, collect_fn, default_result,
                   실제 결과 dict로 변환하는 함수. future.done()이 False인 항목은
                   건드리지 말고 default 값으로 채워서 반환할 것.
     default_result : 아직 하나도 준비 안 됐을 때 렌더링에 쓸 기본값
+    result_ttl  : 마지막으로 성공한 결과를 몇 초까지 그대로 재사용할지 (초)
     반환값: (result, ready)
       - ready=False  → 아직 로딩 중. 호출부는 이 시점에 바로 return 해서
                         이후의 무거운 렌더링을 건너뛰어야 한다.
@@ -290,22 +400,36 @@ def render_async_multi(job_key, submit_fn, collect_fn, default_result,
     """
     jobs = st.session_state.setdefault("_bg_jobs", {})
     job = jobs.get(job_key)
+
+    # ── [수급 추이 토글 등에서 매번 "불러오는 중..."으로 되돌아가는 문제 수정] ──
+    # 이전에는 작업이 한 번 끝나면 바로 jobs.pop()으로 지워버렸다. 그런데 이 페이지
+    # 안의 아주 사소한 상호작용(예: 투자자별 수급 추이 펼치기/접기 버튼)도 Streamlit
+    # 입장에서는 "스크립트 전체를 처음부터 다시 실행"이라서, job이 없어진 상태로 매번
+    # 여기 다시 도달해 4개 API를 새 비동기 작업으로 또 던지고, 최소 한 번의 폴링
+    # 주기 동안 화면 전체가 "불러오는 중..." 문구로 바뀌어버렸다(실제 데이터는
+    # st.cache_data로 이미 캐싱돼 있어 다시 받아올 필요가 없었는데도).
+    # 해결: 마지막으로 성공한 결과를 session_state에 타임스탬프와 함께 남겨두고,
+    # result_ttl 이내에 다시 여기 도달하면(=job이 없어도) 그 결과를 바로 재사용해서
+    # 불필요한 재조회/로딩 화면 깜빡임 자체를 건너뛴다.
+    results_cache = st.session_state.setdefault("_bg_job_results", {})
     if job is None:
-        job = {"futures": submit_fn(), "started_at": time.time()}
+        cached = results_cache.get(job_key)
+        if cached is not None and (time.time() - cached["ts"]) < result_ttl:
+            return cached["result"], True
+        job = {"futures": submit_fn(), "started_at": time.time(), "overall_timeout": overall_timeout}
         jobs[job_key] = job
 
     futures = job["futures"]
     all_done = all(f.done() for f in futures.values())
-    timed_out = (time.time() - job["started_at"]) > overall_timeout
+    timed_out = (time.time() - job["started_at"]) > job.get("overall_timeout", overall_timeout)
 
     if not all_done and not timed_out:
-        @st.fragment(run_every=poll_interval)
-        def _poll():
-            if all(f.done() for f in futures.values()) or (time.time() - job["started_at"]) > overall_timeout:
-                st.rerun()  # 준비 완료 → 프래그먼트가 아니라 앱 전체를 다시 그려서 실제 데이터를 반영
-            else:
-                st.info(f"🔄 {spinner_text}")
-        _poll()
+        # ── [fragment #10719 회피] 여기서 직접 st.fragment(run_every=...)를 만들지
+        # 않는다. 대신 job을 _bg_jobs에 남겨둔 채로 그냥 "아직" 상태를 반환하면,
+        # _main_impl()이 페이지 렌더링 뒤 호출하는 maybe_run_global_poller() →
+        # 세션 전체에 단 하나뿐인 _global_poll_fragment()가 이 job을 포함해 모든
+        # 대기 중인 작업을 함께 감시한다. spinner_text는 더 이상 여기서 개별
+        # 표시하지 않고, 전역 fragment가 진행 중인 작업 개수로 통합해서 보여준다.
         return default_result, False
 
     # 다 끝났거나 상한 시간을 넘김 → 끝난 것만 회수, 안 끝난 항목은 collect_fn이
@@ -314,8 +438,87 @@ def render_async_multi(job_key, submit_fn, collect_fn, default_result,
     for f in futures.values():
         if not f.done():
             f.cancel()  # 이미 실행 중이면 취소는 안 되지만, 큐 대기중이었다면 자리를 비워준다
-    jobs.pop(job_key, None)  # 다음 방문 때는 (캐시 TTL이 지났다면) 새로 조회
+    jobs.pop(job_key, None)
+    results_cache[job_key] = {"result": result, "ts": time.time()}  # 짧은 재사용 캐시 갱신
     return result, True
+
+# ── [근본 수정] 세션당 폴링 fragment는 딱 1개만 존재하도록 통합 ──────────────
+# Streamlit 확인된 버그(#10719, github.com/streamlit/streamlit/issues/10719):
+# run_every로 자동 재실행되는 fragment가 세션 안에 2개 이상 동시에 존재하면,
+# 어느 한쪽의 재실행 타이밍이 겹치는 순간 "The fragment with id ... does not
+# exist anymore" 예외와 함께 그 세션이 죽는다. 이건 파이썬 스레드가 블로킹되는
+# 게 아니라 Streamlit 프레임워크 내부에서 예외로 죽는 것이라, faulthandler
+# 워치독(멈춘 스레드의 콜스택을 찍는 도구)에는 아무것도 안 잡힌다 — 애초에
+# "멈춰있는" 스레드가 없기 때문이다.
+#
+# 기존에는 render_async_multi/run_unified_market_scan_async를 호출하는 곳마다
+# 각자 자기 fragment를 만들었다(대시보드 카드, 수급 추이 토글, 관심종목 프리페치,
+# 전체 스캔 등). 이 중 두 곳이 동시에 "아직 완료 안 됨" 상태가 되면(예: 스캔이
+# 도는 중에 관심종목 탭으로 이동) 정확히 이 버그 조건이 만들어졌다. 일부 호출부는
+# "스캔 중이면 건너뛰기" 식으로 개별 가드를 달아뒀지만, 새 호출부가 생길 때마다
+# 매번 수동으로 챙겨야 해서 재발 여지가 있었다(실제로 대시보드 자체 데이터 로딩과
+# 관심종목 프리페치 두 곳은 이 가드가 빠져 있었다).
+#
+# 해결: fragment 정의/호출 지점을 앱 전체에서 이 함수 하나로 통합한다. 개별
+# render_async_multi/run_unified_market_scan_async 호출은 더 이상 자기 fragment를
+# 만들지 않고, 그저 "완료 안 됨" 상태만 반환한다. 실제 폴링은 _main_impl()이
+# 페이지 렌더링을 마친 뒤 딱 한 번 호출하는 이 전역 fragment가 _bg_jobs와
+# _scan_jobs를 전부 훑어서 담당한다 — 물리적으로 fragment 호출이 세션당 항상
+# 최대 1개이므로, 정의상 #10719가 재현될 수 없다.
+def _all_jobs_settled():
+    """_bg_jobs / _scan_jobs에 아직 완료되지도, 시간 초과되지도 않은 작업이
+    하나라도 남아있으면 False."""
+    now = time.time()
+    for job in list(st.session_state.get("_bg_jobs", {}).values()):
+        futures = job.get("futures", {})
+        done = all(f.done() for f in futures.values())
+        timed_out = (now - job["started_at"]) > job.get("overall_timeout", 20)
+        if not done and not timed_out:
+            return False
+    for job in list(st.session_state.get("_scan_jobs", {}).values()):
+        future = job.get("future")
+        if future is None:
+            continue
+        timed_out = (now - job["started_at"]) > job.get("overall_timeout", 150)
+        stalled = (now - job.get("_last_pct_change_at", job["started_at"])) > 50
+        if not future.done() and not timed_out and not stalled:
+            return False
+    return True
+
+
+@st.fragment(run_every=0.4)
+def _global_poll_fragment():
+    """세션 전체를 통틀어 유일하게 존재하는 주기적(run_every) fragment.
+    _bg_jobs/_scan_jobs에 대기 중인 작업이 하나라도 있을 때만 main()에서 호출된다.
+    ⚠️ 여기서 dump_traceback_later를 걸었다 취소하면 안 된다 — 이 함수는 0.4초마다
+    실행되므로, 그러면 파일 상단에서 걸어둔 영구(repeat=True) 워치독을 계속
+    덮어쓰고 취소해버려서 다른 세션이 실제로 멈췄을 때 트레이스백이 안 찍히게 된다
+    (실제로 이게 원인이었던 사례가 있었다)."""
+    if _all_jobs_settled():
+        st.rerun()  # 전부 끝남 → 전체 rerun으로 실제 데이터를 반영
+    else:
+        n_bg = len(st.session_state.get("_bg_jobs", {}))
+        scan_jobs = st.session_state.get("_scan_jobs", {})
+        # 스캔이 진행 중이면(가장 오래 걸리는 작업이므로) 그 실시간 %를 우선 보여준다.
+        # 이게 없으면 사용자 입장에서 게이지가 그대로 멈춘 것처럼 보인다.
+        scan_pct_text = ""
+        for job in scan_jobs.values():
+            _job_id = job.get("job_id")
+            _st = _SCAN_JOB_STATE.get(_job_id, {})
+            if _st:
+                scan_pct_text = f" — {_st.get('text', '스캔 중...')} ({min(_st.get('pct', 0), 100)}%)"
+            break
+        n_total = n_bg + len(scan_jobs)
+        st.info(f"🔄 데이터를 불러오는 중... (백그라운드 작업 {n_total}건 진행 중){scan_pct_text}")
+
+
+def maybe_run_global_poller():
+    """_main_impl()의 페이지 디스패치 직후 딱 한 번 호출. 대기 중인 백그라운드
+    작업이 있을 때만 전역 폴링 fragment를 띄운다(없으면 아무것도 안 함)."""
+    has_pending = bool(st.session_state.get("_bg_jobs")) or bool(st.session_state.get("_scan_jobs"))
+    if has_pending:
+        _global_poll_fragment()
+# ────────────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_market_index_table():
@@ -338,6 +541,7 @@ def fetch_market_index_table():
 
     def get_naver(key, meta):
         try:
+            # 가격/등락률은 원래부터 안정적으로 동작하던 /basic 엔드포인트를 그대로 사용.
             url = f"https://m.stock.naver.com/api/index/{meta['symbol']}/basic"
             res = requests.get(url, headers=headers, timeout=6)
             data = res.json()
@@ -345,8 +549,32 @@ def fetch_market_index_table():
             diff = float(str(data.get("compareToPreviousClosePrice", "0")).replace(",", ""))
             diff_pct = float(str(data.get("fluctuationsRatio", "0")).replace(",", ""))
             sign = "+" if diff >= 0 else ""
-            vol_raw = data.get("accumulatedTradingVolume", None)
-            vol = f"{int(str(vol_raw).replace(',', '')):,}" if vol_raw else "N/A"
+
+            # ── [거래량 수정] ──────────────────────────────────────────────────
+            # /basic 엔드포인트는 애초에 accumulatedTradingVolume 필드를 안 내려줘서
+            # 거래량이 항상 N/A였다. 거래량은 realtime 엔드포인트에서 "별도로" 시도하되,
+            # 이 호출이 실패하더라도(예: Referer 체크, 응답 형식 차이 등) 위에서 이미
+            # 받아온 가격/등락률까지 통째로 날아가지 않도록 완전히 분리된 try/except로
+            # 감싼다. 실패하면 그냥 거래량만 N/A로 남고 카드의 나머지는 정상 표시된다.
+            vol = "N/A"
+            try:
+                vol_headers = {**headers, "Referer": "https://m.stock.naver.com/"}
+                vol_url = f"https://polling.finance.naver.com/api/realtime/domestic/index/{meta['symbol']}"
+                vres = requests.get(vol_url, headers=vol_headers, timeout=6)
+                vpayload = vres.json()
+                vdatas = vpayload.get("datas") or []
+                vdata = vdatas[0] if vdatas else {}
+                # accumulatedTradingVolume 필드는 "301,494천주"처럼 "천주" 단위 접미사가
+                # 붙은 표시용 문자열이라, 접미사 없는 순수 숫자 문자열인
+                # accumulatedTradingVolumeRaw 필드를 우선 사용한다.
+                vol_raw = vdata.get("accumulatedTradingVolumeRaw", None)
+                if vol_raw in (None, ""):
+                    vol_raw = re.sub(r"[^\d]", "", str(vdata.get("accumulatedTradingVolume", ""))) or None
+                if vol_raw:
+                    vol = f"{int(str(vol_raw).replace(',', '')):,}"
+            except Exception:
+                pass  # 실패하면 거래량만 N/A로 남고 카드의 나머지(가격/등락률)는 정상 표시
+
             return key, {
                 "name": meta["name"], "subtitle": meta["subtitle"],
                 "value": f"{price:,.2f}",
@@ -355,7 +583,7 @@ def fetch_market_index_table():
                 "status": "up" if diff > 0 else ("down" if diff < 0 else "neutral"),
                 "volume": vol,
             }
-        except Exception:
+        except Exception as e:
             return key, None
 
     def get_yfinance(key, meta):
@@ -396,6 +624,27 @@ def fetch_market_index_table():
     return {k: result.get(k, {"name": all_targets[k]["name"], "value": "-", "status": "neutral"})
             for k in all_targets.keys()}
 
+# ── [로그인 직후 스파크라인 차트가 가끔 통째로 빈 상태로 굳어버리는 문제 수정] ────
+# 문제: fetch_sparkline_data()는 st.cache_data(ttl=86400)로 하루 종일 캐싱되는데,
+# 야후 파이낸스(yfinance) 쪽이 그 순간 일시적으로 느리거나(클라우드 IP 레이트리밋 등)
+# df.empty로 응답하면 그 종목은 빈 리스트([])로 채워지고, 그 "빈 결과"가 그대로
+# 하루 종일 캐싱되어버린다. 그래서 로그인 시점에 우연히 한 번 실패한 지수(코스피/
+# 코스닥 등)는 캐시가 갱신되는 다음 날까지 계속 차트 없는 카드로 보였다.
+# 해결: (1) 첫 시도가 실패하면 짧게 대기 후 한 번 더 재시도해서 순간적인 실패 자체를
+# 줄이고, (2) 그래도 실패하면 완전히 빈 값 대신 "마지막으로 성공했던 값"을 대신
+# 돌려준다. _SPARKLINE_LAST_GOOD은 모듈 전역(프로세스 생존 기간 동안 유지)이라,
+# 한 번이라도 성공한 적이 있는 종목은 이후 일시적 실패가 있어도 차트가 비어 보이지
+# 않는다(값이 하루 정도 오래된 것일 수는 있지만, 완전히 비는 것보다 훨씬 낫다).
+#
+# ── [버그 수정] ── 이것도 평범한 전역 변수였다면 위 _DEBUG_STORE와 똑같은 이유로
+# 매 rerun마다 초기화되어 "마지막으로 성공했던 값"을 절대 기억하지 못했을 것이다.
+# @st.cache_resource로 감싸 프로세스 생존 기간 동안 동일 객체가 유지되게 한다.
+@st.cache_resource(show_spinner=False)
+def _get_sparkline_last_good_store():
+    return {}
+
+_SPARKLINE_LAST_GOOD = _get_sparkline_last_good_store()
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_sparkline_data():
     """시장 지수 카드용 180일 스파크라인 데이터를 yfinance로 수집."""
@@ -409,23 +658,30 @@ def fetch_sparkline_data():
     }
 
     def get_history(key, symbol):
-        try:
-            import yfinance as yf
-            df = yf.Ticker(symbol).history(period="180d", interval="1d", timeout=8)
-            if df.empty or "Close" not in df.columns:
-                return key, []
-            closes = df["Close"].dropna().tolist()
-            return key, closes
-        except:
-            return key, []
+        for attempt in range(2):  # 일시적 실패 대비 1회 재시도
+            try:
+                import yfinance as yf
+                df = yf.Ticker(symbol).history(period="180d", interval="1d", timeout=8)
+                if not df.empty and "Close" in df.columns:
+                    closes = df["Close"].dropna().tolist()
+                    if closes:
+                        _SPARKLINE_LAST_GOOD[key] = closes  # 성공한 값만 "마지막 성공값"으로 갱신
+                        return key, closes
+            except Exception:
+                pass
+            if attempt == 0:
+                time.sleep(0.5)
+        # 이번 조회가 끝내 실패했으면, 진짜 빈 리스트 대신 마지막 성공값으로 대체한다.
+        # (한 번도 성공한 적이 없으면 어쩔 수 없이 빈 리스트 — 카드 자체는 정상 렌더링됨)
+        return key, _SPARKLINE_LAST_GOOD.get(key, [])
 
     result = run_parallel_safe(
         lambda kv: get_history(kv[0], kv[1]), list(targets.items()),
         max_workers=6, overall_timeout=12, per_result_timeout=6,
     )
-    # 실패/타임아웃난 종목은 빈 리스트로 채워서 카드가 항상 렌더링되게 함
+    # 실패/타임아웃난 종목은 마지막 성공값(없으면 빈 리스트)으로 채워서 카드가 항상 렌더링되게 함
     for k in targets.keys():
-        result.setdefault(k, [])
+        result.setdefault(k, _SPARKLINE_LAST_GOOD.get(k, []))
     return result
 
 
@@ -465,7 +721,7 @@ def fetch_investor_trend():
             today = datetime.datetime.now().strftime("%Y%m%d")
             url = f"https://finance.naver.com/sise/investorDealTrendDay.naver?bizdate={today}&sosok={sosok}"
             res = requests.get(url, headers=headers, timeout=7)
-            res.encoding = res.apparent_encoding or 'euc-kr'
+            res.encoding = 'euc-kr'  # 네이버금융(finance.naver.com)은 euc-kr 고정 — apparent_encoding 추측에 의존하면 특정 종목명 바이트 패턴에서 오탐(예: 키릴 계열로 오판)해 파싱이 깨진다
             dfs = pd.read_html(io.StringIO(res.text))
 
             target = None
@@ -528,7 +784,7 @@ def fetch_investor_trend_monthly(sosok):
             date_str = date.strftime("%Y%m%d")
             url = f"https://finance.naver.com/sise/investorDealTrendDay.naver?bizdate={date_str}&sosok={sosok}"
             res = requests.get(url, headers=headers, timeout=5)
-            res.encoding = res.apparent_encoding or 'euc-kr'
+            res.encoding = 'euc-kr'  # 네이버금융(finance.naver.com)은 euc-kr 고정 — apparent_encoding 추측에 의존하면 특정 종목명 바이트 패턴에서 오탐(예: 키릴 계열로 오판)해 파싱이 깨진다
             dfs = pd.read_html(io.StringIO(res.text))
             target = None
             for df in dfs:
@@ -607,6 +863,7 @@ FED_RATE_HISTORY = [
 ]
 
 BOK_RATE_HISTORY = [
+    {"date": "2026-07-16", "rate": 2.75, "action": "인상 (+0.25%p)"},
     {"date": "2026-05-28", "rate": 2.50, "action": "동결"},
     {"date": "2026-04-10", "rate": 2.50, "action": "동결"},
     {"date": "2026-02-26", "rate": 2.50, "action": "동결"},
@@ -650,6 +907,20 @@ def fetch_fed_rate_data():
 def fetch_bok_rate_data():
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 
+    # ── [자동 라벨 판정] BOK_RATE_HISTORY 갱신을 깜빡해도 숫자만은 최신으로 보이게 ──
+    # 실시간 조회는 "현재 금리 숫자"만 줄 뿐 "이번에 인상/인하/동결됐는지"는 알려주지
+    # 않는다. 예전엔 그 라벨을 항상 하드코딩된 BOK_RATE_HISTORY에서만 가져왔는데,
+    # 회의가 끝나고 이 리스트를 사람이 업데이트하는 걸 깜빡하면(2026-07-16 인상 건이
+    # 실제로 그랬다) 화면에는 옛날 숫자+옛날 라벨이 함께 나왔다.
+    # 지금은 실시간 숫자가 하드코딩된 최신 이력과 다르면, 그 차이를 보고 인상/인하
+    # 라벨을 자동 계산해서 이력 맨 앞에 끼워넣는다. 다만 회의 날짜·정확한 %p폭 같은
+    # 세부 정보는 모르므로 "(자동감지)"를 붙여 사람이 넣은 값과 구분한다.
+    history = [
+        {"date": h["date"], "range": f"{h['rate']:.2f}%", "action": h["action"]}
+        for h in BOK_RATE_HISTORY[:10]
+    ]
+    latest_hardcoded = BOK_RATE_HISTORY[0]
+
     try:
         url = "https://m.stock.naver.com/api/index/IRR_BOK/basic"
         res = requests.get(url, headers=headers, timeout=8)
@@ -660,18 +931,14 @@ def fetch_bok_rate_data():
         date_display = dt.strftime("%Y-%m-%d") if pd.notna(dt) else "최신"
 
         if rate_val > 0:
-            history = [
-                {"date": h["date"], "range": f"{h['rate']:.2f}%", "action": h["action"]}
-                for h in BOK_RATE_HISTORY[:10]
-            ]
+            diff = round(rate_val - latest_hardcoded["rate"], 2)
+            if abs(diff) >= 0.01:
+                auto_action = f"{'인상' if diff > 0 else '인하'} ({diff:+.2f}%p, 자동감지)"
+                history = [{"date": date_display, "range": f"{rate_val:.2f}%", "action": auto_action}] + history
             return {"current": {"rate": f"{rate_val:.2f}%", "date": date_display}, "history": history}
     except Exception:
         pass
 
-    history = [
-        {"date": h["date"], "range": f"{h['rate']:.2f}%", "action": h["action"]}
-        for h in BOK_RATE_HISTORY[:10]
-    ]
     latest = BOK_RATE_HISTORY[0]
     return {"current": {"rate": f"{latest['rate']:.2f}%", "date": latest["date"]}, "history": history}
 
@@ -784,7 +1051,7 @@ def fetch_dividend_ranking():
         try:
             _dbg(f"페이지 {page} 요청 시작")
             res = requests.get(f"{base_url}?page={page}", headers=headers, timeout=10)
-            res.encoding = res.apparent_encoding or 'euc-kr'
+            res.encoding = 'euc-kr'  # 네이버금융(finance.naver.com)은 euc-kr 고정 — apparent_encoding 추측에 의존하면 특정 종목명 바이트 패턴에서 오탐(예: 키릴 계열로 오판)해 파싱이 깨진다
             _dbg(f"페이지 {page} 응답 수신, read_html 파싱 시작")
 
             # ✅ 정규식으로 href 속성에서 종목코드 추출 후 딕셔너리에 저장
@@ -809,7 +1076,7 @@ def fetch_dividend_ranking():
         import re as _re
         _dbg("첫 페이지(전체 페이지 수 파악) 요청 시작")
         res0 = requests.get(base_url, headers=headers, timeout=10)
-        res0.encoding = res0.apparent_encoding or 'euc-kr'
+        res0.encoding = 'euc-kr'  # 네이버금융 euc-kr 고정
         _dbg("첫 페이지 응답 수신")
         page_nums = [int(p) for p in _re.findall(r'[?&]page=(\d+)', res0.text)]
         max_page = max(page_nums) if page_nums else 10
@@ -1033,8 +1300,10 @@ def fetch_company_info_fnguide(code):
         res = requests.get(nv_url, headers=naver_headers, timeout=6)
         name_debug["status"] = res.status_code
         # 네이버금융 응답 인코딩이 euc-kr 고정이 아닌 경우가 생겨 자동감지로 변경
-        # (apparent_encoding이 실패하면 euc-kr을 최후 fallback으로 사용)
-        res.encoding = res.apparent_encoding or 'euc-kr'
+        # 네이버금융 응답 인코딩이 euc-kr 고정이 아닌 경우가 생겨 자동감지로 변경했었으나,
+        # apparent_encoding 자동감지가 오히려 특정 종목명에서 오탐(키릴 계열 등으로 오판)해
+        # 파싱이 깨지는 문제가 확인되어 다시 euc-kr 고정으로 되돌림.
+        res.encoding = 'euc-kr'  # 네이버금융(finance.naver.com)은 euc-kr 고정 — apparent_encoding 추측에 의존하면 특정 종목명 바이트 패턴에서 오탐(예: 키릴 계열로 오판)해 파싱이 깨진다
         html = res.text
         name_debug["resp_len"] = len(html)
 
@@ -1178,7 +1447,7 @@ def fetch_investor_trend_by_code(code, days=20):
             debug["last_url"] = url
             res = requests.get(url, headers=naver_headers, timeout=8)
             debug["last_status"] = res.status_code
-            res.encoding = res.apparent_encoding or 'euc-kr'
+            res.encoding = 'euc-kr'  # 네이버금융(finance.naver.com)은 euc-kr 고정 — apparent_encoding 추측에 의존하면 특정 종목명 바이트 패턴에서 오탐(예: 키릴 계열로 오판)해 파싱이 깨진다
             debug["resp_len"] = len(res.text)
             debug["resp_snippet"] = res.text[:300]
 
@@ -1816,6 +2085,7 @@ def fetch_financial_data(code):
 # =========================
 import zipfile
 import xml.etree.ElementTree as ET
+import urllib.parse
 from io import BytesIO
 
 
@@ -1827,23 +2097,154 @@ def get_dart_api_key():
         return os.environ.get("DART_API_KEY", "")
 
 
+# ── ⚠️ [임시 우회] Streamlit Cloud → opendart.fss.or.kr 직접 연결 차단 우회용 프록시 ──
+# 문제: Streamlit Community Cloud(해외 서버)에서 opendart.fss.or.kr로 직접 요청하면
+# 매번 ConnectTimeout이 발생한다(로컬 PC에서는 정상 동작 확인됨). DART가 국내 IP가
+# 아닌 요청을 막고 있는 것으로 추정됨.
+# 임시 조치: 무료 공개 CORS 프록시(allorigins)를 경유해서 우회한다.
+# ⚠️ 이 경로를 쓰면 DART API 키가 제3자 서버(allorigins.win)에 노출된다.
+#    임시 검증/우회용으로만 사용할 것 — 장기적으로는 자체 국내 리전 프록시 서버로
+#    교체 필요. 자체 프록시로 바꿀 때는 _DART_USE_PROXY = False로 내리고
+#    _dart_request() 내부에서 자체 프록시 URL을 호출하도록 바꾸면 된다.
+_DART_USE_PROXY = True
+# ── [폴백 체인] 무료 공개 프록시는 개별적으로(때로는 동시에) 다운되는 경우가 흔해서
+# (allorigins 내부 오류, codetabs 521 다운 모두 실제로 관측됨), 하나가 실패하면
+# 다음 프록시로 자동 전환하도록 여러 개를 순서대로 등록해둔다. 앞쪽이 우선순위가 높다.
+# mode="query": 대상 URL을 인코딩해서 쿼리 파라미터로 붙이는 방식 (allorigins, codetabs, corsproxy.io)
+# mode="path" : 대상 URL을 인코딩하지 않고 경로 뒤에 그대로 이어붙이는 방식 (thingproxy)
+_DART_PROXY_BASES = [
+    # ⭐ 1순위: 자체 Cloudflare Worker 프록시 (배포 완료, 가장 안정적).
+    {"base": "https://restless-fog-8937.daimon8835.workers.dev/?url=", "mode": "query"},
+    {"base": "https://api.allorigins.win/raw?url=", "mode": "query"},
+    {"base": "https://api.codetabs.com/v1/proxy?quest=", "mode": "query"},
+    # ❌ corsproxy.io는 제외함: 무료 플랜이 서버→서버 요청 자체를 막아놔서
+    # ("Server-side requests are not allowed on your plan") 여기서는 구조적으로
+    # 항상 실패한다. 일시적 장애가 아니라 이 조합에서는 영구적으로 못 쓰는 서비스.
+    {"base": "https://thingproxy.freeboard.io/fetch/", "mode": "path"},
+]
+
+
+def _is_proxy_error_response(res):
+    """DART가 아니라 프록시 서비스 자체가 낸 오류인지 판별.
+
+    - HTTP 4xx/5xx (예: codetabs가 죽었을 때 뜨는 521 "Web server is down" 에러 페이지)
+    - allorigins처럼 {"error": "...", "stack": "..."} 형태의 JSON 내부 오류
+    이런 응답을 DART 응답으로 착각해 그대로 파싱하면 status=None/json_decode_error로
+    흘러가 버리므로, 여기서 미리 걸러내고 다음 프록시로 넘어간다.
+    """
+    if res.status_code >= 400:
+        return True
+    body_preview = res.text[:200].lstrip()
+    if body_preview.startswith("{"):
+        try:
+            body = res.json()
+        except Exception:
+            return False
+        if isinstance(body, dict) and "error" in body and "stack" in body:
+            return True
+    return False
+
+
+def _dart_request(url, params, timeout):
+    """DART API에 요청을 보낸다.
+
+    _DART_USE_PROXY가 True면 등록된 CORS 프록시들을 순서대로 시도한다.
+    한 프록시가 네트워크 예외를 던지거나 프록시 자체 내부 오류를 반환하면,
+    바로 실패 처리하지 않고 다음 프록시로 자동 폴백한다. 프록시 하나가 응답이
+    느리거나 멈춰있을 때 전체 요청이 timeout(기본 30초) x 프록시 개수만큼 오래
+    걸리지 않도록, 프록시별 시도는 더 짧은 attempt_timeout으로 빠르게 실패시키고
+    넘어간다. 모든 프록시가 실패하면 마지막으로 받은 응답(또는 마지막 예외)을
+    그대로 반환/발생시켜 기존 호출부의 에러 처리 로직(디버그 로깅 등)이 그대로
+    동작하게 한다.
+    """
+    if not _DART_USE_PROXY:
+        return requests.get(url, params=params, timeout=timeout)
+
+    full_target_url = f"{url}?{urllib.parse.urlencode(params)}"
+    attempt_timeout = min(timeout, 12)
+    last_res = None
+    last_exc = None
+    for proxy in _DART_PROXY_BASES:
+        if proxy["mode"] == "query":
+            proxied_url = proxy["base"] + urllib.parse.quote(full_target_url, safe="")
+        else:  # "path" 모드
+            proxied_url = proxy["base"] + full_target_url
+        try:
+            res = requests.get(proxied_url, timeout=attempt_timeout)
+        except Exception as e:
+            last_exc = e
+            continue
+        last_res = res
+        if not _is_proxy_error_response(res):
+            return res
+        # 이 프록시가 내부 오류를 낸 경우 → 다음 프록시로 계속 시도
+            return res
+        # 이 프록시가 내부 오류를 낸 경우 → 다음 프록시로 계속 시도
+
+    if last_res is not None:
+        return last_res
+    raise last_exc
+
+
 @st.cache_data(ttl=86400 * 7, show_spinner=False)  # 고유번호 목록은 자주 안 바뀌므로 7일 캐싱
 def fetch_dart_corp_code_map():
     """
     DART 전체 기업 고유번호(corp_code) 목록을 받아
     {6자리 종목코드: {"corp_code": ..., "corp_name": ...}} 형태로 반환.
+
+    ⚠️ [정적 파일 우선] Streamlit Cloud에서 opendart.fss.or.kr의 corpCode.xml
+    (3.5MB zip)을 실시간으로 받아오는 게 네트워크 제약(느림/차단/프록시 불안정)으로
+    어려워서, generate_dart_corp_map.py로 로컬에서 미리 생성해둔
+    dart_corp_code_map.json을 같은 폴더에서 우선 읽는다. 이 매핑은 자주 안 바뀌므로
+    실시간 API 호출이 굳이 필요 없다. 파일이 없거나 읽기 실패하면 기존처럼
+    API에서 직접(또는 프록시로) 받아오는 것으로 폴백한다.
+
+    🔧 [디버그] 실패 원인을 _DEBUG_STORE에 남겨서 render_disclosure_tab에서
+    expander로 확인할 수 있게 한다.
     """
+    debug_info = {"step": "start", "api_key_set": bool(get_dart_api_key())}
+
+    # ── 1순위: 로컬 정적 파일 ─────────────────────────────────────────
+    static_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dart_corp_code_map.json")
+    try:
+        if os.path.exists(static_path):
+            with open(static_path, "r", encoding="utf-8") as f:
+                result = json.load(f)
+            debug_info["step"] = "success_from_static_file"
+            debug_info["source"] = static_path
+            debug_info["total_listed_companies"] = len(result)
+            debug_info["samsung_005930_found"] = "005930" in result
+            _DEBUG_STORE["_dart_corpmap_debug"] = debug_info
+            return result
+    except Exception as e:
+        debug_info["static_file_error"] = f"{type(e).__name__}: {e}"
+        # 정적 파일 읽기가 실패하면 아래 API 폴백으로 계속 진행
+
+    # ── 2순위: API에서 직접(또는 프록시로) 받아오기 (기존 로직 폴백) ──────
     api_key = get_dart_api_key()
     if not api_key:
+        debug_info["step"] = "no_api_key"
+        _DEBUG_STORE["_dart_corpmap_debug"] = debug_info
         return {}
 
     try:
         url = "https://opendart.fss.or.kr/api/corpCode.xml"
-        res = requests.get(url, params={"crtfc_key": api_key}, timeout=10)
+        res = _dart_request(url, {"crtfc_key": api_key}, timeout=30)
+        debug_info["http_status"] = res.status_code
+        debug_info["via_proxy"] = _DART_USE_PROXY
+        debug_info["content_type"] = res.headers.get("Content-Type", "")
         res.raise_for_status()
 
-        with zipfile.ZipFile(BytesIO(res.content)) as zf:
-            xml_bytes = zf.read(zf.namelist()[0])
+        try:
+            with zipfile.ZipFile(BytesIO(res.content)) as zf:
+                xml_bytes = zf.read(zf.namelist()[0])
+        except zipfile.BadZipFile:
+            # DART가 zip 대신 에러 메시지(XML/텍스트)를 반환한 경우.
+            # 보통 키 미승인/오타/사용한도초과일 때 이 분기로 들어온다.
+            debug_info["step"] = "not_a_zip_file"
+            debug_info["raw_response_preview"] = res.content[:300].decode("utf-8", errors="replace")
+            _DEBUG_STORE["_dart_corpmap_debug"] = debug_info
+            return {}
 
         root = ET.fromstring(xml_bytes)
         result = {}
@@ -1856,8 +2257,16 @@ def fetch_dart_corp_code_map():
                     "corp_code": corp_code,
                     "corp_name": corp_name,
                 }
+
+        debug_info["step"] = "success_from_api"
+        debug_info["total_listed_companies"] = len(result)
+        debug_info["samsung_005930_found"] = "005930" in result
+        _DEBUG_STORE["_dart_corpmap_debug"] = debug_info
         return result
-    except Exception:
+    except Exception as e:
+        debug_info["step"] = "exception"
+        debug_info["exception"] = f"{type(e).__name__}: {e}"
+        _DEBUG_STORE["_dart_corpmap_debug"] = debug_info
         return {}
 
 
@@ -1867,15 +2276,24 @@ def fetch_disclosure_list(code, days=90, page_count=30):
     특정 종목코드의 최근 공시 목록을 반환.
     반환 형식: list of dict [{date, title, report_no, url, flag}, ...]
     """
+    debug_info = {"step": "start", "requested_code": code}
     api_key = get_dart_api_key()
     if not api_key:
+        debug_info["step"] = "no_api_key"
+        _DEBUG_STORE[f"_dart_disclosure_debug_{code}"] = debug_info
         return []
 
     code = normalize_kr_code(code)
     corp_map = fetch_dart_corp_code_map()
+    debug_info["corp_map_size"] = len(corp_map)
     corp_info = corp_map.get(code)
     if not corp_info:
+        debug_info["step"] = "corp_code_not_found_in_map"
+        _DEBUG_STORE[f"_dart_disclosure_debug_{code}"] = debug_info
         return []
+
+    debug_info["corp_name"] = corp_info.get("corp_name")
+    debug_info["corp_code"] = corp_info.get("corp_code")
 
     end_dt = datetime.datetime.now()
     start_dt = end_dt - datetime.timedelta(days=days)
@@ -1892,10 +2310,25 @@ def fetch_disclosure_list(code, days=90, page_count=30):
             "sort": "date",
             "sort_mth": "desc",
         }
-        res = requests.get(url, params=params, timeout=8)
-        data = res.json()
+        res = _dart_request(url, params, timeout=30)
+        debug_info["http_status"] = res.status_code
+        debug_info["raw_response_preview"] = res.text[:500]
+        try:
+            data = res.json()
+        except Exception as e:
+            debug_info["step"] = "json_decode_error"
+            debug_info["json_decode_exception"] = f"{type(e).__name__}: {e}"
+            _DEBUG_STORE[f"_dart_disclosure_debug_{code}"] = debug_info
+            return []
+        debug_info["response_keys"] = list(data.keys()) if isinstance(data, dict) else f"not_a_dict: {type(data).__name__}"
+        debug_info["dart_status"] = data.get("status") if isinstance(data, dict) else None
+        debug_info["dart_message"] = data.get("message") if isinstance(data, dict) else None
+        debug_info["via_proxy"] = _DART_USE_PROXY
 
-        if data.get("status") != "000":
+        if not isinstance(data, dict) or data.get("status") != "000":
+            # DART status 코드 참고: 013=조회된 데이터 없음, 020=사용한도초과, 800=시스템점검 등
+            debug_info["step"] = "dart_status_not_000"
+            _DEBUG_STORE[f"_dart_disclosure_debug_{code}"] = debug_info
             return []
 
         rows = []
@@ -1908,8 +2341,14 @@ def fetch_disclosure_list(code, days=90, page_count=30):
                 "url": f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={item.get('rcept_no', '')}",
                 "flag": _classify_disclosure(title),
             })
+        debug_info["step"] = "success"
+        debug_info["rows_found"] = len(rows)
+        _DEBUG_STORE[f"_dart_disclosure_debug_{code}"] = debug_info
         return rows
-    except Exception:
+    except Exception as e:
+        debug_info["step"] = "exception"
+        debug_info["exception"] = f"{type(e).__name__}: {e}"
+        _DEBUG_STORE[f"_dart_disclosure_debug_{code}"] = debug_info
         return []
 
 
@@ -1936,14 +2375,15 @@ def render_disclosure_tab(code):
 
     col_range, col_refresh = st.columns([5, 1])
     with col_range:
-        period_choice = st.radio(
+        period_choice = st.pills(
             "조회 기간",
             ["최근 30일", "최근 90일", "최근 180일", "최근 1년"],
-            index=1,
-            horizontal=True,
+            default="최근 90일",
             key=f"dart_period_{code}",
             label_visibility="collapsed",
         )
+        if period_choice is None:  # pills는 다시 누르면 선택 해제가 되므로 기본값으로 되돌림
+            period_choice = "최근 90일"
         days = {"최근 30일": 30, "최근 90일": 90, "최근 180일": 180, "최근 1년": 365}[period_choice]
     with col_refresh:
         if st.button("새로고침", key=f"dart_refresh_{code}", use_container_width=True):
@@ -1953,6 +2393,15 @@ def render_disclosure_tab(code):
 
     if not rows:
         st.caption("최근 공시 내역이 없거나 DART에 등록된 종목코드를 찾을 수 없습니다.")
+        norm_code = normalize_kr_code(code)
+        _corpmap_dbg = _DEBUG_STORE.get("_dart_corpmap_debug")
+        _disclosure_dbg = _DEBUG_STORE.get(f"_dart_disclosure_debug_{norm_code}")
+        if _corpmap_dbg or _disclosure_dbg:
+            with st.expander("🔧 디버그 정보 (공시 조회 실패 원인 확인용)"):
+                st.write("① 기업 고유번호(corp_code) 목록 조회 결과:")
+                st.json(_corpmap_dbg or {"info": "호출 안 됨"})
+                st.write("② 공시 목록 조회 결과:")
+                st.json(_disclosure_dbg or {"info": "호출 안 됨"})
         return
 
     flag_style = {
@@ -1977,24 +2426,122 @@ def render_disclosure_tab(code):
         )
 
 
+def _parse_screener_page_html(res_text, sosok):
+    """네이버 시가총액 페이지 HTML → DataFrame 파싱 (fetch_page_data와 마지막페이지
+    사전탐지(_detect_screener_last_page)가 이 로직을 공유하기 위해 분리함)."""
+    code_matches = re.findall(r'href="/item/main\.naver\?code=(\d+)" class="tltle">(.*?)</a>', res_text)
+    name_to_code = {name: code for code, name in code_matches}
+    if not name_to_code: return None
+    dfs = pd.read_html(io.StringIO(res_text))
+    main_df = next((df for df in dfs if '종목명' in df.columns), None)
+    if main_df is None or main_df.empty: return None
+    main_df = main_df.dropna(subset=['종목명'])
+    main_df['종목코드'] = main_df['종목명'].map(name_to_code)
+    main_df['시장'] = "코스피" if sosok == 0 else "코스닥"
+    return main_df
+
+def _extract_screener_current_page(res_text):
+    """[진단용] 응답 HTML의 네이버 페이지네이터에서 실제 활성 페이지 번호를 추출한다.
+    네이버가 마크업을 바꿔서 못 찾으면 None을 반환하며, 호출부는 이 경우 검증을
+    건너뛴다 — 이 추출 실패 자체가 정상 페이지를 실패로 오판시키지 않도록 하기 위함."""
+    m = re.search(r'<td class="on">\s*<a[^>]*>(\d+)</a>', res_text)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    return None
+
 def fetch_page_data(sosok, page, headers, cookies):
     time.sleep(random.uniform(0.1, 0.3))
     url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
     try:
         res = requests.get(url, headers=headers, cookies=cookies, timeout=10)
-        res.encoding = res.apparent_encoding or 'euc-kr'
-        code_matches = re.findall(r'href="/item/main\.naver\?code=(\d+)" class="tltle">(.*?)</a>', res.text)
-        name_to_code = {name: code for code, name in code_matches}
-        if not name_to_code: return None
-        dfs = pd.read_html(io.StringIO(res.text))
-        main_df = next((df for df in dfs if '종목명' in df.columns), None)
-        if main_df is None or main_df.empty: return None
-        main_df = main_df.dropna(subset=['종목명'])
-        main_df['종목코드'] = main_df['종목명'].map(name_to_code)
-        main_df['시장'] = "코스피" if sosok == 0 else "코스닥"
-        return main_df
-    except Exception:
+        res.encoding = 'euc-kr'  # 네이버금융(finance.naver.com)은 euc-kr 고정 — apparent_encoding 추측에 의존하면 특정 종목명 바이트 패턴에서 오탐(예: 키릴 계열로 오판)해 파싱이 깨진다
+
+        # ── [진단] 상태코드가 200이 아닌 경우 원인 기록 ──────────────────────
+        # 기존에는 status_code를 전혀 확인하지 않아서, 네이버가 429/403/503 등을
+        # 줘도 그냥 파싱 실패로 뭉개져서 "왜 실패했는지"를 알 수 없었다.
+        if res.status_code != 200:
+            fails = _DEBUG_STORE.setdefault("_screener_fetch_failures", [])
+            fails.append({
+                "요청": (sosok, page), "원인": f"HTTP {res.status_code}",
+                "시각": datetime.datetime.now().strftime("%H:%M:%S"),
+            })
+
+        # ── [진단] "실패"로는 안 잡히지만 요청한 페이지와 다른 내용이 온 경우 로그 ──
+        # 레이트리밋/캐시 등으로 엉뚱한 페이지 내용이 200 OK로 오면 기존 로직은 이걸
+        # 그냥 "성공"으로 처리해서 조용히 병합해버린다. 아직 이 불일치를 페이지 실패로
+        # 처리하지는 않는다(마크업 추정에 대한 확신이 100%가 아니라, 이 체크 때문에
+        # 정상 페이지까지 실패 처리되는 부작용을 피하려는 것). 우선 얼마나 자주
+        # 발생하는지 _DEBUG_STORE에 쌓아서 다음 스캔에서 확인한다.
+        returned_page = _extract_screener_current_page(res.text)
+        if returned_page is not None and returned_page != page:
+            mismatches = _DEBUG_STORE.setdefault("_screener_page_mismatches", [])
+            mismatches.append({
+                "요청": (sosok, page),
+                "실제응답페이지": returned_page,
+                "시각": datetime.datetime.now().strftime("%H:%M:%S"),
+            })
+            # 요청한 페이지가 실제보다 커서(존재하지 않는 페이지) 마지막 페이지로
+            # 클램프되어 온 경우 → 진짜 실패가 아니라 "범위 초과"이므로 별도 표시.
+            # (사전 감지가 어떤 이유로든 빗나갔을 때를 대비한 이중 안전장치)
+            if returned_page < page:
+                _DEBUG_STORE.setdefault("_screener_overflow_pages", set()).add((sosok, page))
+
+        parsed = _parse_screener_page_html(res.text, sosok)
+        if parsed is None:
+            fails = _DEBUG_STORE.setdefault("_screener_fetch_failures", [])
+            # ── [진단] 왜 파싱이 실패했는지 원인을 눈으로 볼 수 있게 스냅샷 저장 ──
+            # HTTP 200인데도 파싱이 실패하는 건 네트워크 문제가 아니라 정규식/파싱
+            # 로직이 실제 HTML 구조와 안 맞는 경우일 가능성이 높다. 얼마나 안 맞는지
+            # 판단할 수 있도록 최소한의 단서를 남긴다: 페이지 길이, 핵심 키워드 존재
+            # 여부, class="tltle" 요구 없이 느슨하게 찾은 종목코드 개수, 실제 HTML
+            # 일부 발췌.
+            loose_codes = re.findall(r'href="/item/main\.naver\?code=(\d+)"', res.text)
+            snippet_idx = res.text.find('종목명')
+            if snippet_idx == -1:
+                snippet_idx = res.text.find('<table')
+            snippet = res.text[max(0, snippet_idx - 100): snippet_idx + 500] if snippet_idx != -1 else res.text[:500]
+            fails.append({
+                "요청": (sosok, page),
+                "원인": f"HTTP {res.status_code}, 종목테이블 파싱 실패",
+                "응답길이": len(res.text),
+                "'종목명'문자열있음": '종목명' in res.text,
+                "'tltle'문자열있음": 'tltle' in res.text,
+                "느슨한매칭_종목코드개수": len(loose_codes),
+                "html_snippet": snippet,
+                "시각": datetime.datetime.now().strftime("%H:%M:%S"),
+            })
+        return parsed
+    except requests.exceptions.Timeout:
+        _DEBUG_STORE.setdefault("_screener_fetch_failures", []).append({
+            "요청": (sosok, page), "원인": "타임아웃(10초)", "시각": datetime.datetime.now().strftime("%H:%M:%S"),
+        })
         return None
+    except Exception as e:
+        _DEBUG_STORE.setdefault("_screener_fetch_failures", []).append({
+            "요청": (sosok, page), "원인": f"예외: {type(e).__name__}", "시각": datetime.datetime.now().strftime("%H:%M:%S"),
+        })
+        return None
+
+def _detect_screener_last_page_by_probe(headers, cookies, sosok, default_last=44):
+    """실제 마지막 페이지를 확실하게 찾기 위해, 절대 존재하지 않을 만큼 큰 페이지
+    번호(999)를 일부러 요청한다. 네이버는 이런 초과 요청에도 에러를 내지 않고
+    실제 마지막 페이지로 클램프해서 응답하며, 페이지네이터의 활성 페이지(class="on")
+    표시도 그 진짜 마지막 페이지 번호를 그대로 보여준다 — 이건 실제 진단 로그로
+    확인된 동작이다(코스닥 38~44 요청 → 매번 '실제응답페이지: 37'로 관측됨).
+    이전에 시도했던 '맨뒤(pgRR)' 링크 파싱은 마크업 추정이 틀려 항상 실패했었다."""
+    try:
+        res = requests.get(
+            f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page=999",
+            headers=headers, cookies=cookies, timeout=10
+        )
+        res.encoding = 'euc-kr'  # 네이버금융(finance.naver.com)은 euc-kr 고정 — apparent_encoding 추측에 의존하면 특정 종목명 바이트 패턴에서 오탐(예: 키릴 계열로 오판)해 파싱이 깨진다
+        detected = _extract_screener_current_page(res.text)
+        return detected if detected else default_last
+    except Exception:
+        return default_last
 
 def fetch_screener_data_generator():
     session = requests.Session()
@@ -2008,7 +2555,7 @@ def fetch_screener_data_generator():
         session.get("https://finance.naver.com/sise/sise_market_sum.naver", headers=headers, timeout=10)
     except Exception:
         pass  # 세션 워밍업 실패해도 쿠키 없이 계속 진행 (뒤에서 페이지별로 재시도됨)
-    time.sleep(0.5)
+    time.sleep(0.15)
 
     field_url = "https://finance.naver.com/sise/field_submit.naver?menu=market_sum&returnUrl=https%3A%2F%2Ffinance.naver.com%2Fsise%2Fsise_market_sum.naver&fieldIds=per&fieldIds=pbr&fieldIds=roe&fieldIds=dividend&fieldIds=property_total&fieldIds=debt_total&fieldIds=high52"
     try:
@@ -2016,11 +2563,45 @@ def fetch_screener_data_generator():
     except Exception:
         pass
     cookies = session.cookies.get_dict()
-    
+
+    # ── 실제 마지막 페이지 자동 감지 (하드코딩 44 제거) ──────────────────────
+    # 문제: range(1, 45)로 코스피/코스닥 둘 다 무조건 44페이지까지 요청했는데,
+    # 코스닥은 상장 종목 수가 더 적어서 실제 마지막 페이지가 44보다 작다(진단 결과: 37).
+    # 존재하지 않는 페이지를 요청하면 네이버가 200 OK를 주지만 종목 테이블은 비어 있어
+    # 매 스캔마다 3라운드 재시도를 다 태우고도 결국 "실패 페이지"로 잡혔다.
+    # _detect_screener_last_page_by_probe로 실제 마지막 페이지를 구하고, 그 이후
+    # 페이지는 애초에 요청 목록에서 제외한다. 1페이지 응답은 그대로 결과에 재사용.
+    _DEBUG_STORE["_screener_page_mismatches"] = []
+    _DEBUG_STORE["_screener_overflow_pages"] = set()
+    _DEBUG_STORE["_screener_fetch_failures"] = []
+
     all_data = []
-    urls = [(sosok, page) for sosok in [0, 1] for page in range(1, 45)]
-    total_pages = len(urls)
-    completed = 0
+    last_page_by_sosok = {}
+    for sosok in [0, 1]:
+        try:
+            res0 = requests.get(
+                f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page=1",
+                headers=headers, cookies=cookies, timeout=10
+            )
+            res0.encoding = 'euc-kr'  # 네이버금융 euc-kr 고정
+            df0 = _parse_screener_page_html(res0.text, sosok)
+            if df0 is not None and not df0.empty:
+                all_data.append(df0)
+        except Exception:
+            pass
+        last_page_by_sosok[sosok] = _detect_screener_last_page_by_probe(headers, cookies, sosok, default_last=44)
+        _DEBUG_STORE[f"_screener_last_page_sosok{sosok}"] = last_page_by_sosok[sosok]
+
+    # 코스피를 전부 먼저, 코스닥을 나중에 순서대로 나열하면(기존 방식) 같은 세션
+    # 쿠키로 나가는 요청 중 코스닥 쪽이 항상 시간상 뒤에 실행되어, 네이버가 세션
+    # 단위로 누적 요청 수를 추적해 레이트리밋을 건다면 코스닥에만 실패가 몰릴 수
+    # 있다(실제로 관측된 패턴과 일치). 두 시장 페이지를 번갈아 섞어서 제출 순서상
+    # 어느 한쪽에만 부하가 쏠리지 않게 한다.
+    _urls_0 = [(0, page) for page in range(2, last_page_by_sosok[0] + 1)]
+    _urls_1 = [(1, page) for page in range(2, last_page_by_sosok[1] + 1)]
+    urls = [u for pair in zip_longest(_urls_0, _urls_1) for u in pair if u is not None]
+    total_pages = len(urls) + 2  # 이미 처리한 1페이지 2건 포함
+    completed = 2  # 위에서 이미 처리한 1페이지 2건
     failed_pages = []
 
     _executor = get_shared_executor()
@@ -2084,10 +2665,24 @@ def fetch_screener_data_generator():
         failed_pages = still_failed
         retry_round += 1
 
+    # 범위 초과(존재하지 않는 페이지라 마지막 페이지로 클램프된 경우)로 확인된 건
+    # 진짜 실패가 아니므로 사용자 경고 대상에서 제외한다.
+    _overflow = _DEBUG_STORE.get("_screener_overflow_pages", set())
+    failed_pages = [p for p in failed_pages if p not in _overflow]
+
+    # ── [세션 프리징 버그 수정] session_state 대신 _DEBUG_STORE에 기록 ──────────
+    # 이 제너레이터는 _unified_scan_worker(오케스트레이션 백그라운드 스레드)에서
+    # 직접 호출된다. 파일 상단에 이미 문서화된 규칙(백그라운드 스레드에서 session_state를
+    # 직접 건드리면 메인 스크립트 실행 스레드가 영원히 멈출 수 있다)을 그대로 어기고
+    # 있던 부분 — 같은 함수의 page_mismatches/fetch_failures는 이미 _DEBUG_STORE를
+    # 쓰고 있었는데 missing_pages만 예외로 session_state를 직접 썼다. 이 불일치가
+    # "새로고침도 재시도도 안 통하고 오직 앱 리붓만 통하는" 세션 프리징의 유력한
+    # 원인이었을 가능성이 높다. 화면 표시는 메인 스레드(run_unified_market_scan_async)가
+    # 완료 시점에 이 값을 읽어서 처리한다.
     if failed_pages:
-        st.session_state["_screener_missing_pages"] = failed_pages
+        _DEBUG_STORE["_screener_missing_pages"] = failed_pages
     else:
-        st.session_state["_screener_missing_pages"] = []
+        _DEBUG_STORE["_screener_missing_pages"] = []
 
     if not all_data: raise Exception("네이버 금융 데이터를 불러오지 못했습니다. (서버 응답 지연)")
     yield "데이터 병합 및 재무 지표 자체 계산 중...", 95
@@ -2138,6 +2733,18 @@ def fetch_screener_data_generator():
         final_df = final_df[['종목코드', '종목명', '시장', '현재가', '52주고점', '고점대비(%)', 'PER', 'PBR', '배당수익률', 'ROE', '부채비율']]
     else:
         final_df = final_df[['종목코드', '종목명', '시장', '현재가', 'PER', 'PBR', '배당수익률', 'ROE', '부채비율']]
+
+    # ── 병합 후 종목코드 중복 검사 ────────────────────────────────────────────
+    # "실패 페이지" 경고에는 안 잡히지만, 레이트리밋/캐시 등으로 엉뚱한 페이지
+    # 내용이 200 OK로 와서 조용히 병합되는 경우 여기서 중복 종목코드로 드러난다.
+    # 이 경우 전에는 아무 경고 없이 중복 행이 그대로 섞여 들어갔다.
+    dup_mask = final_df['종목코드'].duplicated(keep=False)
+    # ── [세션 프리징 버그 수정] 여기도 session_state 대신 _DEBUG_STORE 사용 (위 missing_pages와 동일한 이유) ──
+    if dup_mask.any():
+        _DEBUG_STORE["_screener_dup_codes"] = sorted(final_df.loc[dup_mask, '종목코드'].dropna().unique().tolist())
+    else:
+        _DEBUG_STORE["_screener_dup_codes"] = []
+
     yield final_df, 100
 
 @st.cache_data(ttl=3600*12, show_spinner=False)
@@ -2194,6 +2801,66 @@ def fetch_live_price_change(code):
         return None, None, None
 
 HIGH52_PATH = "saved_high52_data.csv"
+HIGH52_META_PATH = "saved_high52_meta.json"
+
+
+def _parse_krx_date_series(raw_series):
+    """KRX CSV의 날짜/연월 컬럼을 최대한 유연하게 파싱해서 datetime Series로 반환.
+    '2025/07', '202507', '2025-07-01', '20250701' 등 KRX가 실제로 내려주는
+    여러 표기 형태를 다 커버하려고 두 가지 방식을 시도한다."""
+    s = raw_series.astype(str).str.strip()
+    parsed = pd.to_datetime(s, errors='coerce')
+    if parsed.notna().sum() < len(s) * 0.5:
+        digits = s.str.extract(r'(\d{4})\D?(\d{2})')
+        alt = pd.to_datetime(
+            digits[0] + '-' + digits[1] + '-01',
+            errors='coerce', format='%Y-%m-%d'
+        )
+        if alt.notna().sum() > parsed.notna().sum():
+            parsed = alt
+    return parsed
+
+
+def _extract_krx_date_range(h_df):
+    """업로드된 KRX CSV에서 날짜 컬럼을 찾아 'YYYY.MM ~ YYYY.MM' 형태로 반환.
+    날짜 컬럼을 못 찾거나 파싱에 실패하면 None (호출부에서 기간 표시만 생략)."""
+    date_col = find_col(h_df, ['년/월', '년월', '일자', '날짜', '기준일자', '기준월', '연월'])
+    if not date_col:
+        return None
+    parsed = _parse_krx_date_series(h_df[date_col])
+    parsed = parsed.dropna()
+    if parsed.empty:
+        return None
+    d_min, d_max = parsed.min(), parsed.max()
+    if d_min.strftime('%Y.%m') == d_max.strftime('%Y.%m'):
+        return d_min.strftime('%Y.%m')
+    return f"{d_min.strftime('%Y.%m')} ~ {d_max.strftime('%Y.%m')}"
+
+
+def save_high52_meta(market_info):
+    """market_info: {"코스피": {"date_range": "2025.07 ~ 2026.08", "count": 912}, ...}
+    업로드 직후 호출해서, 다음부터는 화면에 재진입해도(=재업로드 안 해도) 언제 갱신됐고
+    데이터 기간이 어디까지인지 계속 확인할 수 있도록 파일로 남긴다."""
+    meta = {
+        "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "markets": market_info,
+    }
+    try:
+        with open(HIGH52_META_PATH, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def load_high52_meta():
+    if not os.path.exists(HIGH52_META_PATH):
+        return None
+    try:
+        with open(HIGH52_META_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
 
 def merge_high52(df):
     if not os.path.exists(HIGH52_PATH): return df
@@ -2356,45 +3023,98 @@ def check_naver_52w_robust(row_dict):
             }
     return None
 
-def run_unified_market_scan():
-    """전체 시장 스크리너 스캔 + 52주 고점 매칭(추천 종목 후보 산출)을 한 번에 실행.
-    대시보드 / 추천 종목 / 종목 스크리너, 어디서 버튼을 눌러도 이 함수 하나로
-    'shared_screener_df'와 'reco_raw_data'가 함께 갱신되어 세 화면 모두 같은 데이터를 공유한다."""
-    pb = st.progress(0, text="[1/2] 전체 시장 데이터 스캔 준비 중...")
+# ── [스캔 버튼 멈춤 수정] 전체 시장 스캔을 백그라운드 스레드 + 논블로킹 폴링으로 전환 ──
+# 문제: 기존 run_unified_market_scan()은 fetch_screener_data_generator()를 "메인
+# 스크립트 실행 스레드"에서 그대로 for문으로 소비했다. 내부적으로 1단계만 최대 35초
+# 대기 + 실패 페이지 재시도 최대 3라운드(라운드마다 최대 2~10초 대기 + 최대 18초
+# 응답 대기)가 있어서, 최악의 경우 1분~1분 반 가까이 메인 스레드가 통째로 막혔다.
+# 이 동안 Streamlit은 같은 세션에서 오는 어떤 클릭(탭 이동 포함)도 받지 못했고,
+# "멈춘 줄 알고" 사용자가 반복 클릭/새로고침을 하면 스캔이 중복 실행되어 공유
+# 스레드풀에 부하가 더 쏠리는 악순환까지 생겼다(스레드 좀비 누적 → 결국 프로세스
+# 전체가 응답 없음 상태로 이어지는 원인 중 하나).
+#
+# 해결: 다른 비동기 로딩 지점(render_async_multi)과 동일한 철학으로, 실제 스캔
+# 작업(1단계 스크리너 스캔 + 2단계 52주 고점 매칭)을 오케스트레이션 풀의 백그라운드
+# 스레드에 통째로 던지고, 메인 스크립트는 st.fragment(run_every=...)로 진행률만
+# 짧은 간격(0.4초)으로 폴링한다. 백그라운드 스레드 안에서는 st.progress/st.error 같은
+# 위젯 호출이 안전하지 않으므로, 진행률/에러/경고는 전부 모듈 전역 dict
+# (_SCAN_JOB_STATE)에 기록해두고 메인 스레드가 폴링 시점에 그 값을 읽어 그린다.
+# session_state 최종 반영(shared_screener_df / reco_raw_data)도 반드시 메인
+# 스레드에서만 수행해서, "백그라운드 스레드가 세션 상태를 직접 확정 짓는" 상황을
+# 피한다.
+# ── [핵심 버그 수정] "스캔 실패: 알 수 없음, 0%"가 항상 뜨던 진짜 원인 ──────────
+# 이전에는 이 줄이 `_SCAN_JOB_STATE = {}`처럼 평범한 전역 변수였다. Streamlit은
+# 상호작용이 있을 때마다(특히 아래 폴링 프래그먼트가 거는 st.rerun()마다) 스크립트
+# 파일 전체를 처음부터 다시 실행하므로, 이 대입문도 매번 다시 실행되어 매 rerun마다
+# _SCAN_JOB_STATE가 새로운 빈 딕셔너리로 초기화되고 있었다. 반면 백그라운드에서
+# 실제로 스캔을 수행하는 _unified_scan_worker 스레드는 자신이 "시작될 때(=이전
+# rerun)의" _SCAN_JOB_STATE 객체에 진행률을 계속 기록한다. 그 결과 폴링 후 다시
+# 실행된 스크립트가 state = _SCAN_JOB_STATE.get(job_id, {})를 읽으면, 실제 진행
+# 상황이 담긴 "옛날" 객체가 아니라 방금 새로 만들어진 "텅 빈" 객체를 보게 되어
+# 항상 text="알 수 없음", pct=0으로 나타났다 — 스캔이 실제로는 잘 진행/완료되고
+# 있었어도 절대 그 사실을 알 수 없었던 것.
+# 해결: 아래 스레드풀들과 동일하게 @st.cache_resource로 감싸서, 이 줄이 매
+# rerun마다 다시 실행되더라도 항상 "동일한" 딕셔너리 객체를 반환하게 한다.
+@st.cache_resource(show_spinner=False)
+def _get_scan_job_state_store():
+    return {}
+
+_SCAN_JOB_STATE = _get_scan_job_state_store()
+
+def _unified_scan_worker(job_id):
+    """run_unified_market_scan()의 1+2단계 로직을 그대로 수행하되, st.* 위젯 호출
+    대신 _SCAN_JOB_STATE[job_id]에 진행률/결과를 기록한다. 오케스트레이션 풀의
+    백그라운드 스레드에서 submit_with_ctx로 실행되는 것을 전제로 한다."""
+    state = _SCAN_JOB_STATE[job_id]
+
+    def set_progress(text, pct):
+        state["text"] = text
+        state["pct"] = pct
 
     # 1단계: 전체 시장 스캔 (종목 스크리너 데이터)
+    set_progress("[1/2] 전체 시장 데이터 스캔 준비 중...", 0)
     try:
         fetch_and_cache_screener_data.clear()
         temp_df = pd.DataFrame()
         for status_msg, pct in fetch_screener_data_generator():
             if isinstance(status_msg, str):
-                pb.progress(pct, text=f"[1/2] 전체 시장 스캔 중: {status_msg}")
+                set_progress(f"[1/2] 전체 시장 스캔 중: {status_msg}", pct)
             else:
                 temp_df = status_msg
 
         if temp_df.empty:
-            pb.empty()
-            st.error("통신 지연으로 시장 스캔에 실패했습니다. 다시 시도해주세요.")
-            return False
+            state["done"] = True
+            state["success"] = False
+            state["error"] = "통신 지연으로 시장 스캔에 실패했습니다. 다시 시도해주세요."
+            return
 
         temp_df = _safe_save_screener_df(temp_df, "saved_screener_data.csv")
-        st.session_state['shared_screener_df'] = temp_df
-        screener_df = temp_df
+        state["screener_df"] = temp_df
 
-        if st.session_state.get("_screener_missing_pages"):
-            st.warning(f"⚠️ 이번 스캔에서 끝내 실패한 페이지 (시장구분, 페이지번호): {st.session_state['_screener_missing_pages']}")
-            st.session_state["_screener_missing_pages"] = []
+        # fetch_screener_data_generator 내부에서 이미 _DEBUG_STORE에 채워둔
+        # 진단 정보를 그대로 옮겨 담아둔다 (최종 표시는 메인 스레드에서).
+        # ⚠️ 이 함수 전체가 오케스트레이션 백그라운드 스레드에서 실행되므로,
+        # 여기서는 절대 st.session_state를 읽거나 쓰지 않는다 — session_state
+        # 반영은 메인 스레드(run_unified_market_scan_async)에서만 한다.
+        state["missing_pages"] = list(_DEBUG_STORE.get("_screener_missing_pages") or [])
+        state["dup_codes"] = list(_DEBUG_STORE.get("_screener_dup_codes") or [])
+        state["page_mismatches"] = list(_DEBUG_STORE.get("_screener_page_mismatches") or [])
+        state["fetch_failures"] = list(_DEBUG_STORE.get("_screener_fetch_failures") or [])
+        _DEBUG_STORE["_screener_missing_pages"] = []
+        _DEBUG_STORE["_screener_dup_codes"] = []
+        _DEBUG_STORE["_screener_page_mismatches"] = []
+        _DEBUG_STORE["_screener_fetch_failures"] = []
     except Exception as e:
-        pb.empty()
-        st.error(f"스캔 실패: {e}")
-        return False
+        state["done"] = True
+        state["success"] = False
+        state["error"] = f"스캔 실패: {e}"
+        return
 
     # 2단계: 52주 고점 매칭 → 추천 종목 후보 산출
     load_high52_map.clear()
     high52_map = load_high52_map()
-    scan_workers = 8 if high52_map else 5
 
-    df = screener_df.copy()
+    df = temp_df.copy()
     finance_keywords = '금융|은행|증권|보험|캐피탈|지주|투자|저축'
     cond = (
         (df['PER'] > 0) & (df['PER'] <= 40) &
@@ -2406,11 +3126,12 @@ def run_unified_market_scan():
     val_df = df[cond].copy()
 
     if val_df.empty:
-        pb.progress(100, text="✨ 시장 스캔 완료!")
-        time.sleep(0.3)
-        pb.empty()
-        st.warning("현재 시장 데이터 기준, 최소 요건(D급)을 통과한 종목조차 없습니다. 추천 종목 후보 산출은 건너뜁니다.")
-        return True
+        set_progress("✨ 시장 스캔 완료!", 100)
+        state["done"] = True
+        state["success"] = True
+        state["reco_df"] = None
+        state["warning"] = "현재 시장 데이터 기준, 최소 요건(D급)을 통과한 종목조차 없습니다. 추천 종목 후보 산출은 건너뜁니다."
+        return
 
     val_df = val_df.sort_values('ROE', ascending=False).head(150)
     rows = []
@@ -2419,29 +3140,138 @@ def run_unified_market_scan():
     progress_text = "⚡ CSV 고점 데이터 매칭 중..." if high52_map else "⚡ 네이버 실시간 API 스캔 중..."
     completed = 0
 
+    # ── [세션 프리징 예방] check_naver_52w_robust는 내부에서 load_high52_map()
+    # (@st.cache_data)을 호출한다. ScriptRunContext 없는 스레드에서 캐시 함수를
+    # 부르면 내부 락에 걸려 영원히 대기할 수 있다는 게 이미 다른 곳(대시보드 등)에서
+    # 확인된 문제라, 여기도 반드시 submit_with_ctx로 컨텍스트를 심어서 제출한다.
     _executor = get_shared_executor()
-    _futures = {_executor.submit(check_naver_52w_robust, r): r for r in dict_records}
+    _futures = {submit_with_ctx(_executor, check_naver_52w_robust, r): r for r in dict_records}
     try:
         for future in concurrent.futures.as_completed(_futures, timeout=25):
             completed += 1
-            pb.progress(int((completed / total) * 100), text=f"[2/2] {progress_text} ({completed}/{total})")
+            set_progress(f"[2/2] {progress_text} ({completed}/{total})", int((completed / total) * 100))
             try:
                 res = future.result(timeout=8)
             except Exception:
                 res = None
-            if res: rows.append(res)
+            if res:
+                rows.append(res)
     except concurrent.futures.TimeoutError:
         pass  # 전체 상한(25초) 초과 → 지금까지 모인 결과로 계속 진행
     finally:
         for f in _futures:
             f.cancel()
 
-    pb.progress(100, text="✨ 스캔 완료! (스크리너 + 추천 종목 데이터가 함께 갱신되었습니다)")
-    time.sleep(0.4)
-    pb.empty()
+    set_progress("✨ 스캔 완료! (스크리너 + 추천 종목 데이터가 함께 갱신되었습니다)", 100)
+    state["done"] = True
+    state["success"] = True
+    state["reco_df"] = pd.DataFrame(rows) if rows else None
 
-    if rows:
-        reco_df = pd.DataFrame(rows)
+
+def run_unified_market_scan_async(job_key="unified_scan", overall_timeout=150):
+    """run_unified_market_scan()의 논블로킹 버전. 버튼 클릭 시 이 함수를 호출하면
+    백그라운드 스레드에서 스캔이 진행되는 동안에도 메인 스크립트가 절대 멈추지 않고,
+    사용자는 다른 탭 이동이나 다른 버튼 클릭을 그대로 계속할 수 있다.
+    (동일 세션 안에서 여러 곳에서 호출해도 job_key가 같으면 중복 스캔이 아니라
+    이미 진행 중인 스캔의 진행률을 같이 보여준다.)"""
+    jobs = st.session_state.setdefault("_scan_jobs", {})
+    job = jobs.get(job_key)
+
+    if job is None:
+        job_id = f"{job_key}_{time.time()}"
+        _SCAN_JOB_STATE[job_id] = {"text": "스캔 준비 중...", "pct": 0, "done": False}
+        future = submit_with_ctx(get_orchestration_executor(), _unified_scan_worker, job_id)
+        job = {"job_id": job_id, "future": future, "started_at": time.time(), "overall_timeout": overall_timeout}
+        jobs[job_key] = job
+
+    job_id = job["job_id"]
+    future = job["future"]
+    state = _SCAN_JOB_STATE.get(job_id, {})
+    timed_out = (time.time() - job["started_at"]) > job.get("overall_timeout", overall_timeout)
+
+    # ── [진행률 정체 감지] "죽지도 않고 응답도 안 오는" 소켓/DNS 행에 대한 방어 ──
+    # concurrent.futures 타임아웃은 대부분의 경우를 막아주지만, DNS 조회 단계처럼
+    # socket.setdefaulttimeout도 적용 안 되는 지점에서 워커 스레드 자체가 통째로
+    # 멎어버리면 future.done()이 영원히 False로 남는다. 이런 경우 overall_timeout까지
+    # 마냥 기다리게 두는 대신, "진행률(%)이 stall_threshold초 이상 전혀 안 바뀌면"
+    # 조기에 중단하고 다음 재시도를 위해 스레드풀 자체를 새로 갈아치운다.
+    _now = time.time()
+    _last_pct = state.get("pct", 0)
+    if state.get("_last_pct_seen") != _last_pct:
+        state["_last_pct_seen"] = _last_pct
+        state["_last_pct_change_at"] = _now
+    # 전역 폴링 fragment(_all_jobs_settled)가 이 job의 정체 여부를 판단할 수 있도록
+    # job dict 자체에도 최신 정체-시각을 반영해둔다.
+    job["_last_pct_change_at"] = state.get("_last_pct_change_at", job["started_at"])
+    _stalled = (_now - state.get("_last_pct_change_at", job["started_at"])) > 50
+
+    if not future.done() and not timed_out and not _stalled:
+        st.progress(min(state.get("pct", 0), 100), text=f"🔄 {state.get('text', '스캔 중...')}")
+        # ── [fragment #10719 회피] 여기서도 자체 fragment를 만들지 않는다. job이
+        # _scan_jobs에 남아있으면, 페이지 렌더링 뒤 호출되는 maybe_run_global_poller()의
+        # 전역 fragment가 이어서 감시하고 완료 시 st.rerun()으로 갱신해준다.
+        return
+
+    # 완료(또는 상한 시간 초과 / 진행률 정체) → 결과를 메인 스레드에서 session_state에 반영
+    jobs.pop(job_key, None)
+
+    if not state.get("success"):
+        _last_text = state.get("text", "알 수 없음")
+        _last_pct = state.get("pct", 0)
+        if _stalled and not future.done():
+            # ── [죽은 스레드풀 강제 교체] ────────────────────────────────
+            # 이 future가 물려있던 풀(공유풀/오케스트레이션풀)에 진짜 좀비 스레드가
+            # 있다는 뜻이므로, 다음 재시도가 또 같은 죽은 풀 뒤에 줄서지 않도록
+            # 지금 바로 두 풀을 전부 새것으로 교체해둔다. 이미 던져진 이 future
+            # 자체는 복구가 안 되지만(파이썬은 실행 중 스레드를 못 죽인다), 최소한
+            # "다시 시도" 버튼을 눌렀을 때는 깨끗한 풀에서 새로 시작하게 된다.
+            print(f"[SCAN STALL {datetime.datetime.now().strftime('%H:%M:%S')}] "
+                  f"진행률이 50초 이상 멈춰 강제 종료 후 스레드풀 교체 "
+                  f"(마지막 상태: {_last_text} {_last_pct}%)", file=sys.stderr, flush=True)
+            try:
+                _get_shared_executor_raw.clear()
+            except Exception:
+                pass
+            try:
+                _get_orchestration_executor_raw.clear()
+            except Exception:
+                pass
+            future.cancel()
+            st.error(
+                f"스캔 실패: 진행이 멈춰서 중단했습니다 (마지막 상태: {_last_text}, {_last_pct}%). "
+                "네이버 서버 응답이 완전히 끊긴 것으로 보입니다. 스레드풀을 새로 정리했으니 "
+                "잠시 후 다시 시도해주세요."
+            )
+        else:
+            st.error(
+                state.get("error")
+                or f"스캔 실패: 시간이 너무 오래 걸려 중단했습니다 (마지막 상태: {_last_text}, {_last_pct}%). 다시 시도해주세요."
+            )
+        _SCAN_JOB_STATE.pop(job_id, None)
+        return
+
+    screener_df = state.get("screener_df")
+    if screener_df is not None:
+        st.session_state['shared_screener_df'] = screener_df
+
+    if state.get("missing_pages"):
+        st.warning(f"⚠️ 이번 스캔에서 끝내 실패한 페이지 (시장구분, 페이지번호): {state['missing_pages']}")
+    if state.get("dup_codes"):
+        st.warning(f"⚠️ 병합 결과에서 중복된 종목코드 발견 (엉뚱한 페이지 내용이 섞였을 가능성): {state['dup_codes']}")
+    if state.get("page_mismatches"):
+        st.warning(f"⚠️ 요청한 페이지와 실제 응답 페이지가 다른 경우 {len(state['page_mismatches'])}건 발견: {state['page_mismatches']}")
+    if state.get("fetch_failures"):
+        from collections import Counter
+        reason_counts = Counter(f["원인"] for f in state["fetch_failures"])
+        st.warning(
+            f"🔍 [진단] 이번 스캔 중 발생한 개별 요청 실패 {len(state['fetch_failures'])}건 "
+            f"(재시도로 회복된 것 포함) — 원인별 집계: {dict(reason_counts)}"
+        )
+        with st.expander("실패 상세 로그 보기"):
+            st.write(state["fetch_failures"])
+
+    reco_df = state.get("reco_df")
+    if reco_df is not None and not reco_df.empty:
         st.session_state['reco_raw_data'] = reco_df
         try:
             reco_df.to_csv(RECO_PATH, index=False, encoding='utf-8-sig')
@@ -2454,9 +3284,12 @@ def run_unified_market_scan():
                 os.remove(RECO_PATH)
             except Exception:
                 pass
-        st.warning("분석 결과 고점 대비 유의미하게 하락한 종목이 없습니다.")
+        st.warning(state.get("warning") or "분석 결과 고점 대비 유의미하게 하락한 종목이 없습니다.")
 
-    return True
+    st.success("✨ 스캔 완료! (스크리너 + 추천 종목 데이터가 함께 갱신되었습니다)")
+    _SCAN_JOB_STATE.pop(job_id, None)
+    st.rerun()
+
 
 def estimate_simple_target_price(current_price, per=None, pbr=None):
     """PER 15배 환산 → PBR 1.3배 환산 → 현재가 +25% 순으로 간이 목표가를 추정.
@@ -2721,14 +3554,15 @@ def draw_fnguide_details(code):
             unsafe_allow_html=True,
         )
 
-        period_choice = st.radio(
+        period_choice = st.pills(
             "조회 기간",
             ["2주 (14일)", "4주 (1개월)", "24주 (6개월)"],
-            index=1,
-            horizontal=True,
+            default="4주 (1개월)",
             key=f"trend_period_{code}",
             label_visibility="collapsed",
         )
+        if period_choice is None:
+            period_choice = "4주 (1개월)"
         _period_days = {"2주 (14일)": 10, "4주 (1개월)": 20, "24주 (6개월)": 120}[period_choice]
         _period_label = f"{period_choice} · {_period_days}거래일"
 
@@ -3136,6 +3970,24 @@ def update_user_password(username, new_password):
     return False
 
 
+def is_admin_user():
+    """현재 로그인한 사용자가 관리자인지 확인.
+
+    secrets.toml에 다음처럼 등록해서 관리한다 (쉼표로 여러 명 등록 가능):
+        ADMIN_USERNAMES = "내아이디,다른관리자아이디"
+    등록돼 있지 않으면 아무도 관리자가 아닌 것으로 간주(보수적 기본값).
+    """
+    current = st.session_state.get("auth_user")
+    if not current:
+        return False
+    try:
+        raw = st.secrets.get("ADMIN_USERNAMES", "")
+    except Exception:
+        raw = ""
+    admin_ids = {u.strip() for u in str(raw).split(",") if u.strip()}
+    return current in admin_ids
+
+
 # =========================
 # ⭐ 관심종목 (마이페이지, Google Sheets 저장)
 # =========================
@@ -3364,7 +4216,7 @@ def render_watchlist_portfolio_summary(df):
     codes = holdings["종목코드"].tolist()
     current_prices = {}
     _executor = get_shared_executor()
-    _futures = {_executor.submit(fetch_live_price_change, code): code for code in codes}
+    _futures = {submit_with_ctx(_executor, fetch_live_price_change, code): code for code in codes}
     try:
         for future in concurrent.futures.as_completed(_futures, timeout=12):
             code = _futures[future]
@@ -3625,35 +4477,103 @@ def render_watchlist():
         return code, price_info, spark, ai_score, hit_prob_html
 
     if _wl_codes:
-        # ⚠️ Streamlit은 새 탭 클릭(재실행 요청)이 와도, 지금 실행 중인 스크립트가
-        # 여기처럼 순수 파이썬 블로킹 호출(as_completed/future.result) 안에 있으면 그
-        # 자리에서 끼어들 수 없다. 사용자가 몇 초 안에 여러 번 연달아 탭을 누르면,
-        # 이전 실행이 아직 이 대기 구간에 갇혀 있는 채로 새 실행들이 밀리고, 그 새
-        # 실행들도 각자 같은 공유 스레드풀에 작업을 또 밀어넣어 워커가 금방 동나버려서
-        # 사실상 멈춘 것처럼 보이는 현상으로 이어진다. 그래서 상한을 짧게(15초/8초)
-        # 유지한다 — 상한을 넘기면 이번 렌더링에서는 일부 종목 데이터가 비어있는 채로
-        # 넘어가고(다음 새로고침 때 캐시가 채워지며 자연히 보임), 그 대신 Streamlit이
-        # 최대한 빨리 제어권을 되찾아서 대기 중인 새 클릭을 처리할 수 있게 하는 걸
-        # 더 우선한다.
-        with st.spinner(f"🔄 관심종목 {len(_wl_codes)}건 시세 조회 중..."):
+        # [저장 버튼 클릭 시 멈춤 대응] render_async_multi의 자동 폴링(0.4초 간격)은
+        # 아직 안 끝났으면 st.fragment 안에서 st.rerun()으로 "전체 페이지"를 강제로
+        # 다시 실행시킨다. 이건 신규 종목처럼 보여줄 데이터가 아예 없을 때는 필요하지만,
+        # 이미 캐시된 값이 있고 그저 55초 신선도가 지나서 "슬쩍 갱신"하는 상황에서까지
+        # 이 강제 리런 루프를 돌리면, 하필 사용자가 매수가/수량을 입력하고 저장 버튼을
+        # 누르는 시점과 겹칠 때 백그라운드 강제 리런이 진행 중인 상호작용과 부딪혀
+        # 세션이 꼬이는 것으로 추정되는 멈춤 현상이 있었다.
+        # 그래서 "완전히 처음 보는 신규 종목"만 어쩔 수 없이 기다리게 하고,
+        # "이미 있던 종목의 신선도 갱신"은 대기/강제리런 없이 조용히 백그라운드에
+        # 던져두기만 했다가 다음 자연스러운 재실행(다른 버튼 클릭 등) 때 반영한다.
+        _WL_PREFETCH_REFRESH_SEC = 55
+        _wl_cache_key = "_wl_prefetch_cache"
+        _wl_cache = st.session_state.setdefault(
+            _wl_cache_key,
+            {"results": {"price": {}, "spark": {}, "ai": {}, "hitprob": {}}, "ts": {}},
+        )
+        _wl_now = time.time()
+
+        _wl_missing_codes = [c for c in _wl_codes if c not in _wl_cache["ts"]]
+        _wl_stale_codes = [
+            c for c in _wl_codes
+            if c not in _wl_missing_codes and (_wl_now - _wl_cache["ts"][c]) >= _WL_PREFETCH_REFRESH_SEC
+        ]
+
+        if _wl_missing_codes:
+            def _submit_wl_jobs():
+                _wl_executor = get_shared_executor()
+                return {c: submit_with_ctx(_wl_executor, _wl_prefetch_one, c) for c in _wl_missing_codes}
+
+            def _collect_wl_results(futures):
+                out = {"price": {}, "spark": {}, "ai": {}, "hitprob": {}}
+                for _code, f in futures.items():
+                    if f.done():
+                        try:
+                            _c, _price_info, _spark, _ai_score, _hp_html = f.result(timeout=0.1)
+                            out["price"][_c] = _price_info
+                            out["spark"][_c] = _spark
+                            out["ai"][_c] = _ai_score
+                            if _hp_html:
+                                out["hitprob"][_c] = _hp_html
+                        except Exception:
+                            pass
+                return out
+
+            _wl_new_results, _wl_ready = render_async_multi(
+                job_key="watchlist_prefetch_new",
+                submit_fn=_submit_wl_jobs,
+                collect_fn=_collect_wl_results,
+                default_result={"price": {}, "spark": {}, "ai": {}, "hitprob": {}},
+                spinner_text=f"신규 관심종목 {len(_wl_missing_codes)}건 시세 조회 중...",
+                overall_timeout=15,
+            )
+            if not _wl_ready:
+                return  # 처음 보는 종목이라 보여줄 게 없을 때만 대기
+
+            for _key in ("price", "spark", "ai", "hitprob"):
+                _wl_cache["results"][_key].update(_wl_new_results.get(_key, {}))
+            for _c in _wl_missing_codes:
+                _wl_cache["ts"][_c] = _wl_now
+
+        if _wl_stale_codes:
+            # 강제 리런/대기 없이 그냥 백그라운드에 던져만 놓는다.
+            _wl_bg_jobs = st.session_state.setdefault("_wl_bg_jobs", {})
             _wl_executor = get_shared_executor()
-            _wl_futures = {_wl_executor.submit(_wl_prefetch_one, c): c for c in _wl_codes}
-            try:
-                for _wl_future in concurrent.futures.as_completed(_wl_futures, timeout=8):
-                    try:
-                        _code, _price_info, _spark, _ai_score, _hp_html = _wl_future.result(timeout=4)
-                    except Exception:
-                        continue
-                    wl_price_cache[_code] = _price_info
-                    sparkline_cache[_code] = _spark
-                    ai_score_cache[_code] = _ai_score
+            for c in _wl_stale_codes:
+                if c not in _wl_bg_jobs or _wl_bg_jobs[c].done():
+                    _wl_bg_jobs[c] = submit_with_ctx(_wl_executor, _wl_prefetch_one, c)
+
+        # 예전에 백그라운드로 던져놓은 작업 중 그 사이 끝난 게 있으면 조용히 캐시에 반영
+        _wl_bg_jobs = st.session_state.get("_wl_bg_jobs", {})
+        for c in list(_wl_bg_jobs.keys()):
+            f = _wl_bg_jobs[c]
+            if f.done():
+                try:
+                    _c, _price_info, _spark, _ai_score, _hp_html = f.result(timeout=0.1)
+                    _wl_cache["results"]["price"][_c] = _price_info
+                    _wl_cache["results"]["spark"][_c] = _spark
+                    _wl_cache["results"]["ai"][_c] = _ai_score
                     if _hp_html:
-                        hit_prob_cache[_code] = _hp_html
-            except concurrent.futures.TimeoutError:
-                pass  # 전체 상한 초과 → 나머지는 건너뛰고 계속 진행
-            finally:
-                for f in _wl_futures:
-                    f.cancel()
+                        _wl_cache["results"]["hitprob"][_c] = _hp_html
+                    _wl_cache["ts"][_c] = time.time()
+                except Exception:
+                    pass
+                del _wl_bg_jobs[c]
+
+        # 관심종목에서 삭제된 종목의 캐시/백그라운드 작업은 정리(메모리 누적 방지)
+        _wl_codes_set = set(_wl_codes)
+        for _key in ("price", "spark", "ai", "hitprob"):
+            _wl_cache["results"][_key] = {
+                c: v for c, v in _wl_cache["results"][_key].items() if c in _wl_codes_set
+            }
+        _wl_cache["ts"] = {c: v for c, v in _wl_cache["ts"].items() if c in _wl_codes_set}
+
+        wl_price_cache = _wl_cache["results"]["price"]
+        sparkline_cache = _wl_cache["results"]["spark"]
+        ai_score_cache = _wl_cache["results"]["ai"]
+        hit_prob_cache = _wl_cache["results"]["hitprob"]
 
 
     reached_summary = []  # [(종목명, 종목코드, 도달차수, 진입가, 현재가), ...]
@@ -4474,6 +5394,12 @@ def _show_debug_memory():
 
 
 def main():
+    # ── [워치독 통합] 개별 arm/cancel은 파일 상단의 영구(repeat=True) 워치독과
+    # 충돌하므로 여기서 더 이상 걸지 않는다 (자세한 이유는 파일 상단 주석 참고).
+    _main_impl()
+
+
+def _main_impl():
     if 'auth_user' not in st.session_state:
         st.session_state.auth_user = None
 
@@ -4788,6 +5714,10 @@ def main():
     # "진입"만 있고 "완료"가 없는 페이지가 바로 멈춘 지점이다.
     print(f"[DEBUG {datetime.datetime.now().strftime('%H:%M:%S')}] 페이지 진입: {selected}", file=sys.stderr, flush=True)
 
+    # ── [워치독 통합] 개별 arm/cancel은 파일 상단의 영구(repeat=True) 워치독과
+    # 충돌하므로 여기서 더 이상 걸지 않는다 (자세한 이유는 파일 상단 주석 참고).
+    # "진입"/"완료" 로그 자체는 여전히 유용하므로(어느 페이지에서 안 돌아오는지
+    # 특정 가능) 그대로 남겨둔다.
     if   selected == "대시보드 홈":      render_dashboard()
     elif selected == "추천 종목":        render_recommendations()
     elif selected == "종목 스크리너":    render_screener()
@@ -4797,6 +5727,16 @@ def main():
     elif selected == "비밀번호 변경":     render_change_password()
 
     print(f"[DEBUG {datetime.datetime.now().strftime('%H:%M:%S')}] 페이지 렌더링 완료: {selected}", file=sys.stderr, flush=True)
+
+    # ── [전역 폴링 fragment 호출 — 세션당 이 한 곳에서만] ─────────────────────
+    # 위에서 렌더링한 페이지가 render_async_multi/run_unified_market_scan_async를
+    # 통해 _bg_jobs 또는 _scan_jobs에 작업을 남겨뒀을 수 있다. 그 작업들의 완료
+    # 여부를 감시하는 주기적(run_every) fragment는 앱 전체에서 이 호출 단 한 곳에서만
+    # 만들어진다 — 어떤 페이지·어떤 카드가 몇 개의 백그라운드 작업을 걸어뒀든
+    # 물리적으로 fragment는 세션당 최대 1개만 존재하므로, Streamlit #10719
+    # ("2개 이상의 run_every fragment 동시 존재 시 세션 다운")가 구조적으로
+    # 재현될 수 없다.
+    maybe_run_global_poller()
 
 
 def render_rate_strip():
@@ -4861,11 +5801,14 @@ def render_dashboard():
             fetch_sector_ranking.clear()
             fetch_fed_rate_data.clear()
             fetch_bok_rate_data.clear()
+            # render_async_multi의 짧은 재사용 캐시도 같이 비워야, 새로고침 직후에
+            # 방금까지 쓰던 옛 결과가 다시 그대로 재사용되는 일이 없다.
+            st.session_state.get("_bg_job_results", {}).pop("dashboard_main_data", None)
             st.rerun()
     with col_scan:
-        if st.button("종목 스캔 (스크리너+추천)", use_container_width=True, key="dash_unified_scan_btn"):
-            run_unified_market_scan()
-            st.rerun()
+        _dash_scan_clicked = st.button("종목 스캔 (스크리너+추천)", use_container_width=True, key="dash_unified_scan_btn")
+    if _dash_scan_clicked or "unified_scan" in st.session_state.get("_scan_jobs", {}):
+        run_unified_market_scan_async()
     with col_rate_strip:
         render_rate_strip()
 
@@ -4888,10 +5831,10 @@ def render_dashboard():
     def _submit_dash_jobs():
         _dash_executor = get_orchestration_executor()
         return {
-            "indices":    _dash_executor.submit(fetch_market_index_table),
-            "sparklines": _dash_executor.submit(fetch_sparkline_data),
-            "trend":      _dash_executor.submit(fetch_investor_trend),
-            "df_sector":  _dash_executor.submit(fetch_sector_ranking),
+            "indices":    submit_with_ctx(_dash_executor, fetch_market_index_table),
+            "sparklines": submit_with_ctx(_dash_executor, fetch_sparkline_data),
+            "trend":      submit_with_ctx(_dash_executor, fetch_investor_trend),
+            "df_sector":  submit_with_ctx(_dash_executor, fetch_sector_ranking),
         }
 
     def _collect_dash_results(futures):
@@ -4986,12 +5929,22 @@ def render_dashboard():
         </div>
         """
         with col:
-            import streamlit.components.v1 as components
-            components.html(html, height=230 if show_volume else 210, scrolling=False)
+            # [환율/금/원유 카드에서 HTML 태그가 그대로 텍스트로 보이는 문제 수정]
+            # show_volume=False일 때 vol_html이 빈 문자열이 되는데, 위 f-string은
+            # Python 소스 들여쓰기가 그대로 살아있는 여러 줄짜리 문자열이라
+            # "공백만 있는 줄"(빈 vol_html 자리) 바로 다음에 "4칸 이상 들여쓰인 줄"
+            # (chart_section)이 오게 된다. 마크다운 문법에서는 이 조합을 "들여쓰기
+            # 코드블록"으로 해석해서, 그 아래 HTML을 그대로 이스케이프된 텍스트로
+            # 보여준다(정확히 스크린샷에서 보인 증상). 줄마다 앞뒤 공백을 지워서
+            # 이 오인식 자체가 안 일어나게 한다.
+            html_stripped = "\n".join(line.strip() for line in html.split("\n"))
+            st.markdown(html_stripped, unsafe_allow_html=True)
 
     c1, c2, c3 = st.columns(3)
     for col, key in [(c1, "kospi"), (c2, "kosdaq"), (c3, "nasdaq")]:
         render_index_card(col, key, indices.get(key, {}), show_volume=True)
+
+    # 코스피/코스닥 거래량 정상 확인 완료 (진단용 expander 제거됨)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -5048,7 +6001,29 @@ def render_dashboard():
         st.markdown(row_html, unsafe_allow_html=True)
         
         if st.button(" ", key=f"inv_btn_{market_key}", use_container_width=True, help=f"{market_label} 수급 추이 토글하기"):
-            st.session_state["investor_open"][market_key] = not is_open
+            # ── [Streamlit 확인된 버그(#10719) 회피] 동시에 여러 개의 run_every
+            # fragment가 뜨면 "fragment does not exist anymore" 에러와 함께 세션이
+            # 멈추는 게 Streamlit 팀이 인정한 버그다. render_async_multi가 토글마다
+            # 하나씩 주기적 fragment를 만들기 때문에, 코스피/코스닥을 동시에 열어두면
+            # 그 순간 2개가 동시에 돌면서 이 버그에 걸린다. 그래서 한 번에 하나만
+            # 열리도록 강제한다(새로 여는 시장 외에는 전부 닫음).
+            #
+            # ── [토글 반복 클릭 시 멈춤 추가 대응] ────────────────────────────
+            # 위 대응만으로는 "아직 데이터 로딩(=백그라운드 job)이 안 끝난 시장을
+            # 닫자마자 바로 다른 시장을 여는" 경우가 막히지 않는다. 이때 방금 닫은
+            # 시장의 render_async_multi job이 st.session_state["_bg_jobs"]에 그대로
+            # 남아있으면, 그 job에 딸려있던 주기적(run_every) 프래그먼트가 화면에서는
+            # 사라졌는데도 백엔드에서는 계속 스케줄링되고 있을 수 있다. 여기서 곧바로
+            # 다른 시장을 열어 새 프래그먼트가 또 뜨면 두 프래그먼트가 겹치면서
+            # 위와 동일한 Streamlit 버그(#10719)에 걸릴 수 있다. 그래서 시장을 닫는
+            # 순간, 그 시장에 대해 진행 중이던 백그라운드 job을 명시적으로 지워서
+            # "닫혔는데 뒤에서 계속 폴링되는" 상태 자체를 없앤다.
+            opening = not is_open
+            if opening:
+                st.session_state["investor_open"] = {k: False for k in st.session_state["investor_open"]}
+            else:
+                st.session_state.get("_bg_jobs", {}).pop(f"investor_monthly_{market_key}", None)
+            st.session_state["investor_open"][market_key] = opening
             st.rerun()
 
         br_css = "8px 8px 0 0" if is_open else "8px"
@@ -5075,8 +6050,46 @@ def render_dashboard():
         </style>
         """, unsafe_allow_html=True)
 
-        if is_open:
-            monthly = run_with_progress(f"{market_label} 월별 수급 불러오는 중...", fetch_investor_trend_monthly, sosok)
+        if is_open and "unified_scan" in st.session_state.get("_scan_jobs", {}):
+            # ── [Streamlit 확인된 버그(#10719) 회피] 전체 시장 스캔이 진행 중이면
+            # 이미 스캔 진행률용 주기적(run_every) fragment가 하나 떠 있는 상태다.
+            # 여기서 또 render_async_multi가 두 번째 주기적 fragment를 만들면,
+            # 두 fragment의 자동 재실행 타이밍이 겹치면서 "does not exist anymore"
+            # 에러와 함께 세션이 멈추는 Streamlit 자체 버그(github.com/streamlit/
+            # streamlit/issues/10719)에 걸린다. 그래서 스캔이 끝날 때까지는 이
+            # 수급 추이 조회 자체를 잠깐 미뤄둔다(스캔이 끝나면 자연히 다시 열림).
+            st.markdown(
+                '<div style="border:1px solid #E2E8F0;border-top:none;border-radius:0 0 8px 8px;'
+                'padding:12px 16px;font-size:12px;color:#94A3B8;">⏳ 전체 시장 스캔이 진행 중이라 잠시 후 표시됩니다.</div>',
+                unsafe_allow_html=True
+            )
+        elif is_open:
+            # ── [수급 토글 반복 클릭 시 완전 멈춤 수정] ──────────────────────────
+            # 이전에는 run_with_progress(...)가 fetch_investor_trend_monthly를
+            # "메인 스크립트 스레드에서 직접" 동기 호출했다. 이 함수는 내부적으로
+            # 22개의 날짜별 요청을 공유 스레드풀에 던지고 최대 12초간 그 자리에서
+            # 기다리는데, 그동안 Streamlit은 새로운 클릭(토글을 또 누르는 것 포함)을
+            # 전혀 받아줄 수 없다. 사용자가 토글을 반복해서 누르면 이런 블로킹 호출이
+            # 계속 쌓이고, 공유 풀(32개 워커)에 요청이 몰리면서 결국 앱 전체가
+            # 완전히 멈추는(리붓 전에는 회복 안 되는) 상태로 이어졌다.
+            # 해결: 대시보드의 다른 카드들과 동일하게 render_async_multi(논블로킹 +
+            # 짧은 간격 폴링) 패턴으로 바꾼다. 이러면 메인 스레드가 절대 막히지 않고,
+            # 토글을 반복해서 눌러도 매번 즉시 다음 상호작용을 받을 수 있다. 또한
+            # render_async_multi에 이미 추가된 "짧은 재사용 캐시" 덕분에, 같은 시장을
+            # 짧은 시간 안에 다시 열었다 닫았다 해도 재조회 자체가 일어나지 않는다.
+            _monthly_result, _monthly_ready = render_async_multi(
+                job_key=f"investor_monthly_{market_key}",
+                submit_fn=lambda: {"monthly": submit_with_ctx(get_orchestration_executor(), fetch_investor_trend_monthly, sosok)},
+                collect_fn=lambda futures: {
+                    "monthly": (futures["monthly"].result(timeout=0.1) if futures["monthly"].done() else None) or []
+                },
+                default_result={"monthly": []},
+                spinner_text=f"{market_label} 월별 수급 불러오는 중...",
+                overall_timeout=15,
+            )
+            if not _monthly_ready:
+                return  # 폴링 프래그먼트가 알아서 이어감 — 준비되면 자동으로 다시 그림
+            monthly = _monthly_result.get("monthly") or []
             if not monthly:
                 st.markdown(
                     '<div style="border:1px solid #E2E8F0;border-top:none;border-radius:0 0 8px 8px;'
@@ -5779,8 +6792,8 @@ def render_recommendations():
         if warn_text:
             st.markdown(f"<div style='font-size:12.5px; color:#B45309; line-height:1.5; margin-top:2px;'>{warn_text}</div>", unsafe_allow_html=True)
 
-    if btn_scan:
-        run_unified_market_scan()
+    if btn_scan or "unified_scan" in st.session_state.get("_scan_jobs", {}):
+        run_unified_market_scan_async()
 
     _reco_df = load_reco_df()
     if not _reco_df.empty:
@@ -5795,12 +6808,14 @@ def render_recommendations():
             strict_debt = st.toggle("부채비율 '엄격 기준' 적용 (권장)", value=True, help="해제 시 모든 등급의 부채비율 허들을 300%로 완화하여 더 많은 종목을 탐색합니다.")
 
         st.markdown("<br>", unsafe_allow_html=True)
-        selected_grade = st.radio(
-            "등급 필터", 
-            ["전체보기", "💎 S급", "🥇 A급", "🥈 B급", "🥉 C급", "👀 D급"], 
-            horizontal=True, 
+        selected_grade = st.pills(
+            "등급 필터",
+            ["전체보기", "💎 S급", "🥇 A급", "🥈 B급", "🥉 C급", "👀 D급"],
+            default="전체보기",
             label_visibility="collapsed"
         )
+        if selected_grade is None:
+            selected_grade = "전체보기"
 
         def assign_grade(row, is_strict):
             per, pbr, roe, debt, drop, div = row['PER'], row['PBR'], row['ROE'], row['부채비율'], row['고점 / 하락률'], row['배당수익률']
@@ -5841,116 +6856,149 @@ def render_recommendations():
         if display_df.empty:
             st.info(f"현재 설정된 필터({market_filter}, {selected_grade})에 부합하는 종목이 없습니다. 조건을 완화해보세요.")
         else:
-            for _, row in display_df.iterrows():
-                name  = row['종목명']
-                code  = str(row['종목코드']).zfill(6)
-                market_str = row.get('시장', '')
-                price = row['현재가_num']
-                drop_pct = row['고점 / 하락률']
-                per, pbr, roe, debt = row['PER'], row['PBR'], row['ROE'], row['부채비율']
-                div = row.get('배당수익률', 0.0)
-                grade_label = row['등급']
-                source_badge = row.get('데이터출처', '🌐 실시간')
+            PAGE_SIZE = 15
+            total_n = len(display_df)
+            _reco_filter_sig = (market_filter, strict_debt, selected_grade, total_n)
+            if st.session_state.get('_reco_filter_sig') != _reco_filter_sig:
+                st.session_state['_reco_filter_sig'] = _reco_filter_sig
+                st.session_state['_reco_shown'] = False
+                st.session_state['_reco_page_count'] = 1
 
-                entry_2nd, entry_3rd = calc_entry_points(price, pbr, drop_pct, price)
-                entry_2nd_pct = round((entry_2nd / price - 1) * 100, 1) if price else 0.0
-                entry_3rd_pct = round((entry_3rd / price - 1) * 100, 1) if price else 0.0
+            if not st.session_state.get('_reco_shown', False):
+                # [클릭 게이트] 탭 진입/필터 변경 즉시 종목 카드를 전부 그리면(많을 때는
+                # 수십~백 개) 매번 렌더링 부하가 커서 탭 전환이 버벅였다. 그래서 결과를
+                # 미리 그리지 않고, 사용자가 직접 "결과 보기"를 눌렀을 때만 그리기 시작한다.
+                if st.button(f"🔽 결과 보기 ({total_n}건)", use_container_width=True, key="reco_show_btn"):
+                    st.session_state['_reco_shown'] = True
+                    st.rerun()
+            else:
+                if st.button("🔼 결과 접기", key="reco_hide_btn"):
+                    st.session_state['_reco_shown'] = False
+                    st.rerun()
 
-                if "S급" in grade_label: bg_color = "#EEF2FF"
-                elif "A급" in grade_label: bg_color = "#F0FDF4"
-                elif "B급" in grade_label: bg_color = "#FEFCE8"
-                elif "C급" in grade_label: bg_color = "#FFF5F5"
-                else: bg_color = "#F8FAFC"
+                # [페이지네이션] 결과 보기를 눌렀어도 한 번에 다 쏟아내지 않고
+                # PAGE_SIZE(15)개씩 나눠서 그린다 — 조건에 맞는 종목이 많을 때의
+                # 렌더링 부하를 완화한다.
+                page_count = st.session_state.get('_reco_page_count', 1)
+                n_show = min(page_count * PAGE_SIZE, total_n)
+                page_df = display_df.iloc[:n_show]
 
-                is_saved = is_in_watchlist(username, code)
+                for _, row in page_df.iterrows():
+                    name  = row['종목명']
+                    code  = str(row['종목코드']).zfill(6)
+                    market_str = row.get('시장', '')
+                    price = row['현재가_num']
+                    drop_pct = row['고점 / 하락률']
+                    per, pbr, roe, debt = row['PER'], row['PBR'], row['ROE'], row['부채비율']
+                    div = row.get('배당수익률', 0.0)
+                    grade_label = row['등급']
+                    source_badge = row.get('데이터출처', '🌐 실시간')
 
-                with st.container(key=f"reco_card_{code}"):
-                    st.markdown(f"""
-                        <style>
-                        .st-key-reco_card_{code} {{
-                            background:{bg_color}; border:1px solid #E2E8F0; border-radius:8px;
-                            padding:16px 20px 4px 20px; margin-bottom:5px; margin-top:12px;
-                        }}
-                        .st-key-reco_card_{code} div[data-testid="stButton"] {{
-                            margin-top:6px; display:flex; justify-content:flex-end;
-                        }}
-                        .st-key-reco_card_{code} div[data-testid="stButton"] button {{
-                            background-color:transparent !important; border:none !important;
-                            outline:none !important; box-shadow:none !important;
-                            padding:0 !important; margin:0 !important; min-height:auto !important;
-                            line-height:1 !important; font-size:19px !important; color:#F59E0B !important;
-                        }}
-                        .st-key-reco_card_{code} div[data-testid="stButton"] button:hover,
-                        .st-key-reco_card_{code} div[data-testid="stButton"] button:focus,
-                        .st-key-reco_card_{code} div[data-testid="stButton"] button:focus:not(:active),
-                        .st-key-reco_card_{code} div[data-testid="stButton"] button:active {{
-                            background-color:transparent !important; border:none !important;
-                            outline:none !important; box-shadow:none !important; color:#D97706 !important;
-                        }}
-                        </style>
-                    """, unsafe_allow_html=True)
+                    entry_2nd, entry_3rd = calc_entry_points(price, pbr, drop_pct, price)
+                    entry_2nd_pct = round((entry_2nd / price - 1) * 100, 1) if price else 0.0
+                    entry_3rd_pct = round((entry_3rd / price - 1) * 100, 1) if price else 0.0
 
-                    col_content, col_star = st.columns([25, 1])
-                    with col_content:
+                    if "S급" in grade_label: bg_color = "#EEF2FF"
+                    elif "A급" in grade_label: bg_color = "#F0FDF4"
+                    elif "B급" in grade_label: bg_color = "#FEFCE8"
+                    elif "C급" in grade_label: bg_color = "#FFF5F5"
+                    else: bg_color = "#F8FAFC"
+
+                    is_saved = is_in_watchlist(username, code)
+
+                    with st.container(key=f"reco_card_{code}"):
                         st.markdown(f"""
-                            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; padding-top:6px;">
-                                <div>
-                                    <span style="font-size:15px; font-weight:700; color:#0F172A;">{name}</span>
-                                    <span style="font-size:11px; color:#94A3B8; margin-left:6px;">{code} | {market_str}</span>
-                                    <span style="font-size:11px; font-weight:700; color:#111827; background:#FFFFFF; border: 1px solid #D1D5DB; padding:2px 10px; border-radius:10px; margin-left:8px;">{grade_label}</span>
-                                    <span style="font-size:10px; color:#94A3B8; background:#F1F5F9; border: 1px solid #E2E8F0; padding:2px 7px; border-radius:8px; margin-left:6px;">{source_badge}</span>
+                            <style>
+                            .st-key-reco_card_{code} {{
+                                background:{bg_color}; border:1px solid #E2E8F0; border-radius:8px;
+                                padding:16px 20px 4px 20px; margin-bottom:5px; margin-top:12px;
+                            }}
+                            .st-key-reco_card_{code} div[data-testid="stButton"] {{
+                                margin-top:6px; display:flex; justify-content:flex-end;
+                            }}
+                            .st-key-reco_card_{code} div[data-testid="stButton"] button {{
+                                background-color:transparent !important; border:none !important;
+                                outline:none !important; box-shadow:none !important;
+                                padding:0 !important; margin:0 !important; min-height:auto !important;
+                                line-height:1 !important; font-size:19px !important; color:#F59E0B !important;
+                            }}
+                            .st-key-reco_card_{code} div[data-testid="stButton"] button:hover,
+                            .st-key-reco_card_{code} div[data-testid="stButton"] button:focus,
+                            .st-key-reco_card_{code} div[data-testid="stButton"] button:focus:not(:active),
+                            .st-key-reco_card_{code} div[data-testid="stButton"] button:active {{
+                                background-color:transparent !important; border:none !important;
+                                outline:none !important; box-shadow:none !important; color:#D97706 !important;
+                            }}
+                            </style>
+                        """, unsafe_allow_html=True)
+
+                        col_content, col_star = st.columns([25, 1])
+                        with col_content:
+                            st.markdown(f"""
+                                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; padding-top:6px;">
+                                    <div>
+                                        <span style="font-size:15px; font-weight:700; color:#0F172A;">{name}</span>
+                                        <span style="font-size:11px; color:#94A3B8; margin-left:6px;">{code} | {market_str}</span>
+                                        <span style="font-size:11px; font-weight:700; color:#111827; background:#FFFFFF; border: 1px solid #D1D5DB; padding:2px 10px; border-radius:10px; margin-left:8px;">{grade_label}</span>
+                                        <span style="font-size:10px; color:#94A3B8; background:#F1F5F9; border: 1px solid #E2E8F0; padding:2px 7px; border-radius:8px; margin-left:6px;">{source_badge}</span>
+                                    </div>
+                                    <div style="text-align:right;">
+                                        <span style="font-size:15px; font-weight:700; color:#0F172A;">{int(price):,}</span>
+                                        <span style="font-size:12px; font-weight:700; color:#16A34A; background:#FFFFFF; border: 1px solid #D1D5DB; padding:2px 8px; border-radius:12px; margin-left:8px;">52주최고 대비 {drop_pct:.1f}%</span>
+                                    </div>
                                 </div>
-                                <div style="text-align:right;">
-                                    <span style="font-size:15px; font-weight:700; color:#0F172A;">{int(price):,}</span>
-                                    <span style="font-size:12px; font-weight:700; color:#16A34A; background:#FFFFFF; border: 1px solid #D1D5DB; padding:2px 8px; border-radius:12px; margin-left:8px;">52주최고 대비 {drop_pct:.1f}%</span>
+                            """, unsafe_allow_html=True)
+                        with col_star:
+                            if st.button("⭐" if is_saved else "☆", key=f"reco_star_{code}", help="관심종목에서 제거" if is_saved else "관심종목에 추가"):
+                                if is_saved:
+                                    remove_from_watchlist(username, code)
+                                    st.toast(f"'{name}'을(를) 관심종목에서 제거했습니다.")
+                                else:
+                                    add_to_watchlist(username, code, name)
+                                    st.toast(f"'{name}'을(를) 관심종목에 추가했습니다.")
+                                st.rerun()
+
+                        st.markdown(f"""
+                            <div style="display:flex; gap:18px; font-size:12px; color:#64748B; margin:8px 0 12px 0; flex-wrap:wrap;">
+                                <span>PER <b style="color:#1E293B;">{per:.2f}배</b></span>
+                                <span>PBR <b style="color:#1E293B;">{pbr:.2f}배</b></span>
+                                <span>ROE <b style="color:#1E293B;">{roe:.1f}%</b></span>
+                                <span>부채비율 <b style="color:#1E293B;">{debt:.1f}%</b></span>
+                                <span>배당수익률 <b style="color:#DC2626;">{div:.1f}%</b></span>
+                            </div>
+                            <div style="display:flex; gap:10px; padding-bottom:16px;">
+                                <div style="flex:1; background:#FFFFFF; border:1px solid #E2E8F0; border-radius:6px; padding:8px 4px; text-align:center;">
+                                    <div style="font-size:11px; color:#94A3B8; margin-bottom:2px;">1차 진입 (비중 25%)</div>
+                                    <div style="font-size:13px; font-weight:700; color:#5A4EE5;">{int(price):,}</div>
+                                </div>
+                                <div style="flex:1; background:#FFFFFF; border:1px solid #E2E8F0; border-radius:6px; padding:8px 4px; text-align:center;">
+                                    <div style="font-size:11px; color:#94A3B8; margin-bottom:2px;">2차 진입 ({entry_2nd_pct:+.1f}% / 35%)</div>
+                                    <div style="font-size:13px; font-weight:700; color:#1E293B;">{int(entry_2nd):,}</div>
+                                </div>
+                                <div style="flex:1; background:#FFFFFF; border:1px solid #E2E8F0; border-radius:6px; padding:8px 4px; text-align:center;">
+                                    <div style="font-size:11px; color:#94A3B8; margin-bottom:2px;">3차 진입 ({entry_3rd_pct:+.1f}% / 40%)</div>
+                                    <div style="font-size:13px; font-weight:700; color:#1E293B;">{int(entry_3rd):,}</div>
                                 </div>
                             </div>
                         """, unsafe_allow_html=True)
-                    with col_star:
-                        if st.button("⭐" if is_saved else "☆", key=f"reco_star_{code}", help="관심종목에서 제거" if is_saved else "관심종목에 추가"):
-                            if is_saved:
-                                remove_from_watchlist(username, code)
-                                st.toast(f"'{name}'을(를) 관심종목에서 제거했습니다.")
-                            else:
-                                add_to_watchlist(username, code, name)
-                                st.toast(f"'{name}'을(를) 관심종목에 추가했습니다.")
-                            st.rerun()
-
-                    st.markdown(f"""
-                        <div style="display:flex; gap:18px; font-size:12px; color:#64748B; margin:8px 0 12px 0; flex-wrap:wrap;">
-                            <span>PER <b style="color:#1E293B;">{per:.2f}배</b></span>
-                            <span>PBR <b style="color:#1E293B;">{pbr:.2f}배</b></span>
-                            <span>ROE <b style="color:#1E293B;">{roe:.1f}%</b></span>
-                            <span>부채비율 <b style="color:#1E293B;">{debt:.1f}%</b></span>
-                            <span>배당수익률 <b style="color:#DC2626;">{div:.1f}%</b></span>
-                        </div>
-                        <div style="display:flex; gap:10px; padding-bottom:16px;">
-                            <div style="flex:1; background:#FFFFFF; border:1px solid #E2E8F0; border-radius:6px; padding:8px 4px; text-align:center;">
-                                <div style="font-size:11px; color:#94A3B8; margin-bottom:2px;">1차 진입 (비중 25%)</div>
-                                <div style="font-size:13px; font-weight:700; color:#5A4EE5;">{int(price):,}</div>
-                            </div>
-                            <div style="flex:1; background:#FFFFFF; border:1px solid #E2E8F0; border-radius:6px; padding:8px 4px; text-align:center;">
-                                <div style="font-size:11px; color:#94A3B8; margin-bottom:2px;">2차 진입 ({entry_2nd_pct:+.1f}% / 35%)</div>
-                                <div style="font-size:13px; font-weight:700; color:#1E293B;">{int(entry_2nd):,}</div>
-                            </div>
-                            <div style="flex:1; background:#FFFFFF; border:1px solid #E2E8F0; border-radius:6px; padding:8px 4px; text-align:center;">
-                                <div style="font-size:11px; color:#94A3B8; margin-bottom:2px;">3차 진입 ({entry_3rd_pct:+.1f}% / 40%)</div>
-                                <div style="font-size:13px; font-weight:700; color:#1E293B;">{int(entry_3rd):,}</div>
-                            </div>
-                        </div>
-                    """, unsafe_allow_html=True)
                 
-                with st.expander(f"{name} · AI 진단 · 재무분석"):
-                    render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_label)
-                    st.markdown("<hr style='margin:16px 0 12px 0; border-color:#E5E7EB;'>", unsafe_allow_html=True)
+                    with st.expander(f"{name} · AI 진단 · 재무분석"):
+                        render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_label)
+                        st.markdown("<hr style='margin:16px 0 12px 0; border-color:#E5E7EB;'>", unsafe_allow_html=True)
 
-                    btn_key = f"reco_fn_{code}"
-                    data_key = f"reco_fn_data_{code}"
-                    if st.button(f"📊 실시간 재무 데이터 불러오기 (FnGuide)", key=btn_key):
-                        with st.spinner(f"'{name}'의 최신 기업 개요와 재무제표를 가져오는 중입니다..."):
-                            st.session_state[data_key] = True
-                    if st.session_state.get(data_key):
-                        draw_fnguide_details(code)
+                        btn_key = f"reco_fn_{code}"
+                        data_key = f"reco_fn_data_{code}"
+                        if st.button(f"📊 실시간 재무 데이터 불러오기 (FnGuide)", key=btn_key):
+                            with st.spinner(f"'{name}'의 최신 기업 개요와 재무제표를 가져오는 중입니다..."):
+                                st.session_state[data_key] = True
+                        if st.session_state.get(data_key):
+                            draw_fnguide_details(code)
+
+
+                if n_show < total_n:
+                    if st.button(f"➕ 더 보기 ({n_show}/{total_n}건 표시 중)", use_container_width=True, key="reco_more_btn"):
+                        st.session_state['_reco_page_count'] = page_count + 1
+                        st.rerun()
 
 SCREENER_PRESETS = {
     "1단계 · 배당형 저평가": {
@@ -5976,7 +7024,9 @@ def render_screener():
     st.markdown("<hr style='margin: 10px 0 15px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
 
     preset_names = list(SCREENER_PRESETS.keys())
-    selected_preset = st.radio("필터 단계", preset_names, horizontal=True, key="screener_preset", label_visibility="collapsed")
+    selected_preset = st.pills("필터 단계", preset_names, default=preset_names[0], key="screener_preset", label_visibility="collapsed")
+    if selected_preset is None:
+        selected_preset = preset_names[0]
     preset = SCREENER_PRESETS[selected_preset]
 
     if preset:
@@ -6005,8 +7055,9 @@ def render_screener():
         </div>
     """, unsafe_allow_html=True)
 
-    if st.button("실시간 데이터 ⚡초고속 스캔 실행"):
-        run_unified_market_scan()
+    _screener_scan_clicked = st.button("실시간 데이터 ⚡초고속 스캔 실행")
+    if _screener_scan_clicked or "unified_scan" in st.session_state.get("_scan_jobs", {}):
+        run_unified_market_scan_async()
 
     col_h52_title, col_h52_help = st.columns([9, 1])
     with col_h52_title:
@@ -6034,85 +7085,134 @@ KRX 정보데이터시스템의 **[12004] 종목 시세 추이(월/연도)** 화
 스크리너 · 추천종목 탭에 반영됩니다."""
             )
 
+    _h52_meta = load_high52_meta()
+    if _h52_meta and _h52_meta.get("markets"):
+        _mkt_meta = _h52_meta["markets"]
+        _parts = []
+        for _label in ["코스피", "코스닥"]:
+            _info = _mkt_meta.get(_label)
+            if _info:
+                _rng = _info.get("date_range") or "기간 확인 불가"
+                _cnt = _info.get("count", 0)
+                _parts.append(f"{_label} {_rng} ({_cnt:,}종목)")
+        if _parts:
+            st.markdown(
+                f"<div style='font-size:12.5px; color:#15803D; background:#F0FDF4; "
+                f"border:1px solid #BBF7D0; border-radius:6px; padding:8px 12px; margin:2px 0 14px 0;'>"
+                f"✅ 52주 고점 데이터 반영됨 — {' · '.join(_parts)}"
+                f"<br><span style='color:#65A30D;'>마지막 갱신: {_h52_meta.get('updated_at', '알 수 없음')}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+    else:
+        st.markdown(
+            "<div style='font-size:12.5px; color:#92400E; background:#FFFBEB; "
+            "border:1px solid #FDE68A; border-radius:6px; padding:8px 12px; margin:2px 0 14px 0;'>"
+            "⚠️ 아직 52주 고점 데이터가 업로드되지 않았습니다.</div>",
+            unsafe_allow_html=True,
+        )
+
     with st.expander("업로드하기", expanded=False):
-        st.markdown("""
-            <p style="font-size: 13px; color: #5D6475; margin-bottom: 6px;">
-                KRX 종목시세추이 CSV(약 1년치)를 <b>코스피 / 코스닥 각각 업로드</b>하면 종목코드 매칭 후
-                <b>52주고점</b>과 <b>고점대비(%)</b> 컬럼이 자동으로 추가됩니다.
-            </p>
-        """, unsafe_allow_html=True)
-        st.link_button("🔗 KRX [52주 최고/최저] 데이터 다운로드", "http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020104", use_container_width=True)
+        if not is_admin_user():
+            st.info("🔒 이 기능은 관리자 계정만 사용할 수 있습니다. 데이터 업데이트가 필요하면 관리자에게 요청해주세요.")
+        else:
+            st.markdown("""
+                <p style="font-size: 13px; color: #5D6475; margin-bottom: 6px;">
+                    KRX 종목시세추이 CSV(약 1년치)를 <b>코스피 / 코스닥 각각 업로드</b>하면 종목코드 매칭 후
+                    <b>52주고점</b>과 <b>고점대비(%)</b> 컬럼이 자동으로 추가됩니다.
+                </p>
+            """, unsafe_allow_html=True)
+            st.link_button("🔗 KRX [52주 최고/최저] 데이터 다운로드", "http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020104", use_container_width=True)
 
-        def process_high52_upload(uploaded_file, market_label):
-            try:
-                try: h_df = pd.read_csv(uploaded_file, encoding='cp949')
-                except:
-                    uploaded_file.seek(0)
-                    h_df = pd.read_csv(uploaded_file, encoding='utf-8')
-                h_df.columns = h_df.columns.str.strip()
-                h_code_col = find_col(h_df, ['종목코드', '단축코드'])
-                h_high_col = find_col(h_df, ['최고가(종가)', '최고가', '52주최고'])
+            def process_high52_upload(uploaded_file, market_label):
+                try:
+                    try: h_df = pd.read_csv(uploaded_file, encoding='cp949')
+                    except:
+                        uploaded_file.seek(0)
+                        h_df = pd.read_csv(uploaded_file, encoding='utf-8')
+                    h_df.columns = h_df.columns.str.strip()
+                    h_code_col = find_col(h_df, ['종목코드', '단축코드'])
+                    h_high_col = find_col(h_df, ['최고가(종가)', '최고가', '52주최고'])
                 
-                if not h_code_col or not h_high_col:
-                    st.error(f"[{market_label}] 종목코드 또는 최고가 컬럼을 찾을 수 초과니다. (감지된 컬럼: {list(h_df.columns)})")
-                    return None
-                h_df['종목코드'] = h_df[h_code_col].astype(str).str.zfill(6)
-                h_df[h_high_col] = pd.to_numeric(h_df[h_high_col].astype(str).str.replace(',', ''), errors='coerce')
-                return h_df.groupby('종목코드')[h_high_col].max()
-            except Exception as e:
-                st.error(f"[{market_label}] 파일 처리 오류: {e}")
-                return None
+                    if not h_code_col or not h_high_col:
+                        st.error(f"[{market_label}] 종목코드 또는 최고가 컬럼을 찾을 수 초과니다. (감지된 컬럼: {list(h_df.columns)})")
+                        return None, None
+                    date_range = _extract_krx_date_range(h_df)
+                    h_df['종목코드'] = h_df[h_code_col].astype(str).str.zfill(6)
+                    h_df[h_high_col] = pd.to_numeric(h_df[h_high_col].astype(str).str.replace(',', ''), errors='coerce')
+                    return h_df.groupby('종목코드')[h_high_col].max(), date_range
+                except Exception as e:
+                    st.error(f"[{market_label}] 파일 처리 오류: {e}")
+                    return None, None
 
-        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-        col_kp, col_kq = st.columns(2)
+            st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+            col_kp, col_kq = st.columns(2)
 
-        with col_kp:
-            st.markdown("<b style='font-size:13px;'>🔵 KOSPI (코스피) CSV</b>", unsafe_allow_html=True)
-            uploaded_kospi = st.file_uploader("코스피 파일 업로드", type=['csv'], key='high52_kospi')
+            with col_kp:
+                st.markdown("<b style='font-size:13px;'>🔵 KOSPI (코스피) CSV</b>", unsafe_allow_html=True)
+                uploaded_kospi = st.file_uploader("코스피 파일 업로드", type=['csv'], key='high52_kospi')
 
-        with col_kq:
-            st.markdown("<b style='font-size:13px;'>🟢 KOSDAQ (코스닥) CSV</b>", unsafe_allow_html=True)
-            uploaded_kosdaq = st.file_uploader("코스닥 파일 업로드", type=['csv'], key='high52_kosdaq')
+            with col_kq:
+                st.markdown("<b style='font-size:13px;'>🟢 KOSDAQ (코스닥) CSV</b>", unsafe_allow_html=True)
+                uploaded_kosdaq = st.file_uploader("코스닥 파일 업로드", type=['csv'], key='high52_kosdaq')
 
-        if uploaded_kospi or uploaded_kosdaq:
-            maps = {}
-            if uploaded_kospi:
-                m = process_high52_upload(uploaded_kospi, "코스피")
-                if m is not None: maps['코스피'] = m
-            if uploaded_kosdaq:
-                m = process_high52_upload(uploaded_kosdaq, "코스닥")
-                if m is not None: maps['코스닥'] = m
+            if uploaded_kospi or uploaded_kosdaq:
+                maps = {}
+                date_ranges = {}
+                if uploaded_kospi:
+                    m, dr = process_high52_upload(uploaded_kospi, "코스피")
+                    if m is not None:
+                        maps['코스피'] = m
+                        date_ranges['코스피'] = dr
+                if uploaded_kosdaq:
+                    m, dr = process_high52_upload(uploaded_kosdaq, "코스닥")
+                    if m is not None:
+                        maps['코스닥'] = m
+                        date_ranges['코스닥'] = dr
 
-            if maps:
-                combined_map = pd.concat(maps.values()).groupby(level=0).max()
-                base_df = load_screener_df()
-                if base_df.empty:
-                    st.error("먼저 실시간 스캔 데이터가 필요합니다. 위 [실시간 데이터 ⚡초고속 스캔 실행] 버튼을 눌러주세요.")
-                else:
-                    base_df['52주고점'] = base_df['종목코드'].map(combined_map)
-                    mask_h = (base_df['현재가'] > 0) & (base_df['52주고점'] > 0)
-                    base_df['고점대비(%)'] = None
-                    base_df.loc[mask_h, '고점대비(%)'] = (
-                        (base_df.loc[mask_h, '현재가'] - base_df.loc[mask_h, '52주고점'])
-                        / base_df.loc[mask_h, '52주고점']
-                    ) * 100
-                    base_cols = [c for c in base_df.columns if c not in ['52주고점', '고점대비(%)']]
-                    base_df[base_cols].to_csv(save_path, index=False, encoding='utf-8-sig')
-                    high52_save = base_df[['종목코드', '52주고점', '고점대비(%)']].dropna(subset=['52주고점'])
-                    high52_save.to_csv(HIGH52_PATH, index=False, encoding='utf-8-sig')
-                    st.session_state['shared_screener_df'] = base_df
-                    load_high52_map.clear()
-                    if 'reco_raw_data' in st.session_state:
-                        del st.session_state['reco_raw_data']
-                    if os.path.exists(RECO_PATH):
-                        try:
-                            os.remove(RECO_PATH)
-                        except Exception:
-                            pass
-                
-                    matched = int(mask_h.sum())
-                    markets_done = " + ".join(maps.keys())
-                    st.success(f"✅ 52주 고점 매칭 완료! ({markets_done}) {matched}종목 업데이트되었습니다. 추천 종목 탭에서 재스캔 시 새 데이터가 바로 적용됩니다.")
+                if maps:
+                    combined_map = pd.concat(maps.values()).groupby(level=0).max()
+                    base_df = load_screener_df()
+                    if base_df.empty:
+                        st.error("먼저 실시간 스캔 데이터가 필요합니다. 위 [실시간 데이터 ⚡초고속 스캔 실행] 버튼을 눌러주세요.")
+                    else:
+                        base_df['52주고점'] = base_df['종목코드'].map(combined_map)
+                        mask_h = (base_df['현재가'] > 0) & (base_df['52주고점'] > 0)
+                        base_df['고점대비(%)'] = None
+                        base_df.loc[mask_h, '고점대비(%)'] = (
+                            (base_df.loc[mask_h, '현재가'] - base_df.loc[mask_h, '52주고점'])
+                            / base_df.loc[mask_h, '52주고점']
+                        ) * 100
+                        base_cols = [c for c in base_df.columns if c not in ['52주고점', '고점대비(%)']]
+                        base_df[base_cols].to_csv(save_path, index=False, encoding='utf-8-sig')
+                        high52_save = base_df[['종목코드', '52주고점', '고점대비(%)']].dropna(subset=['52주고점'])
+                        high52_save.to_csv(HIGH52_PATH, index=False, encoding='utf-8-sig')
+                        st.session_state['shared_screener_df'] = base_df
+                        load_high52_map.clear()
+                        if 'reco_raw_data' in st.session_state:
+                            del st.session_state['reco_raw_data']
+                        if os.path.exists(RECO_PATH):
+                            try:
+                                os.remove(RECO_PATH)
+                            except Exception:
+                                pass
+
+                        # 시장별(코스피/코스닥) 매칭 건수 + 업로드 CSV의 데이터 기간을 메타로 저장
+                        # → 스크리너 탭에 재진입할 때마다(재업로드 없이도) 최신화 여부를 바로 확인 가능
+                        market_info = {}
+                        for label, m in maps.items():
+                            matched_count = int(base_df.loc[
+                                mask_h & base_df['종목코드'].isin(m.index), '종목코드'
+                            ].nunique())
+                            market_info[label] = {
+                                "date_range": date_ranges.get(label),
+                                "count": matched_count,
+                            }
+                        save_high52_meta(market_info)
+
+                        matched = int(mask_h.sum())
+                        markets_done = " + ".join(maps.keys())
+                        st.success(f"✅ 52주 고점 매칭 완료! ({markets_done}) {matched}종목 업데이트되었습니다. 추천 종목 탭에서 재스캔 시 새 데이터가 바로 적용됩니다.")
 
     df = load_screener_df()
 
@@ -6125,7 +7225,9 @@ KRX 정보데이터시스템의 **[12004] 종목 시세 추이(월/연도)** 화
         col_tools1, col_tools2 = st.columns([3, 2])
         with col_tools1:
             with st.container(key="market_filter_box"):
-                market_filter = st.radio("시장", ["전체", "코스피", "코스닥"], horizontal=True, key="screener_market", label_visibility="collapsed")
+                market_filter = st.pills("시장", ["전체", "코스피", "코스닥"], default="전체", key="screener_market", label_visibility="collapsed")
+                if market_filter is None:
+                    market_filter = "전체"
             
             t1, t2 = st.columns(2)
             with t1:
@@ -6232,7 +7334,7 @@ def search_naver_stock_by_name(query):
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         url = f"https://finance.naver.com/search/searchList.naver?query={requests.utils.quote(query)}"
         res = requests.get(url, headers=headers, timeout=6)
-        res.encoding = res.apparent_encoding or 'euc-kr'
+        res.encoding = 'euc-kr'  # 네이버금융(finance.naver.com)은 euc-kr 고정 — apparent_encoding 추측에 의존하면 특정 종목명 바이트 패턴에서 오탐(예: 키릴 계열로 오판)해 파싱이 깨진다
         matches = re.findall(r'href="/item/main\.naver\?code=(\d+)"[^>]*>\s*([^<]+?)\s*</a>', res.text)
         seen = {}
         for code, name in matches:
@@ -6413,17 +7515,33 @@ def render_fnguide():
     if active_code:
         code = active_code
         cache_key = f'fnguide_result_{code}'
-        
+
         if search_btn or cache_key not in st.session_state:
-            with st.spinner("에프앤가이드(FnGuide) 서버에서 데이터를 분석 중입니다..."):
+            # [재무분석 버튼 클릭 시 멈춤 대응] 이 블록만 유일하게 call_with_timeout 같은
+            # 보호장치 없이 fetch_company_info_fnguide → fetch_financial_data를 메인
+            # 스레드에서 순차적으로 직접 호출하고 있었다. 개별 요청엔 timeout이 있지만
+            # 여러 개가 순서대로 실행되니 다 더해지고, FnGuide·네이버 같은 국내 사이트는
+            # 해외 리전 서버에서 접속이 느려지는 경우가 잦아서(코드 곳곳의 DART 우회
+            # 프록시 사례처럼) 체감상 "완전히 멈춘" 것처럼 보일 수 있었다.
+            # 전체를 call_with_timeout으로 감싸서 상한(25초)을 명확히 강제한다.
+            def _do_fnguide_fetch():
                 _info = fetch_company_info_fnguide(code)
                 _df_annual, _, _ = fetch_financial_data(code)
                 _per_ai, _pbr_ai, _roe_ai, _debt_ai, _drop_pct_ai, _div_ai = get_ai_diagnosis_inputs(code, _df_annual)
-                st.session_state[cache_key] = {
+                return {
                     'info': _info,
                     'per_ai': _per_ai, 'pbr_ai': _pbr_ai, 'roe_ai': _roe_ai,
                     'debt_ai': _debt_ai, 'drop_pct_ai': _drop_pct_ai, 'div_ai': _div_ai,
                 }
+
+            with st.spinner("에프앤가이드(FnGuide) 서버에서 데이터를 분석 중입니다..."):
+                _fnguide_result = call_with_timeout(_do_fnguide_fetch, timeout=25)
+
+            if _fnguide_result is None:
+                st.error("⏱️ 데이터 조회가 너무 오래 걸려 중단했습니다. FnGuide/네이버 서버 응답이 느리거나 네트워크가 불안정한 것 같습니다. 잠시 후 다시 시도해주세요.")
+                st.stop()
+
+            st.session_state[cache_key] = _fnguide_result
 
         cached = st.session_state[cache_key]
         info        = cached['info']
@@ -6460,14 +7578,15 @@ def render_fnguide():
             "🛡️ 보수형 (20:40:40)": (20, 40, 40),
             "✏️ 직접 입력":          None,
         }
-        preset_choice = st.radio(
+        preset_choice = st.pills(
             "분할 비중 프리셋",
             list(_PRESETS.keys()),
-            index=0,
-            horizontal=True,
+            default=list(_PRESETS.keys())[0],
             key=f"preset_{code}",
             help="3차까지 하락이 왔을 때 실탄이 가장 많은 공격형(20:30:50)이 평균단가 절감 효과가 가장 큽니다."
         )
+        if preset_choice is None:
+            preset_choice = list(_PRESETS.keys())[0]
 
         if _PRESETS[preset_choice] is not None:
             _pw1, _pw2, _pw3 = _PRESETS[preset_choice]
