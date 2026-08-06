@@ -6004,13 +6004,17 @@ def render_dashboard():
         spinner_text="대시보드 데이터를 불러오는 중...",
         overall_timeout=15,
     )
-    if not _dash_ready:
-        # 이 시점의 dashboard_main_data job은 "방금 막 생성"됐거나 "아직 진행 중"인
-        # 경우만 여기 도달하므로(이미 끝난 job은 위 render_async_multi() 호출이
-        # 그 자리에서 바로 수거해버림), 지금 poller를 켜는 것은 안전하다 — 진짜로
-        # 기다려야 할 작업이 있을 때만 켜지는 것이기 때문.
-        maybe_run_global_poller()
-        return  # 아직 로딩 중 — 이후 렌더링은 건너뛰고, 폴링 프래그먼트가 알아서 이어간다
+    # ── [로딩 배너 위치 통일 — 2026-08-06] ──────────────────────────────────
+    # 예전에는 여기서 바로 poller를 켜고 return 해버렸다. 그러면 이 시점 이후의
+    # 모든 렌더링(시장 지수/수급 동향/핫 섹터/데이터 안내)이 통째로 스킵되면서
+    # 페이지가 "버튼 줄 + 로딩 배너"만 남은 아주 짧은 상태가 되고, 그 결과 로딩
+    # 배너가 (원래는 맨 아래인) 데이터 안내 박스 자리가 아니라 화면 훨씬 위쪽에,
+    # 그리고 다른 내용이 없어 보이니 사실상 "화면 맨 아래"처럼 나타났다.
+    # 해결: 여기서 return 하지 않고 그냥 계속 진행한다. _dash_results는 이미
+    # default_result(빈 dict/DataFrame)로 채워져 있어서 아래 렌더링 코드가 전부
+    # "데이터 없음" 형태로 안전하게 그려진다. poller 호출도 더 이상 여기서 하지
+    # 않고, 함수 맨 끝(데이터 안내 박스 바로 아래) 단 한 곳에서만 한다 — 그래야
+    # 로딩 배너가 항상 같은 자리에 뜬다.
 
     indices = _dash_results["indices"] or {}
     sparklines = _dash_results["sparklines"] or {}
@@ -6239,16 +6243,30 @@ def render_dashboard():
                 spinner_text=f"{market_label} 월별 수급 불러오는 중...",
                 overall_timeout=15,
             )
+            # ── [로딩 배너 위치 통일 — 2026-08-06] ──────────────────────────
+            # 예전에는 여기서 바로 return 해서 이후 렌더링(핫 섹터, 데이터 안내,
+            # 그리고 함수 맨 끝의 poller 호출)까지 전부 건너뛰었다. 그러면 이
+            # 토글이 로딩 중인 동안은 poller 자체가 아예 켜지지 않아서(함수 밖
+            # _main_impl()도 대시보드 홈 페이지에서는 poller를 안 켜주므로) 화면이
+            # 자동으로 갱신되지 않는 문제도 있었다. 이제는 이 섹션만 "불러오는
+            # 중" placeholder로 대체하고 계속 진행해서, 로딩 배너가 함수 맨 끝
+            # (데이터 안내 박스 바로 아래) 한 곳에서만 뜨도록 통일한다.
             if not _monthly_ready:
-                return  # 폴링 프래그먼트가 알아서 이어감 — 준비되면 자동으로 다시 그림
-            monthly = _monthly_result.get("monthly") or []
-            if not monthly:
+                st.markdown(
+                    '<div style="border:1px solid #E2E8F0;border-top:none;border-radius:0 0 8px 8px;'
+                    'padding:12px 16px;font-size:12px;color:#94A3B8;">⏳ 월별 수급 데이터를 불러오는 중입니다...</div>',
+                    unsafe_allow_html=True
+                )
+                monthly = []
+            else:
+                monthly = _monthly_result.get("monthly") or []
+            if _monthly_ready and not monthly:
                 st.markdown(
                     '<div style="border:1px solid #E2E8F0;border-top:none;border-radius:0 0 8px 8px;'
                     'padding:12px 16px;font-size:12px;color:#94A3B8;">데이터를 불러올 수 없습니다.</div>',
                     unsafe_allow_html=True
                 )
-            else:
+            elif _monthly_ready:
                 monthly_desc = list(reversed(monthly))
                 investor_colors = {"외국인": "#DC2626", "기관": "#2563EB", "개인": "#16A34A"}
                 max_abs = max(abs(r[k]) for r in monthly_desc for k in ["외국인", "기관", "개인"]) or 1
@@ -6338,14 +6356,12 @@ def render_dashboard():
         </div>
     """, unsafe_allow_html=True)
 
-    # ── [무한 리렌더 루프 버그 수정] 전역 폴링 fragment는 함수 맨 끝에서 딱 한 번만 ──
-    # 여기 도달했다는 것은 dashboard_main_data는 이미 준비 완료됐고(위에서 조기
-    # 반환하지 않았으므로), investor_monthly_* 등 이 함수 안의 모든 render_async_multi()
-    # 호출도 이미 다 지나온 뒤라는 뜻이다. 즉 "완료됐는데 안 치워진 job"이 있을
-    # 여지가 없는 시점이므로, 지금 _bg_jobs/_scan_jobs에 남아있는 것은 전부 진짜
-    # 아직 안 끝난 작업뿐이다 — 이제서야 poller를 켜는 게 안전하다.
-    # (스캔 진행 중이면 run_unified_market_scan_async()가 이미 _scan_jobs를
-    # 채워뒀으므로 여기서도 정상적으로 감지된다.)
+    # ── [로딩 배너 위치 통일 — 2026-08-06] 전역 폴링 fragment는 함수 맨 끝에서 딱 한 번만 ──
+    # render_dashboard()는 이제 더 이상 중간에 return하지 않으므로(위쪽 dashboard_main_data /
+    # investor_monthly_* 로딩 중에는 빈 기본값으로 안전하게 렌더링만 하고 계속 진행함),
+    # 이 줄은 이 함수 안에서 항상 정확히 한 번, 그리고 항상 "데이터 안내" 박스
+    # 바로 아래에서 실행된다. 그래서 대시보드 데이터/월별 수급/전체 시장 스캔 중
+    # 무엇이 로딩 중이든 상관없이, 진행 상황 배너는 항상 이 자리 하나에서만 뜬다.
     maybe_run_global_poller()
 
 # =========================
