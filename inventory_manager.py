@@ -1674,6 +1674,34 @@ def _fn_lookup_row_multi(df, keyword_candidates, col_label):
         return float('nan')
 
 
+def _apply_forecast_valuation_fallback(rows, cols=('ROE', 'PER', 'PBR', '부채비율')):
+    """마지막 기간이 아직 마감되지 않은 컨센서스 추정치('...(E)')인데 ROE/PER/PBR/
+    부채비율이 원본 표 자체에 없어 NaN인 경우(분기별 컨센서스는 이 지표들을 아예
+    제공하지 않는 경우가 흔함), 직전 실제(마감된) 기간의 값을 근사치로 이어서
+    채운다. 어떤 항목이 이렇게 대체됐는지는 '_est_cols'(콤마 구분 문자열)에 남겨서
+    화면에서 '≈'로 구분 표시할 수 있게 한다. 실제 값이 있으면 아무것도 건드리지
+    않는다."""
+    if not rows:
+        return rows
+    last = rows[-1]
+    if '(E)' not in str(last.get('연도/분기', '')):
+        for r in rows:
+            r.setdefault('_est_cols', '')
+        return rows
+    filled = []
+    for col in cols:
+        if pd.isna(last.get(col)):
+            for prev in reversed(rows[:-1]):
+                if pd.notna(prev.get(col)):
+                    last[col] = prev[col]
+                    filled.append(col)
+                    break
+    for r in rows:
+        r.setdefault('_est_cols', '')
+    last['_est_cols'] = ','.join(filled)
+    return rows
+
+
 def _fn_build_period_table(income_df, balance_df, valuation_df, is_quarter):
     """손익/재무상태/투자지표 테이블을 기간(연도·분기) 기준 한 표로 병합."""
     core_items = ['매출액', '영업이익', '당기순이익', '영업이익률', '순이익률', 'ROE', 'PER', 'PBR', '부채비율']
@@ -1696,12 +1724,22 @@ def _fn_build_period_table(income_df, balance_df, valuation_df, is_quarter):
         per = _fn_lookup(valuation_df, 'PER(배)', c)
         pbr = _fn_lookup(valuation_df, 'PBR(배)', c)
 
+        # 연도/분기 라벨의 '(E)' 표기는 마지막에 붙여서 다시 표시하되, 마감 전
+        # 기간 판별(_apply_forecast_valuation_fallback)은 원본 컬럼명 c로 판단해야
+        # 하므로 라벨에도 그대로 남겨둔다(기존에는 여기서 지워서 아래 fallback이
+        # 마감 전 기간을 인식하지 못했다).
         rows.append({
-            '연도/분기': c.replace('(E)', ''),
+            '연도/분기': c,
             '매출액': rev, '영업이익': op, '당기순이익': ni,
             '영업이익률': op_margin, '순이익률': ni_margin,
             'ROE': roe, 'PER': per, 'PBR': pbr, '부채비율': debt_ratio,
         })
+
+    # 🔧 [2026-08-06] 분기별 컨센서스에는 ROE/PER/PBR/부채비율 자체가 없는 경우가
+    # 흔해서, 마감 전 마지막 기간은 직전 실제 값을 근사치로 이어서 채운다.
+    rows = _apply_forecast_valuation_fallback(rows)
+    for r in rows:
+        r['연도/분기'] = r['연도/분기'].replace('(E)', '')
 
     out = pd.DataFrame(rows)
     if out.empty:
@@ -1716,6 +1754,7 @@ def _fn_build_period_table(income_df, balance_df, valuation_df, is_quarter):
         final_cols.append(item)
         if f'{item} {label}' in out.columns:
             final_cols.append(f'{item} {label}')
+    final_cols.append('_est_cols')
     return out[final_cols]
 
 
@@ -2016,18 +2055,35 @@ def _naver_wise_build_period_table(real_df, col_period_pairs, is_quarter):
     → 이 구조를 맞춰야 render_company_analysis 등 기존 렌더링 코드를 그대로 재사용 가능."""
     rows = []
     for col, period in col_period_pairs:
+        rev = _naver_wise_lookup(real_df, '매출액', col)
+        op = _naver_wise_lookup(real_df, '영업이익', col)
+        op_margin = _naver_wise_lookup(real_df, '영업이익률', col)
+        # 🔧 [2026-08-06] 마감 전 분기/연도(E)는 WiseReport 원본에 영업이익률만
+        # 먼저 채워지고 영업이익(금액) 행은 비어있는 경우가 흔하다. 매출액과
+        # 영업이익률이 둘 다 있으면 금액을 역산해서 채운다(매출액 × 영업이익률).
+        if pd.isna(op) and pd.notna(rev) and pd.notna(op_margin):
+            op = rev * op_margin / 100.0
         rows.append({
             '연도/분기': period,
-            '매출액': _naver_wise_lookup(real_df, '매출액', col),
-            '영업이익': _naver_wise_lookup(real_df, '영업이익', col),
+            '매출액': rev,
+            '영업이익': op,
             '당기순이익': _naver_wise_lookup(real_df, '당기순이익', col),
-            '영업이익률': _naver_wise_lookup(real_df, '영업이익률', col),
+            '영업이익률': op_margin,
             '순이익률': _naver_wise_lookup(real_df, '순이익률', col),
             'ROE': _naver_wise_lookup(real_df, 'ROE(%)', col),
             'PER': _naver_wise_lookup(real_df, 'PER(배)', col),
             'PBR': _naver_wise_lookup(real_df, 'PBR(배)', col),
             '부채비율': _naver_wise_lookup(real_df, '부채비율', col),
         })
+
+    # 🔧 [2026-08-06] 마감 전 마지막 기간(E)은 ROE/PER/PBR/부채비율 항목 자체가
+    # WiseReport 컨센서스 원본에 없는 경우가 흔하다(연간 컨센서스에는 있어도
+    # 분기 컨센서스에는 이 지표들을 아예 제공하지 않는 경우가 많음). 값이 급격히
+    # 바뀌는 지표가 아니므로, 직전 실제(마감된) 기간의 값을 근사치로 이어서
+    # 보여주고 어떤 항목이 대체됐는지 '_est_cols'에 기록해 화면에서 '≈'로 구분
+    # 표시할 수 있게 한다.
+    rows = _apply_forecast_valuation_fallback(rows)
+
     out = pd.DataFrame(rows)
     if out.empty:
         return out
@@ -2041,6 +2097,7 @@ def _naver_wise_build_period_table(real_df, col_period_pairs, is_quarter):
         final_cols.append(item)
         if f'{item} {label}' in out.columns:
             final_cols.append(f'{item} {label}')
+    final_cols.append('_est_cols')
     return out[final_cols]
 
 
@@ -3798,15 +3855,16 @@ def draw_fnguide_details(code):
                     with st.expander("🔧 디버그 정보 (항목명 매칭 실패 원인 확인용)"):
                         st.json(_fdbg3)
 
-            def custom_formatter(val, col_name):
+            def custom_formatter(val, col_name, is_est=False):
                 try:
                     clean_val = str(val).replace(',', '').strip()
                     f_val = float(clean_val)
                     if pd.isna(f_val) or clean_val == '-' or clean_val == 'nan': return "-"
+                    prefix = "≈ " if is_est else ""
                     if '성장률' in col_name:
-                        if f_val > 0: return f"🔺 +{f_val:.1f}%"
-                        elif f_val < 0: return f"🔻 {f_val:.1f}%"
-                        else: return "0.0%"
+                        if f_val > 0: return f"{prefix}🔺 +{f_val:.1f}%"
+                        elif f_val < 0: return f"{prefix}🔻 {f_val:.1f}%"
+                        else: return f"{prefix}0.0%"
                     if col_name in ['매출액', '영업이익', '당기순이익']:
                         v_int = int(round(f_val))
                         is_minus = v_int < 0
@@ -3814,18 +3872,31 @@ def draw_fnguide_details(code):
                         cho = abs_v // 10000
                         uk  = abs_v % 10000
                         formatted_num = f"{v_int:,}"
-                        if cho > 0: return f"{formatted_num} ({'-' if is_minus else ''}{cho}조 {uk:,}억)" if uk > 0 else f"{formatted_num} ({'-' if is_minus else ''}{cho}조)"
-                        return f"{formatted_num} ({'-' if is_minus else ''}{uk:,}억)"
-                    elif col_name in ['영업이익률', '순이익률', 'ROE', '부채비율']: return f"{f_val:.1f}%"
-                    elif col_name in ['PER', 'PBR']: return f"{f_val:.2f}배"
-                    return f"{f_val:,}"
+                        if cho > 0: return f"{prefix}{formatted_num} ({'-' if is_minus else ''}{cho}조 {uk:,}억)" if uk > 0 else f"{prefix}{formatted_num} ({'-' if is_minus else ''}{cho}조)"
+                        return f"{prefix}{formatted_num} ({'-' if is_minus else ''}{uk:,}억)"
+                    elif col_name in ['영업이익률', '순이익률', 'ROE', '부채비율']: return f"{prefix}{f_val:.1f}%"
+                    elif col_name in ['PER', 'PBR']: return f"{prefix}{f_val:.2f}배"
+                    return f"{prefix}{f_val:,}"
                 except: return str(val)
 
             def format_and_style(input_df):
                 display_df = input_df.copy()
+                # '_est_cols'는 화면에 그대로 노출할 컬럼이 아니라, 어떤 셀이 마감 전
+                # 기간이라 직전 실제값으로 근사 대체됐는지 표시하기 위한 내부 메타데이터다.
+                # 여기서 꺼내 쓰고 실제 표에서는 제거한다.
+                if '_est_cols' in display_df.columns:
+                    est_series = display_df['_est_cols'].fillna('').astype(str)
+                    display_df = display_df.drop(columns=['_est_cols'])
+                else:
+                    est_series = pd.Series([''] * len(display_df), index=display_df.index)
                 for col in display_df.columns[1:]:
-                    display_df[col] = display_df[col].apply(lambda x: custom_formatter(x, col))
+                    est_flags = [col in e.split(',') for e in est_series]
+                    display_df[col] = [
+                        custom_formatter(v, col, is_est=flag)
+                        for v, flag in zip(display_df[col], est_flags)
+                    ]
                 def style_cells(val):
+                    if '≈' in str(val): return 'color: #64748B; font-style: italic;'
                     if '🔺' in str(val): return 'color: #10B981; font-weight: 600;'
                     if '🔻' in str(val) or ('-' in str(val) and ('조' in str(val) or '억' in str(val))):
                         return 'color: #EF4444; font-weight: 600;'
@@ -3860,19 +3931,19 @@ def draw_fnguide_details(code):
                     _freshness_badge = _quarter_freshness_badge(df_quarter)
                     if _freshness_badge:
                         st.markdown(_freshness_badge, unsafe_allow_html=True)
-                    # ── [분기(E) 컬럼 빈칸 안내 — 2026-08-06] ──────────────────────
-                    # "2026/06(E)"처럼 아직 마감되지 않은 분기는 FnGuide/네이버
-                    # 컨센서스 원본 자체가 매출액·영업이익률·성장률 같은 몇몇 항목만
-                    # 먼저 채워두고, 영업이익(금액)·당기순이익·ROE·PER·PBR·부채비율은
-                    # 분기가 실제로 마감돼 재무제표가 나오기 전까지 공란으로 두는
-                    # 경우가 흔하다(우리 쪽 파싱 실패가 아니라 원본 표 자체의 공백).
-                    # 그걸 그냥 "-"로만 보여주면 버그처럼 보이므로 안내를 덧붙인다.
+                    # ── [분기(E) 컬럼 근사치 표시 안내 — 2026-08-06] ──────────────────
+                    # "2026/06(E)"처럼 아직 마감되지 않은 분기는 컨센서스 원본 자체가
+                    # 매출액·영업이익률 등만 먼저 제공하고, ROE·PER·PBR·부채비율(그리고
+                    # 이로부터 역산 가능한 영업이익 금액)은 분기 마감 전까지 아예
+                    # 제공하지 않는 경우가 흔하다. 이제는 빈 칸으로 두는 대신 직전
+                    # 실제(마감) 분기 값을 '≈' 표시로 근사해서 채워 보여준다.
                     _latest_q = str(df_quarter['연도/분기'].iloc[-1])
                     if '(E)' in _latest_q:
                         st.caption(
                             f"💡 **{_latest_q}**는 아직 마감되지 않은 분기(컨센서스 추정치)입니다. "
-                            "매출액·영업이익률 등 일부 항목만 먼저 제공되고, 영업이익(금액)·당기순이익·"
-                            "ROE·PER·PBR·부채비율은 분기 마감 후 채워지는 경우가 많습니다."
+                            "매출액·영업이익률 등은 컨센서스 제공값을 그대로 표시하고, "
+                            "ROE·PER·PBR·부채비율처럼 분기 컨센서스에 아직 없는 값은 "
+                            "직전 실제(마감) 분기 값을 **'≈'** 표시로 근사해 보여줍니다."
                         )
                     df_quarter_display = df_quarter.iloc[::-1].reset_index(drop=True)
                     st.dataframe(format_and_style(df_quarter_display), use_container_width=True, hide_index=True)
