@@ -547,9 +547,63 @@ def _global_poll_fragment():
         st.info(f"🔄 데이터를 불러오는 중... (백그라운드 작업 {n_total}건 진행 중){scan_pct_text}")
 
 
+# ── [탭 이동 중 "끊겼다 됐다" 반복 현상 수정] 다른 페이지 소유의 완료된 job 정리 ──
+# 문제: render_async_multi()가 만드는 _bg_jobs 항목(dashboard_main_data,
+# investor_monthly_kospi/kosdaq, watchlist_prefetch_new)은 전부 "그 job을 만든
+# 페이지 코드가 다시 실행돼야만" collect_fn이 호출되어 jobs.pop()으로 치워진다.
+# 그런데 사용자가 그 job이 끝나기도 전에 다른 탭으로 이동해버리면, 백그라운드
+# 스레드는 계속 돌다가 실제로 끝나긴 하지만(future.done()=True), 그걸 수거해줄
+# 페이지 코드는 더 이상 실행되지 않는다(사용자가 그 페이지를 안 보고 있으므로).
+# 그 결과 _bg_jobs에는 "이미 끝났는데 아무도 안 치운" job이 계속 남아있게 되고,
+# 전역 폴링 fragment(_global_poll_fragment)는 이걸 볼 때마다 "설정=끝남"으로
+# 판단해서 현재 보고 있는 페이지가 무엇이든 상관없이 즉시 st.rerun()을 반복
+# 호출한다 — 이게 로그에서 보이는 "다른 탭으로 갔는데 계속 순간순간 다시
+# 그려지는" 현상의 정체다 (실제로 렌더링은 매번 정상 완료되지만, 사용자가
+# 아무 것도 안 눌렀는데 초당 몇 번씩 전체 스크립트가 다시 실행됨).
+# 해결: 각 job_key가 "원래 어느 페이지 소유인지" 매핑해두고, 현재 페이지가
+# 그 소유 페이지가 "아니면서" 이미 다 끝난 job을 발견하면, 여기서 대신 조용히
+# 치워버린다(collect_fn 없이 그냥 버림 → 해당 페이지를 나중에 다시 열면 캐시가
+# 없으니 한 번 더 새로 조회하게 됨 — 약간의 재조회 비용은 있지만 무한 반복보다
+# 훨씬 낫다). 현재 페이지가 실제 소유 페이지인 job은 절대 건드리지 않는다 —
+# 그건 이 함수가 호출되기 "전에" 이미 그 페이지 자신의 render_async_multi() 호출이
+# 정상적으로 수거해갔어야 하는 게 원칙이고, 안 끝났다면 여전히 폴링이 필요하다.
+_BG_JOB_OWNER_PAGES = {
+    "dashboard_main_data": {"대시보드 홈"},
+    "investor_monthly_kospi": {"대시보드 홈"},
+    "investor_monthly_kosdaq": {"대시보드 홈"},
+    "watchlist_prefetch_new": {"관심종목"},
+}
+_SCAN_JOB_OWNER_PAGES = {"대시보드 홈", "종목 스크리너"}
+
+
+def _purge_orphaned_jobs():
+    current = st.session_state.get("current_page")
+
+    bg_jobs = st.session_state.get("_bg_jobs")
+    if bg_jobs:
+        for key in list(bg_jobs.keys()):
+            owners = _BG_JOB_OWNER_PAGES.get(key)
+            if owners is None or current in owners:
+                continue  # 소유 페이지를 모르거나(안전하게 보존) 지금 그 페이지에 있으면 건드리지 않음
+            futures = bg_jobs[key].get("futures", {})
+            if futures and all(f.done() for f in futures.values()):
+                bg_jobs.pop(key, None)
+
+    scan_jobs = st.session_state.get("_scan_jobs")
+    if scan_jobs and current not in _SCAN_JOB_OWNER_PAGES:
+        for key in list(scan_jobs.keys()):
+            job = scan_jobs[key]
+            future = job.get("future")
+            if future is not None and future.done():
+                scan_jobs.pop(key, None)
+                _SCAN_JOB_STATE.pop(job.get("job_id"), None)
+# ────────────────────────────────────────────────────────────────────────
+
+
 def maybe_run_global_poller():
     """_main_impl()의 페이지 디스패치 직후 딱 한 번 호출. 대기 중인 백그라운드
     작업이 있을 때만 전역 폴링 fragment를 띄운다(없으면 아무것도 안 함)."""
+    _purge_orphaned_jobs()
     has_pending = bool(st.session_state.get("_bg_jobs")) or bool(st.session_state.get("_scan_jobs"))
     if has_pending:
         _global_poll_fragment()
@@ -5789,11 +5843,11 @@ def _main_impl():
     # anymore")가 재현될 수 있기 때문이다.
     # [진행률 배너 위치 문제 수정] 예전에는 이 중앙 호출 단 한 곳에서만 불렀는데,
     # 그 위치가 "어떤 페이지든 다 그린 뒤"라서 실시간 진행률 배너가 항상 그 페이지
-    # 맨 아래(스캔 버튼과 동떨어진 곳)에만 나타났다. 대시보드는 스캔 버튼 바로
-    # 아래에서 보이도록 render_dashboard() 안에서 직접 이 fragment를 이미 호출해
-    # 두었으므로, 여기서 또 부르면 "한 실행에 두 번 호출"이 되어 버린다. 그래서
-    # 대시보드 페이지일 때는 여기서 건너뛴다.
-    if selected != "대시보드 홈":
+    # 맨 아래(스캔 버튼과 동떨어진 곳)에만 나타났다. 대시보드와 종목 스크리너는
+    # 스캔 버튼 바로 아래에서 보이도록 각자의 render 함수 안에서 직접 이 fragment를
+    # 이미 호출해두었으므로, 여기서 또 부르면 "한 실행에 두 번 호출"이 되어 버린다.
+    # 그래서 이 두 페이지일 때는 여기서 건너뛴다.
+    if selected not in ("대시보드 홈", "종목 스크리너"):
         maybe_run_global_poller()
 
 
@@ -7166,6 +7220,19 @@ def render_screener():
     _screener_scan_clicked = st.button("실시간 데이터 ⚡초고속 스캔 실행")
     if _screener_scan_clicked or "unified_scan" in st.session_state.get("_scan_jobs", {}):
         run_unified_market_scan_async()
+
+    # ── [진행률 배너 위치 요청] 스캔 버튼 바로 아래에서 실시간 진행률을 보여준다 ──
+    # 예전에는 이 페이지에서 전역 폴링 fragment를 따로 호출하지 않고 _main_impl()의
+    # 맨 끝 호출에만 의존했다. fragment는 코드에서 "호출된 그 자리"에 그려지므로,
+    # 그 결과 진행률 배너가 페이지 맨 아래(스캔 버튼과 멀리 떨어진 곳)에 나타났다.
+    # 대시보드와 동일한 방식으로, 여기서 스캔 버튼 바로 아래에 앞당겨 호출한다.
+    # ⚠️ fragment는 세션당 "이번 스크립트 실행에서 딱 한 번만" 호출돼야 하므로
+    # (안 그러면 Streamlit 버그 #10719 재발), 이 페이지가 선택된 경우 _main_impl()의
+    # 맨 끝 호출은 건너뛰도록 처리해뒀다 (아래 _main_impl 참고).
+    # (run_unified_market_scan_async()가 막 job을 만들었거나 아직 진행 중일 때만
+    # 여기 도달하므로 안전하다 — 방금 완료된 경우엔 그 함수 안에서 이미 결과를
+    # 반영하고 st.rerun()까지 호출해버려서 아예 이 아래 코드에 도달하지 않는다.)
+    maybe_run_global_poller()
 
     col_h52_title, col_h52_help = st.columns([9, 1])
     with col_h52_title:
