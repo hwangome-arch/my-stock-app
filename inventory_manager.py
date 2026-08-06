@@ -3222,7 +3222,14 @@ def run_unified_market_scan_async(job_key="unified_scan", overall_timeout=150):
     job_id = job["job_id"]
     future = job["future"]
     state = _SCAN_JOB_STATE.get(job_id, {})
-    timed_out = (time.time() - job["started_at"]) > job.get("overall_timeout", overall_timeout)
+    _elapsed = time.time() - job["started_at"]
+    timed_out = _elapsed > job.get("overall_timeout", overall_timeout)
+    # ── [임시 진단 로그] 150초 안전장치가 왜 발동을 안 하는지 원인 파악용.
+    # 원인 파악되면 제거할 것.
+    print(f"[DEBUG SCAN {datetime.datetime.now().strftime('%H:%M:%S')}] "
+          f"job_id={job_id} elapsed={_elapsed:.1f}s timeout={job.get('overall_timeout', overall_timeout)} "
+          f"timed_out={timed_out} future.done()={future.done()} pct={state.get('pct')}",
+          file=sys.stderr, flush=True)
 
     # ── [진행률 정체 감지] "죽지도 않고 응답도 안 오는" 소켓/DNS 행에 대한 방어 ──
     # concurrent.futures 타임아웃은 대부분의 경우를 막아주지만, DNS 조회 단계처럼
@@ -3255,6 +3262,9 @@ def run_unified_market_scan_async(job_key="unified_scan", overall_timeout=150):
         return
 
     # 완료(또는 상한 시간 초과 / 진행률 정체) → 결과를 메인 스레드에서 session_state에 반영
+    print(f"[DEBUG SCAN {datetime.datetime.now().strftime('%H:%M:%S')}] "
+          f"job_id={job_id} 정리 단계 진입 (future.done()={future.done()} timed_out={timed_out} stalled={_stalled}) "
+          f"→ jobs.pop 실행", file=sys.stderr, flush=True)
     jobs.pop(job_key, None)
 
     if not state.get("success"):
