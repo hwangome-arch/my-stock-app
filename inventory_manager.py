@@ -3206,7 +3206,14 @@ def run_unified_market_scan_async(job_key="unified_scan", overall_timeout=150):
     _stalled = (_now - state.get("_last_pct_change_at", job["started_at"])) > 50
 
     if not future.done() and not timed_out and not _stalled:
-        st.progress(min(state.get("pct", 0), 100), text=f"🔄 {state.get('text', '스캔 중...')}")
+        # ── [진행률 표시 이원화 문제 수정] 예전에는 여기서 st.progress(...)를 직접
+        # 그렸는데, 이 줄은 "전체 페이지가 다시 실행될 때"만 값이 갱신된다. 반면
+        # 실제 살아있는 진행률(%)은 아래 전역 폴링 fragment가 0.4초마다 갱신하는
+        # 배너 쪽에만 반영된다. 그 결과 화면에는 "예전 % 값에서 멈춰있는 바(여기)"와
+        # "실시간으로 올라가는 배너(페이지 맨 아래, 전역 fragment)"가 동시에 보여서,
+        # 사용자 입장에서는 "진행 표시가 위쪽에서 아래로 옮겨간 것처럼" 보이는
+        # 혼란을 줬다. 정적인 바는 그리지 않고, 실시간 표시는 전역 fragment
+        # 하나로 통일한다(각 페이지가 그 fragment를 어디서 호출하느냐로 위치를 정한다).
         # ── [fragment #10719 회피] 여기서도 자체 fragment를 만들지 않는다. job이
         # _scan_jobs에 남아있으면, 페이지 렌더링 뒤 호출되는 maybe_run_global_poller()의
         # 전역 fragment가 이어서 감시하고 완료 시 st.rerun()으로 갱신해준다.
@@ -5728,15 +5735,21 @@ def _main_impl():
 
     print(f"[DEBUG {datetime.datetime.now().strftime('%H:%M:%S')}] 페이지 렌더링 완료: {selected}", file=sys.stderr, flush=True)
 
-    # ── [전역 폴링 fragment 호출 — 세션당 이 한 곳에서만] ─────────────────────
+    # ── [전역 폴링 fragment 호출 — "이번 스크립트 실행"에 딱 한 번만] ───────────
     # 위에서 렌더링한 페이지가 render_async_multi/run_unified_market_scan_async를
     # 통해 _bg_jobs 또는 _scan_jobs에 작업을 남겨뒀을 수 있다. 그 작업들의 완료
-    # 여부를 감시하는 주기적(run_every) fragment는 앱 전체에서 이 호출 단 한 곳에서만
-    # 만들어진다 — 어떤 페이지·어떤 카드가 몇 개의 백그라운드 작업을 걸어뒀든
-    # 물리적으로 fragment는 세션당 최대 1개만 존재하므로, Streamlit #10719
-    # ("2개 이상의 run_every fragment 동시 존재 시 세션 다운")가 구조적으로
-    # 재현될 수 없다.
-    maybe_run_global_poller()
+    # 여부를 감시하는 주기적(run_every) fragment는 이번 스크립트 실행 동안 반드시
+    # 딱 한 번만 호출돼야 한다 — 같은 실행 안에서 두 번 호출되면 그 순간 화면에
+    # run_every fragment가 2개 동시에 떠서 Streamlit 버그 #10719("does not exist
+    # anymore")가 재현될 수 있기 때문이다.
+    # [진행률 배너 위치 문제 수정] 예전에는 이 중앙 호출 단 한 곳에서만 불렀는데,
+    # 그 위치가 "어떤 페이지든 다 그린 뒤"라서 실시간 진행률 배너가 항상 그 페이지
+    # 맨 아래(스캔 버튼과 동떨어진 곳)에만 나타났다. 대시보드는 스캔 버튼 바로
+    # 아래에서 보이도록 render_dashboard() 안에서 직접 이 fragment를 이미 호출해
+    # 두었으므로, 여기서 또 부르면 "한 실행에 두 번 호출"이 되어 버린다. 그래서
+    # 대시보드 페이지일 때는 여기서 건너뛴다.
+    if selected != "대시보드 홈":
+        maybe_run_global_poller()
 
 
 def render_rate_strip():
@@ -5811,6 +5824,17 @@ def render_dashboard():
         run_unified_market_scan_async()
     with col_rate_strip:
         render_rate_strip()
+
+    # ── [진행률 배너 위치 복원] 전역 폴링 fragment를 여기서 직접 호출한다 ──────────
+    # 원래는 _main_impl()이 페이지를 다 그린 "맨 뒤"에서만 이 fragment를 호출했다.
+    # 물리적으로 fragment는 코드에서 호출된 그 자리에 그려지므로, 그 결과 실시간
+    # 진행률 배너가 항상 페이지 맨 아래(사용자가 스캔 버튼과 멀리 떨어진 곳)에
+    # 나타나 버렸다. 대시보드는 스캔 버튼이 상단에 있으니, 버튼 바로 아래에서
+    # 바로 진행 상황을 보고 싶다는 요청에 따라 여기서 앞당겨 호출한다.
+    # ⚠️ fragment는 세션당 반드시 "이번 스크립트 실행에서 딱 한 번만" 호출돼야
+    # 하므로(안 그러면 Streamlit 버그 #10719 재발), 이 페이지가 선택된 경우
+    # _main_impl()의 맨 끝 호출은 건너뛰도록 처리해뒀다 (아래 _main_impl 참고).
+    maybe_run_global_poller()
 
     if load_screener_df().empty:
         st.markdown(
