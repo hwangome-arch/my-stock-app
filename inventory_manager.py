@@ -5880,17 +5880,31 @@ def render_dashboard():
     with col_rate_strip:
         render_rate_strip()
 
-    # ── [진행률 배너 위치 복원] 전역 폴링 fragment를 여기서 직접 호출한다 ──────────
-    # 원래는 _main_impl()이 페이지를 다 그린 "맨 뒤"에서만 이 fragment를 호출했다.
-    # 물리적으로 fragment는 코드에서 호출된 그 자리에 그려지므로, 그 결과 실시간
-    # 진행률 배너가 항상 페이지 맨 아래(사용자가 스캔 버튼과 멀리 떨어진 곳)에
-    # 나타나 버렸다. 대시보드는 스캔 버튼이 상단에 있으니, 버튼 바로 아래에서
-    # 바로 진행 상황을 보고 싶다는 요청에 따라 여기서 앞당겨 호출한다.
-    # ⚠️ fragment는 세션당 반드시 "이번 스크립트 실행에서 딱 한 번만" 호출돼야
-    # 하므로(안 그러면 Streamlit 버그 #10719 재발), 이 페이지가 선택된 경우
-    # _main_impl()의 맨 끝 호출은 건너뛰도록 처리해뒀다 (아래 _main_impl 참고).
-    maybe_run_global_poller()
-
+    # ── [무한 리렌더 루프 버그 수정 — 2026-08-06] ─────────────────────────────
+    # 문제: maybe_run_global_poller()가 예전에는 여기(스캔 버튼 바로 아래)에서
+    # 호출됐다. 그런데 실제 백그라운드 작업(dashboard_main_data, investor_monthly_*)은
+    # 이 지점보다 한참 "뒤"의 render_async_multi() 호출에서 생성되고, 그 작업이
+    # 끝났을 때 _bg_jobs에서 지우는(jobs.pop) 것도 바로 그 뒤쪽 호출이 담당한다.
+    #
+    # 그 결과 이런 일이 벌어졌다: 예를 들어 수급동향 토글을 열어 investor_monthly_*
+    # 작업이 백그라운드에서 완료되면(future.done()=True), 그 job은 아직 여기
+    # 위쪽(이 지점)에서는 전혀 손대지 않은 채로 _bg_jobs에 "완료된 채로" 남아있는
+    # 상태였다. 다음 스크립트 실행이 이 지점에 도달하면 maybe_run_global_poller()는
+    # "_bg_jobs가 비어있지 않다"는 이유만으로 전역 폴링 fragment를 새로 띄웠고,
+    # 그 fragment는 즉시 "어차피 다 끝났다(_all_jobs_settled()=True)"고 판단해서
+    # *그 자리에서 바로* st.rerun()을 호출했다. st.rerun()은 예외를 던져 현재
+    # 스크립트 실행을 즉시 중단시키므로, 스크립트는 실제로 job을 수거(pop)하는
+    # 뒤쪽 코드까지 끝내 도달하지 못했다. 그래서 job은 "완료됐지만 안 치워진" 채로
+    # 영원히 남고, 이 패턴이 매 실행마다 반복되며 초당 수 회의 전체 페이지
+    # 리렌더 무한 루프가 됐다 (로그에서 "페이지 진입"만 잔뜩 찍히고 "페이지
+    # 렌더링 완료"는 거의 안 찍힌 이유).
+    #
+    # 해결: maybe_run_global_poller() 호출을 이 함수(render_dashboard) 안의 모든
+    # render_async_multi() 호출(=job 생성/수거 지점)보다 "뒤"로 옮긴다. 이러면
+    # 이번 스크립트 실행에서 이미 끝난 job은 poller가 보기 전에 먼저 수거돼서
+    # _bg_jobs에서 사라지고, poller는 "진짜로 아직 안 끝난" 작업이 있을 때만
+    # fragment를 띄우게 된다. (아래쪽 두 지점 — 데이터 로딩 중 조기 반환 직전,
+    # 그리고 함수 맨 끝 — 에서 각각 정확히 한 번씩만 호출한다.)
     if load_screener_df().empty:
         st.markdown(
             "<div style='font-size:12.5px; color:#B45309; margin: -6px 0 10px 0;'>"
@@ -5937,6 +5951,11 @@ def render_dashboard():
         overall_timeout=15,
     )
     if not _dash_ready:
+        # 이 시점의 dashboard_main_data job은 "방금 막 생성"됐거나 "아직 진행 중"인
+        # 경우만 여기 도달하므로(이미 끝난 job은 위 render_async_multi() 호출이
+        # 그 자리에서 바로 수거해버림), 지금 poller를 켜는 것은 안전하다 — 진짜로
+        # 기다려야 할 작업이 있을 때만 켜지는 것이기 때문.
+        maybe_run_global_poller()
         return  # 아직 로딩 중 — 이후 렌더링은 건너뛰고, 폴링 프래그먼트가 알아서 이어간다
 
     indices = _dash_results["indices"] or {}
@@ -6264,6 +6283,16 @@ def render_dashboard():
             시장 지수, 수급 동향 및 업종 테마는 <b>네이버 금융</b> 실시간 데이터를 기반으로 합니다. 시장 개장 시간(09:00~15:30) 외에는 전일 종가/마감 기준으로 표시될 수 있습니다.
         </div>
     """, unsafe_allow_html=True)
+
+    # ── [무한 리렌더 루프 버그 수정] 전역 폴링 fragment는 함수 맨 끝에서 딱 한 번만 ──
+    # 여기 도달했다는 것은 dashboard_main_data는 이미 준비 완료됐고(위에서 조기
+    # 반환하지 않았으므로), investor_monthly_* 등 이 함수 안의 모든 render_async_multi()
+    # 호출도 이미 다 지나온 뒤라는 뜻이다. 즉 "완료됐는데 안 치워진 job"이 있을
+    # 여지가 없는 시점이므로, 지금 _bg_jobs/_scan_jobs에 남아있는 것은 전부 진짜
+    # 아직 안 끝난 작업뿐이다 — 이제서야 poller를 켜는 게 안전하다.
+    # (스캔 진행 중이면 run_unified_market_scan_async()가 이미 _scan_jobs를
+    # 채워뒀으므로 여기서도 정상적으로 감지된다.)
+    maybe_run_global_poller()
 
 # =========================
 # 🤖 AI 종목 진단 엔진
