@@ -5934,6 +5934,25 @@ def render_dashboard():
     with col_rate_strip:
         render_rate_strip()
 
+    # ── [로딩 배너 위치를 화면 상단으로 — 2026-08-06] ─────────────────────────
+    # 사용자가 원하는 위치는 스캔 버튼 바로 아래(화면 상단)다. 그런데 poller
+    # 호출 자체를 여기로 옮기면 예전에 이미 한 번 겪었던 무한 리렌더 루프
+    # 버그가 재발한다 — 바로 아래 [무한 리렌더 루프 버그 수정] 주석 참고:
+    # 완료됐지만 아직 수거(pop)되지 않은 job이 있을 때 poller가 여기서 먼저
+    # _all_jobs_settled()=True를 보고 st.rerun()을 던지면, 그 job을 실제로
+    # 수거하는 뒤쪽 render_async_multi() 호출까지 스크립트가 도달하지 못해서
+    # job이 "완료됐는데 안 치워진" 채로 영원히 남아 매 실행마다 즉시
+    # rerun→중단이 반복된다.
+    #
+    # 해결: "호출 위치"와 "화면에 그려지는 위치"를 분리한다. st.empty()로
+    # 화면상의 자리(placeholder)만 여기(상단)에 미리 잡아두고, 실제
+    # maybe_run_global_poller() 호출은 여전히 함수 맨 끝 — 모든
+    # render_async_multi() 호출(=job 수거 지점)이 끝난 뒤 — 에서 한다. 그때
+    # with _poller_slot.container(): 로 감싸서 호출하면, 실제 실행은 뒤에서
+    # 하면서도 화면에는 이 placeholder 자리(=상단)에 그려진다.
+    # ⚠️ 절대 이 지점에서 바로 maybe_run_global_poller()를 호출하지 말 것.
+    _poller_slot = st.empty()
+
     # ── [무한 리렌더 루프 버그 수정 — 2026-08-06] ─────────────────────────────
     # 문제: maybe_run_global_poller()가 예전에는 여기(스캔 버튼 바로 아래)에서
     # 호출됐다. 그런데 실제 백그라운드 작업(dashboard_main_data, investor_monthly_*)은
@@ -5953,12 +5972,12 @@ def render_dashboard():
     # 리렌더 무한 루프가 됐다 (로그에서 "페이지 진입"만 잔뜩 찍히고 "페이지
     # 렌더링 완료"는 거의 안 찍힌 이유).
     #
-    # 해결: maybe_run_global_poller() 호출을 이 함수(render_dashboard) 안의 모든
-    # render_async_multi() 호출(=job 생성/수거 지점)보다 "뒤"로 옮긴다. 이러면
-    # 이번 스크립트 실행에서 이미 끝난 job은 poller가 보기 전에 먼저 수거돼서
-    # _bg_jobs에서 사라지고, poller는 "진짜로 아직 안 끝난" 작업이 있을 때만
-    # fragment를 띄우게 된다. (아래쪽 두 지점 — 데이터 로딩 중 조기 반환 직전,
-    # 그리고 함수 맨 끝 — 에서 각각 정확히 한 번씩만 호출한다.)
+    # 해결: maybe_run_global_poller() "호출"은 이 함수(render_dashboard) 안의 모든
+    # render_async_multi() 호출(=job 생성/수거 지점)보다 "뒤"에서, 딱 한 번만
+    # 한다 (아래 함수 맨 끝). 이러면 이번 스크립트 실행에서 이미 끝난 job은
+    # poller가 보기 전에 먼저 수거돼서 _bg_jobs에서 사라지고, poller는 "진짜로
+    # 아직 안 끝난" 작업이 있을 때만 fragment를 띄우게 된다. 화면상 위치만
+    # 위 _poller_slot 덕분에 상단(스캔 버튼 바로 아래)으로 옮겨진다.
     if load_screener_df().empty:
         st.markdown(
             "<div style='font-size:12.5px; color:#B45309; margin: -6px 0 10px 0;'>"
@@ -6356,13 +6375,14 @@ def render_dashboard():
         </div>
     """, unsafe_allow_html=True)
 
-    # ── [로딩 배너 위치 통일 — 2026-08-06] 전역 폴링 fragment는 함수 맨 끝에서 딱 한 번만 ──
-    # render_dashboard()는 이제 더 이상 중간에 return하지 않으므로(위쪽 dashboard_main_data /
-    # investor_monthly_* 로딩 중에는 빈 기본값으로 안전하게 렌더링만 하고 계속 진행함),
-    # 이 줄은 이 함수 안에서 항상 정확히 한 번, 그리고 항상 "데이터 안내" 박스
-    # 바로 아래에서 실행된다. 그래서 대시보드 데이터/월별 수급/전체 시장 스캔 중
-    # 무엇이 로딩 중이든 상관없이, 진행 상황 배너는 항상 이 자리 하나에서만 뜬다.
-    maybe_run_global_poller()
+    # ── [로딩 배너 위치를 화면 상단으로 — 2026-08-06] ─────────────────────────
+    # 여기 도달했다는 것은 이 함수 안의 모든 render_async_multi() 호출(=job
+    # 수거 지점)을 이미 다 지나온 뒤라는 뜻이므로, 지금 poller를 켜는 것은
+    # 안전하다(위쪽 "무한 리렌더 루프 버그 수정" 주석 참고). 실제 "호출"은
+    # 여기서 하지만, _poller_slot.container()로 감싸서 화면에는 함수 상단에서
+    # 미리 잡아둔 자리(스캔 버튼 바로 아래)에 그려지도록 한다.
+    with _poller_slot.container():
+        maybe_run_global_poller()
 
 # =========================
 # 🤖 AI 종목 진단 엔진
