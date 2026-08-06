@@ -81,12 +81,31 @@ def _set_shared_screener_df(df):
         pass  # 백그라운드 스레드 등 session_state 접근이 불가능한 상황이면 모듈 캐시만 사용
 
 # ==== 🚀 [테마 강제 고정 로직] ====
+# ── [세션/프로세스 전체 프리징의 진짜 근본 원인 수정] ─────────────────────────
+# 문제: Streamlit은 상호작용(버튼 클릭, 탭 이동, rerun 등) 때마다 이 .py 파일
+# 전체를 처음부터 다시 실행한다. 그런데 이 블록이 무조건 매번
+# .streamlit/config.toml을 새로 "쓰기"(open(..., "w"))만 하고 있어서, 내용이
+# 완전히 똑같더라도 파일의 mtime이 매 렌더링마다 갱신됐다. Streamlit 자체의
+# 파일 감시 스레드(polling_path_watcher)가 이걸 "설정이 바뀌었다"고 매번 감지해서
+# config를 다시 읽어들이는데(get_config_options() 내부에서 락을 잡음), 하필 메인
+# 스크립트 실행 스레드도 스크립트를 컴파일하는 단계(get_bytecode → magic 처리 →
+# config.get_option)에서 같은 config 락이 필요하다. 두 스레드가 이 락을 두고
+# 계속 경합하다 보니(rerun이 잦을수록, 특히 0.4초 폴링 fragment까지 겹치면 경합
+# 빈도가 급증), 결국 메인 스크립트 스레드가 이 지점에서 영원히 멈추는 상태가
+# 됐다 — 워치독 스택 덤프에서 정확히 이 지점(streamlit/config.py:222 get_option)
+# 이 잡혔다. config 락은 세션별이 아니라 프로세스 전역이라, 한번 물리면 그 뒤로는
+# 어떤 세션의 어떤 rerun도 이 지점을 통과하지 못해 "리붓 아니면 답이 없는" 상태가
+# 된 것 — 지금까지 겪은 프리징 중 가장 근본적인 원인이었을 가능성이 높다.
+# 해결: 내용이 실제로 다를 때만 쓴다. 최초 1회(또는 실제로 테마를 바꿀 때)만
+# 디스크에 쓰기가 발생하고, 그 이후의 모든 rerun에서는 파일을 건드리지 않으므로
+# Streamlit 파일 감시자가 "변경 없음"으로 보고 config 재로딩 자체가 트리거되지
+# 않는다.
 try:
     config_dir = ".streamlit"
     if not os.path.exists(config_dir):
         os.makedirs(config_dir)
     config_path = os.path.join(config_dir, "config.toml")
-    
+
     theme_config = """[theme]
 base="light"
 primaryColor="#5A4EE5"
@@ -94,8 +113,17 @@ backgroundColor="#F8FAFC"
 secondaryBackgroundColor="#0F141F"
 textColor="#111827"
 """
-    with open(config_path, "w", encoding="utf-8") as f:
-        f.write(theme_config)
+    _existing_theme_config = None
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                _existing_theme_config = f.read()
+        except Exception:
+            _existing_theme_config = None
+
+    if _existing_theme_config != theme_config:
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(theme_config)
 except Exception:
     pass
 # ==================================
@@ -132,7 +160,7 @@ st.set_page_config(page_title="Inventory Manager", page_icon="📦", layout="wid
 # True로 두면 대시보드 스캔 버튼이 비활성화되고 실제 스캔 잡(오케스트레이션
 # 스레드+공유 스레드풀 사용)이 전혀 시작되지 않는다. 원인 파악 후 다시 False로
 # 되돌리면 된다. (추천종목/스크리너 페이지의 스캔은 영향 없음 — 필요하면 같이 끌 수 있음)
-DEBUG_DISABLE_DASHBOARD_SCAN = True
+DEBUG_DISABLE_DASHBOARD_SCAN = False
 
 # =========================
 # 🕸️ 데이터 처리 엔진
