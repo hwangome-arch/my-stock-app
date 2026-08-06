@@ -127,6 +127,13 @@ _SCREENER_DF_CACHE = _get_screener_df_cache()
 # =========================
 st.set_page_config(page_title="Inventory Manager", page_icon="📦", layout="wide")
 
+# ── [임시 디버그 스위치] 대시보드 "종목 스캔" 기능 끄기 ──────────────────────
+# 코스피/코스닥 수급 토글에서 멈추는 문제의 원인을 좁히기 위한 임시 조치.
+# True로 두면 대시보드 스캔 버튼이 비활성화되고 실제 스캔 잡(오케스트레이션
+# 스레드+공유 스레드풀 사용)이 전혀 시작되지 않는다. 원인 파악 후 다시 False로
+# 되돌리면 된다. (추천종목/스크리너 페이지의 스캔은 영향 없음 — 필요하면 같이 끌 수 있음)
+DEBUG_DISABLE_DASHBOARD_SCAN = True
+
 # =========================
 # 🕸️ 데이터 처리 엔진
 # =========================
@@ -5819,8 +5826,18 @@ def render_dashboard():
             st.session_state.get("_bg_job_results", {}).pop("dashboard_main_data", None)
             st.rerun()
     with col_scan:
-        _dash_scan_clicked = st.button("종목 스캔 (스크리너+추천)", use_container_width=True, key="dash_unified_scan_btn")
-    if _dash_scan_clicked or "unified_scan" in st.session_state.get("_scan_jobs", {}):
+        if DEBUG_DISABLE_DASHBOARD_SCAN:
+            st.button(
+                "종목 스캔 (임시 비활성화 · 테스트 중)",
+                use_container_width=True,
+                key="dash_unified_scan_btn",
+                disabled=True,
+                help="원인 파악을 위해 임시로 꺼둔 상태입니다. DEBUG_DISABLE_DASHBOARD_SCAN 값을 False로 되돌리면 다시 켜집니다.",
+            )
+            _dash_scan_clicked = False
+        else:
+            _dash_scan_clicked = st.button("종목 스캔 (스크리너+추천)", use_container_width=True, key="dash_unified_scan_btn")
+    if not DEBUG_DISABLE_DASHBOARD_SCAN and (_dash_scan_clicked or "unified_scan" in st.session_state.get("_scan_jobs", {})):
         run_unified_market_scan_async()
     with col_rate_strip:
         render_rate_strip()
