@@ -6587,13 +6587,344 @@ def calc_ai_scores(per, pbr, roe, debt, drop_pct, div):
 def get_ai_total_score(code, screener_df=None):
     """관심종목 카드 등에서 재사용: 종목코드만으로 AI 종합점수(0~100)를 계산. 실패 시 None.
     screener_df를 미리 전달하면(예: 관심종목 병렬조회) 백그라운드 스레드에서 다시
-    load_screener_df()를 호출하지 않아도 되어 session_state 접근을 피할 수 있다."""
+    load_screener_df()를 호출하지 않아도 되어 session_state 접근을 피할 수 있다.
+
+    ⚠️ [세분화 리뉴얼] 배점 체계를 4항목(건전성/성장성/수익성/배당) 뭉뚱그린 점수에서
+    8항목(추세/수급/거래량/재무/밸류/모멘텀/AI패턴/리스크) 세부 배점으로 교체했다
+    (calc_ai_scores_detailed). '왜 이 점수인지' 항목별로 바로 보이도록 하기 위함."""
     try:
         df_annual_ai, _, _ = fetch_financial_data(code)
         per_ai, pbr_ai, roe_ai, debt_ai, drop_pct_ai, div_ai = get_ai_diagnosis_inputs(code, df_annual_ai, screener_df=screener_df)
-        return calc_ai_scores(per_ai, pbr_ai, roe_ai, debt_ai, drop_pct_ai, div_ai)["total"]
+        return calc_ai_scores_detailed(code, per_ai, pbr_ai, roe_ai, debt_ai, drop_pct_ai, div_ai, df_annual=df_annual_ai)["total"]
     except Exception:
         return None
+
+# ═══════════════════════════════════════════════════════════════════════
+# 🔬 [AI 종합점수 세분화] 8개 항목 배점 체계
+# ─────────────────────────────────────────────────────────────────────
+# TradingView Technical Rating(추세/모멘텀 계열 지표 종합), TrendSpider(추세·모멘텀·
+# 거래량·돌파 점수를 각각 분리), MarketSmith(RS Rating·SMR Rating 등 항목별 등급)의
+# "카테고리를 잘게 쪼개서 각각 보여준다"는 아이디어를 참고해, 기존 4항목(건전성/
+# 성장성/수익성/배당)을 아래 8항목으로 재구성했다.
+#
+#   추세(0~20) · 수급(0~20) · 거래량(0~10) · 재무(0~15) ·
+#   밸류(0~10) · 모멘텀(0~10) · AI패턴(0~10) · 리스크(-5~0)
+#
+# ⚠️ 'AI패턴' 항목은 이름과 달리 실제 머신러닝 유사도 검색이 아니라, 과거 급등주에서
+# 자주 관찰되는 규칙(직전 저항선 돌파 + 거래량 동반 + 단기 상승 우위)을 조합한
+# 근사 휴리스틱이다. UI에도 이 점을 명시해 과장된 신뢰를 주지 않도록 한다.
+#
+# 각 항목은 가격/거래량/수급 데이터 조회가 실패해도(네트워크 지연 등) 전체 계산이
+# 막히지 않도록 항목별로 try/except를 걸고, 실패 시에는 극단값 대신 "중립값"으로
+# 대체한다(예: 거래량 데이터가 없으면 만점/0점이 아니라 중간값 5점).
+# ═══════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_price_history_for_score(code, period="1y"):
+    """추세/거래량/모멘텀/패턴/리스크 점수 계산용 일봉 OHLCV(종가·거래량·고가).
+    코스피(.KS) 우선 조회 후 실패하면 코스닥(.KQ)으로 폴백. 실패 시 빈 DataFrame."""
+    code = normalize_kr_code(code)
+    try:
+        import yfinance as yf
+        df = call_with_timeout(
+            lambda: yf.Ticker(f"{code}.KS").history(period=period, interval="1d", timeout=8),
+            timeout=10,
+        )
+        if df is None or df.empty:
+            df = call_with_timeout(
+                lambda: yf.Ticker(f"{code}.KQ").history(period=period, interval="1d", timeout=8),
+                timeout=10,
+            )
+        if df is None or df.empty:
+            return pd.DataFrame()
+        return df[["Close", "Volume", "High"]].dropna(subset=["Close"])
+    except Exception:
+        return pd.DataFrame()
+
+
+def calc_trend_score(df_price):
+    """📈 추세 점수 (0~20) = MA 정배열(0~10) + 52주 신고가 근접도(0~6) + 추세 지속성(0~4)"""
+    try:
+        if df_price is None or df_price.empty:
+            return 10
+        closes = df_price["Close"].dropna()
+        if len(closes) < 20:
+            return 10
+
+        ma5 = closes.tail(5).mean()
+        ma20 = closes.tail(20).mean()
+        ma60 = closes.tail(60).mean() if len(closes) >= 60 else ma20
+        cur = closes.iloc[-1]
+
+        if ma5 > ma20 > ma60:      s_align = 10
+        elif ma5 > ma20 or ma20 > ma60: s_align = 6
+        else:                       s_align = 2
+
+        high52 = closes.max()
+        if high52 > 0:
+            dist = (high52 - cur) / high52 * 100
+            if dist <= 3:    s_high = 6
+            elif dist <= 10: s_high = 4
+            elif dist <= 20: s_high = 2
+            else:            s_high = 0
+        else:
+            s_high = 0
+
+        recent20 = closes.tail(20)
+        ma20_series = closes.rolling(20).mean().reindex(recent20.index)
+        above_ratio = (recent20 > ma20_series).sum() / len(recent20)
+        if above_ratio >= 0.8:   s_persist = 4
+        elif above_ratio >= 0.5: s_persist = 2
+        else:                     s_persist = 0
+
+        return int(max(0, min(20, s_align + s_high + s_persist)))
+    except Exception:
+        return 10
+
+
+def calc_volume_score(df_price):
+    """📊 거래량 점수 (0~10) = 최근 거래량 ÷ 20일 평균 거래량 비율"""
+    try:
+        if df_price is None or df_price.empty or "Volume" not in df_price.columns:
+            return 5
+        vol = df_price["Volume"].dropna()
+        if len(vol) < 5:
+            return 5
+        recent = vol.iloc[-1]
+        avg20 = vol.tail(20).mean() if len(vol) >= 20 else vol.mean()
+        if avg20 <= 0:
+            return 5
+        ratio = recent / avg20
+        if ratio >= 3:     return 10
+        elif ratio >= 2:   return 8
+        elif ratio >= 1.5: return 6
+        elif ratio >= 1.0: return 4
+        elif ratio >= 0.7: return 2
+        else:              return 0
+    except Exception:
+        return 5
+
+
+def calc_momentum_score(df_price, kospi_closes=None):
+    """🚀 모멘텀 점수 (0~10) = 최근 20일 상승률(0~8) + 코스피 대비 상대강도 RS 보너스(0~2)"""
+    try:
+        if df_price is None or df_price.empty:
+            return 5
+        closes = df_price["Close"].dropna()
+        if len(closes) < 21:
+            return 5
+        ret20 = (closes.iloc[-1] / closes.iloc[-21] - 1) * 100
+
+        if ret20 >= 20:    base = 8
+        elif ret20 >= 10:  base = 6
+        elif ret20 >= 5:   base = 5
+        elif ret20 >= 0:   base = 3
+        elif ret20 >= -10: base = 1
+        else:              base = 0
+
+        rs_bonus = 1  # 코스피 비교 데이터가 없을 때의 중립값
+        if kospi_closes and len(kospi_closes) >= 21:
+            kospi_ret20 = (kospi_closes[-1] / kospi_closes[-21] - 1) * 100
+            diff = ret20 - kospi_ret20
+            if diff >= 10:  rs_bonus = 2
+            elif diff >= 0: rs_bonus = 1
+            else:            rs_bonus = 0
+
+        return int(max(0, min(10, base + rs_bonus)))
+    except Exception:
+        return 5
+
+
+def _investor_side_score(buy_days, n, net_sum):
+    """기관 또는 외국인 한쪽의 수급 점수(0~10). 순매수일 비율과 누적 순매수 부호를 함께 본다."""
+    if n <= 0:
+        return 5
+    ratio = buy_days / n
+    if net_sum > 0 and ratio >= 0.7: return 10
+    if net_sum > 0 and ratio >= 0.5: return 7
+    if net_sum > 0:                  return 5
+    if net_sum <= 0 and ratio <= 0.3: return 0
+    if net_sum <= 0:                  return 3
+    return 5
+
+
+def calc_flow_score(code, days=20):
+    """💰 수급 점수 (0~20) = 기관 순매수 점수(0~10) + 외국인 순매수 점수(0~10)"""
+    try:
+        df = fetch_investor_trend_by_code(code, days=days)
+        if df.empty or '기관순매매' not in df.columns or '외국인순매매' not in df.columns:
+            return 10
+        inst = df['기관순매매']
+        frgn = df['외국인순매매']
+        n = len(df)
+        inst_score = _investor_side_score(int((inst > 0).sum()), n, inst.sum())
+        frgn_score = _investor_side_score(int((frgn > 0).sum()), n, frgn.sum())
+        return int(max(0, min(20, inst_score + frgn_score)))
+    except Exception:
+        return 10
+
+
+def calc_financial_score_detailed(df_annual, roe):
+    """💹 재무 점수 (0~15) = ROE(0~8) + 영업이익 증가율 YoY(0~5) + EPS 흐름(0~2)"""
+    try:
+        if roe is None or roe == -999: s_roe = 4
+        elif roe >= 20: s_roe = 8
+        elif roe >= 15: s_roe = 6
+        elif roe >= 10: s_roe = 4
+        elif roe >= 5:  s_roe = 2
+        elif roe >= 0:  s_roe = 1
+        else:            s_roe = 0
+
+        s_op, s_eps = 2, 1  # 데이터 없을 때의 중립값
+
+        if df_annual is not None and not df_annual.empty and len(df_annual) >= 2:
+            if '영업이익' in df_annual.columns:
+                prev = _to_float_safe(df_annual.iloc[-2]['영업이익'])
+                latest = _to_float_safe(df_annual.iloc[-1]['영업이익'])
+                if prev not in (None, 0) and latest is not None:
+                    growth = (latest - prev) / abs(prev) * 100
+                    if growth >= 20:  s_op = 5
+                    elif growth >= 10: s_op = 3
+                    elif growth >= 0:  s_op = 1
+                    else:               s_op = 0
+
+            eps_col = next((c for c in df_annual.columns if 'EPS' in str(c)), None)
+            if eps_col:
+                prev_eps = _to_float_safe(df_annual.iloc[-2][eps_col])
+                latest_eps = _to_float_safe(df_annual.iloc[-1][eps_col])
+                if latest_eps is not None and latest_eps > 0:
+                    s_eps = 2 if (prev_eps is not None and latest_eps > prev_eps) else 1
+                elif latest_eps is not None:
+                    s_eps = 0
+
+        return int(max(0, min(15, s_roe + s_op + s_eps)))
+    except Exception:
+        return 7
+
+
+def calc_valuation_score_detailed(per, pbr, roe):
+    """📉 밸류 점수 (0~10) = PER(0~5) + PBR(0~3) + PEG 근사(0~2, PER÷ROE)"""
+    try:
+        if per is None or per <= 0: s_per = 2
+        elif per <= 8:  s_per = 5
+        elif per <= 12: s_per = 4
+        elif per <= 18: s_per = 3
+        elif per <= 25: s_per = 1
+        else:            s_per = 0
+
+        if pbr is None or pbr <= 0: s_pbr = 1
+        elif pbr <= 1:   s_pbr = 3
+        elif pbr <= 1.5: s_pbr = 2
+        elif pbr <= 2.5: s_pbr = 1
+        else:             s_pbr = 0
+
+        if per and per > 0 and roe and roe != -999 and roe > 0:
+            peg = per / roe
+            if peg <= 1:   s_peg = 2
+            elif peg <= 1.5: s_peg = 1
+            else:             s_peg = 0
+        else:
+            s_peg = 1
+
+        return int(max(0, min(10, s_per + s_pbr + s_peg)))
+    except Exception:
+        return 5
+
+
+def calc_pattern_score(df_price, volume_score):
+    """🔥 AI 패턴 점수 (0~10, ⚠️ 규칙 기반 근사 휴리스틱 — 실제 ML 유사도 검색 아님)
+    = 직전 20일 저항선(고점) 돌파(0~5) + 거래량 동반(0~3) + 최근 상승 우위(0~2)"""
+    try:
+        if df_price is None or df_price.empty or len(df_price) < 21:
+            return 5
+        closes = df_price["Close"].dropna()
+        cur = closes.iloc[-1]
+        prior20_high = closes.iloc[-21:-1].max()
+
+        score = 0
+        if prior20_high > 0 and cur >= prior20_high:
+            score += 5
+        if volume_score >= 6:
+            score += 3
+        recent5 = closes.tail(6).diff().dropna()
+        if int((recent5 > 0).sum()) >= 3:
+            score += 2
+
+        return int(max(0, min(10, score)))
+    except Exception:
+        return 5
+
+
+def calc_risk_score(df_price, debt):
+    """⚠️ 리스크 점수 (-5~0, 감점 전용) = 변동성(0~3 감점) + 부채비율(0~2 감점)"""
+    try:
+        penalty = 0
+        if df_price is not None and not df_price.empty:
+            closes = df_price["Close"].dropna().tail(20)
+            if len(closes) >= 5 and closes.mean() > 0:
+                cv = (closes.std() / closes.mean()) * 100
+                if cv >= 6:   penalty += 3
+                elif cv >= 4: penalty += 2
+                elif cv >= 2: penalty += 1
+
+        if debt is not None and debt > 0:
+            if debt > 200:   penalty += 2
+            elif debt > 100: penalty += 1
+
+        return -int(max(0, min(5, penalty)))
+    except Exception:
+        return -1
+
+
+def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=None, screener_df=None):
+    """세분화된 AI 종합점수(0~100). 8개 항목 배점을 그대로 합산한다.
+
+        추세(0~20) · 수급(0~20) · 거래량(0~10) · 재무(0~15) ·
+        밸류(0~10) · 모멘텀(0~10) · AI패턴(0~10) · 리스크(-5~0)
+
+    df_annual을 미리 전달하면(재무 데이터를 이미 조회한 경우) 재조회를 생략한다."""
+    code = normalize_kr_code(code)
+
+    try:
+        df_price = fetch_price_history_for_score(code)
+    except Exception:
+        df_price = pd.DataFrame()
+
+    kospi_closes = None
+    try:
+        kospi_closes = fetch_sparkline_data().get("kospi")
+    except Exception:
+        pass
+
+    if df_annual is None:
+        try:
+            df_annual, _, _ = fetch_financial_data(code)
+        except Exception:
+            df_annual = None
+
+    trend      = calc_trend_score(df_price)
+    volume     = calc_volume_score(df_price)
+    momentum   = calc_momentum_score(df_price, kospi_closes)
+    pattern    = calc_pattern_score(df_price, volume)
+    risk       = calc_risk_score(df_price, debt)
+    flow       = calc_flow_score(code)
+    financial  = calc_financial_score_detailed(df_annual, roe)
+    valuation  = calc_valuation_score_detailed(per, pbr, roe)
+
+    total = int(max(0, min(100, trend + flow + volume + financial + valuation + momentum + pattern + risk)))
+
+    return {
+        "total": total,
+        "trend": trend,         "trend_max": 20,     "trend_min": 0,
+        "flow": flow,           "flow_max": 20,      "flow_min": 0,
+        "volume": volume,       "volume_max": 10,    "volume_min": 0,
+        "financial": financial, "financial_max": 15, "financial_min": 0,
+        "valuation": valuation, "valuation_max": 10, "valuation_min": 0,
+        "momentum": momentum,   "momentum_max": 10,  "momentum_min": 0,
+        "pattern": pattern,     "pattern_max": 10,   "pattern_min": 0,
+        "risk": risk,           "risk_max": 0,       "risk_min": -5,
+    }
+
 
 def _ai_score_color(total):
     if total >= 85:   return "#7C3AED"
@@ -6893,8 +7224,12 @@ def _build_ai_comment(name, code, per, pbr, roe, debt, drop_pct, div, scores, to
     return sections
 
 def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_label):
-    scores = calc_ai_scores(per, pbr, roe, debt, drop_pct, div)
-    total  = scores["total"]
+    # 💬 AI 코멘트(강점/약점 서술)는 기존 4항목(건전성/성장성/수익성/배당) 로직을 그대로 쓴다.
+    # 화면에 보이는 점수판/총점은 아래 8항목 세분화(calc_ai_scores_detailed)가 "공식" 값이며,
+    # legacy_scores는 코멘트 문장 생성용 내부 참고값일 뿐 화면에 별도로 노출하지 않는다.
+    legacy_scores = calc_ai_scores(per, pbr, roe, debt, drop_pct, div)
+    detailed = calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div)
+    total = detailed["total"]
 
     if total >= 85:   total_color = "#7C3AED"; total_label = "최우량"
     elif total >= 70: total_color = "#2563EB"; total_label = "우량"
@@ -6908,24 +7243,42 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         f'{grade_label}</span>'
     ) if grade_label else ""
 
-    def score_bar(score):
-        if score >= 80:   bar_color = "#7C3AED"
-        elif score >= 65: bar_color = "#2563EB"
-        elif score >= 50: bar_color = "#16A34A"
-        elif score >= 35: bar_color = "#D97706"
-        else:             bar_color = "#DC2626"
+    def score_bar(score, max_val, min_val=0):
+        rng = max_val - min_val
+        ratio = (score - min_val) / rng if rng else 1.0
+        pct = max(0, min(100, ratio * 100))
+        if ratio >= 0.8:   bar_color = "#7C3AED"
+        elif ratio >= 0.65: bar_color = "#2563EB"
+        elif ratio >= 0.5:  bar_color = "#16A34A"
+        elif ratio >= 0.35: bar_color = "#D97706"
+        else:               bar_color = "#DC2626"
+        label = f"{score}/{max_val}" if min_val == 0 else f"{score}점"
         return (
             '<div style="display:flex; align-items:center; gap:10px; margin-bottom:8px;">'
-            '<div style="width:80px; font-size:12px; color:#64748B; text-align:right;">' + str(score) + '점</div>'
+            '<div style="width:52px; font-size:12px; color:#64748B; text-align:right;">' + label + '</div>'
             '<div style="flex:1; background:#F1F5F9; border-radius:4px; height:8px;">'
-            '<div style="width:' + str(score) + '%; background:' + bar_color + '; border-radius:4px; height:8px;"></div>'
+            '<div style="width:' + str(pct) + '%; background:' + bar_color + '; border-radius:4px; height:8px;"></div>'
             '</div></div>'
         )
 
-    bar_health   = score_bar(scores['health'])
-    bar_growth   = score_bar(scores['growth'])
-    bar_profit   = score_bar(scores['profit'])
-    bar_dividend = score_bar(scores['dividend'])
+    categories = [
+        ("📈", "추세",     detailed["trend"],     detailed["trend_max"],     0),
+        ("💰", "수급",     detailed["flow"],       detailed["flow_max"],       0),
+        ("📊", "거래량",   detailed["volume"],     detailed["volume_max"],     0),
+        ("💹", "재무",     detailed["financial"],  detailed["financial_max"],  0),
+        ("📉", "밸류",     detailed["valuation"],  detailed["valuation_max"],  0),
+        ("🚀", "모멘텀",   detailed["momentum"],   detailed["momentum_max"],   0),
+        ("🔥", "AI패턴",   detailed["pattern"],    detailed["pattern_max"],    0),
+        ("⚠️", "리스크",   detailed["risk"],       detailed["risk_max"],       detailed["risk_min"]),
+    ]
+
+    cat_cards = "".join(
+        '<div style="background:#FFFFFF; border:1px solid #E2E8F0; border-radius:8px; padding:10px 12px;">'
+        f'<div style="font-size:11px; color:#94A3B8; margin-bottom:4px;">{icon} {label}</div>'
+        + score_bar(val, max_v, min_v) +
+        '</div>'
+        for icon, label, val, max_v, min_v in categories
+    )
 
     html = (
         '<div style="background:#FAFBFF; border:1px solid #C7D2FE; border-radius:10px; padding:18px 20px; margin-top:12px;">'
@@ -6939,25 +7292,16 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         '<div style="font-size:12px; color:' + total_color + '; font-weight:600;">● ' + total_label + '</div>'
         '</div></div>'
         '<div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">'
-        '<div style="background:#FFFFFF; border:1px solid #E2E8F0; border-radius:8px; padding:10px 12px;">'
-        '<div style="font-size:11px; color:#94A3B8; margin-bottom:4px;">🏦 재무 건전성</div>'
-        + bar_health +
+        + cat_cards +
         '</div>'
-        '<div style="background:#FFFFFF; border:1px solid #E2E8F0; border-radius:8px; padding:10px 12px;">'
-        '<div style="font-size:11px; color:#94A3B8; margin-bottom:4px;">📈 성장성</div>'
-        + bar_growth +
+        '<div style="margin-top:10px; font-size:10.5px; color:#94A3B8; line-height:1.6;">'
+        '⚠️ AI패턴 점수는 과거 급등 사례에서 흔히 보이는 규칙(저항선 돌파·거래량 동반·상승 우위)을 '
+        '조합한 근사치이며, 실제 유사도 검색이나 매매 신호가 아닙니다.'
         '</div>'
-        '<div style="background:#FFFFFF; border:1px solid #E2E8F0; border-radius:8px; padding:10px 12px;">'
-        '<div style="font-size:11px; color:#94A3B8; margin-bottom:4px;">💰 수익성</div>'
-        + bar_profit +
         '</div>'
-        '<div style="background:#FFFFFF; border:1px solid #E2E8F0; border-radius:8px; padding:10px 12px;">'
-        '<div style="font-size:11px; color:#94A3B8; margin-bottom:4px;">🎯 배당 매력</div>'
-        + bar_dividend +
-        '</div>'
-        '</div></div>'
     )
     st.markdown(html, unsafe_allow_html=True)
+    scores = legacy_scores  # 아래 _build_ai_comment 호출부와의 변수명 호환
 
     def _escape_and_mark(text):
         """이스케이프 후 강조 마커(「」『』【】)를 실제 태그로 치환."""
