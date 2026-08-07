@@ -6637,7 +6637,21 @@ def fetch_price_history_for_score(code, period="1y"):
             )
         if df is None or df.empty:
             return pd.DataFrame()
-        return df[["Close", "Volume", "High"]].dropna(subset=["Close"])
+        df = df[["Close", "Volume", "High"]].dropna(subset=["Close"])
+
+        # ── [버그 수정: 당일 거래량 0으로 잡혀 거래량/추세/모멘텀 점수가 왜곡되는 문제] ──
+        # 코스피/코스닥 종목을 yfinance로 조회하면, 장중이거나 당일 데이터가 아직
+        # 완전히 반영되기 전에는 가장 최근(오늘) 봉의 Volume이 0 또는 NaN으로 채워진
+        # 채 내려오는 경우가 흔하다(야후가 KRX 거래량 집계를 종가 확정 후에야 채워
+        # 넣는 것으로 추정됨). 이 상태를 그대로 쓰면 "오늘 거래량 0 ÷ 20일 평균" = 0점
+        # 으로 계산되어, 실제로는 정상 거래되는 날에도 거래량 점수가 0으로 나오고
+        # (실측: 삼성전자 거래량 0/10), 같은 미확정 봉의 종가를 쓰는 추세·모멘텀
+        # 점수까지 함께 낮게 왜곡됐다. 마지막 봉이 거래량 0/NaN이면 아직 확정되지
+        # 않은 데이터로 보고 제거하고, 그 앞의 확정된 거래일 데이터로 계산한다.
+        if not df.empty and (pd.isna(df["Volume"].iloc[-1]) or df["Volume"].iloc[-1] == 0):
+            df = df.iloc[:-1]
+
+        return df
     except Exception:
         return pd.DataFrame()
 
