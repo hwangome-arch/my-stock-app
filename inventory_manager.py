@@ -6651,6 +6651,33 @@ def fetch_price_history_for_score(code, period="1y"):
         if not df.empty and (pd.isna(df["Volume"].iloc[-1]) or df["Volume"].iloc[-1] == 0):
             df = df.iloc[:-1]
 
+        # ── [버그 수정: yfinance 가격 자체가 실제 주가와 몇 배씩 어긋나는 문제] ──────
+        # 실측 사례(2026-08): 삼성전자(005930)를 조회하면 yfinance가 최근 종가를
+        # 1,458,000원으로 내려줬다. 그런데 실제 삼성전자는 2018년 50:1 액면분할
+        # 이후 2026년 8월 기준 20만원대 후반~30만원대에서 거래 중이라(2026-05-04
+        # 장중 23만1000원으로 액면분할 후 최고가 경신), 실제가와 4~5배 이상
+        # 차이난다. 즉 yfinance가 이 종목에 대해 (액면분할 조정 오류 등으로 추정되는)
+        # 잘못된 가격 계열을 내려주고 있었다는 뜻이다. 이 가격을 그대로 쓰면 52주
+        # 고점대비/추세/모멘텀 점수가 전부 허구의 폭락으로 계산된다.
+        #
+        # 이미 이 앱에는 네이버 금융에서 실시간가를 가져오는 fetch_current_price_info
+        # (신뢰도 높은 소스, 60초 캐시)가 있으므로, yfinance 마지막 종가를 그 값과
+        # 대조해서 2배 넘게 어긋나면 "이 종목은 yfinance 가격 데이터를 신뢰할 수
+        # 없다"고 보고 통째로 버린다(빈 DataFrame → 각 점수 함수가 중립값으로 대체).
+        # 어설프게 배율을 추정해서 보정하지 않는 이유: 어긋난 배율이 항상 깔끔한
+        # 50배 같은 값이 아닐 수 있어(실측 사례는 약 5배), 잘못 보정하면 틀린
+        # 데이터를 "그럴듯하게 틀린" 데이터로 바꿔 오히려 알아채기 더 어려워진다.
+        if not df.empty:
+            try:
+                ref_price = fetch_current_price_info(code).get("price")
+                last_close = df["Close"].iloc[-1]
+                if ref_price and last_close and ref_price > 0:
+                    ratio = last_close / ref_price
+                    if ratio > 2.0 or ratio < 0.5:
+                        return pd.DataFrame()
+            except Exception:
+                pass
+
         return df
     except Exception:
         return pd.DataFrame()
@@ -6696,20 +6723,29 @@ def calc_trend_score(df_price):
         return 10
 
 
-def calc_volume_score(df_price):
+def calc_volume_score(df_price, exclude_today=False):
     """📊 거래량 점수 (0~10) = 최근 거래량 ÷ 20일 평균 거래량 비율
 
-    ⚠️ [버그 수정] 기존에는 ratio < 0.7(오늘 거래량이 20일 평균의 70% 미만)이면
+    ⚠️ [버그 수정 1] 기존에는 ratio < 0.7(오늘 거래량이 20일 평균의 70% 미만)이면
     무조건 0점으로 처리했다. 이 구간이 너무 넓어서(0%~69%가 전부 0점), 실제로는
     "약간 조용한 날"과 "거래가 사실상 없는 날"이 구분되지 않고 똑같이 0점으로
     표시되는 문제가 있었다. 특히 삼성전자·SK하이닉스처럼 평소 거래량 절대량이
     크고 안정적인 초대형주는 평균 대비 50~65% 수준으로만 줄어도 이 넓은 0점
     구간에 자주 걸려, 다른 종목과 비교했을 때 데이터가 안 들어오는 것처럼
-    보이는 원인이 됐다. 0.4~1.0 사이를 세분화해서 이 문제를 없앴다."""
+    보이는 원인이 됐다. 0.4~1.0 사이를 세분화해서 이 문제를 없앴다.
+
+    ⚠️ [버그 수정 2] 장중(당일 미마감)에 조회하면 df_price의 마지막 봉은 "오늘"의
+    아직 다 쌓이지 않은 누적 거래량이다. 이걸 하루 전체가 확정된 20일 평균과
+    비교하면, 장이 끝나기 전까지는 구조적으로 항상 낮은(심하면 0점) 점수가 나올
+    수밖에 없다 — 실제로 거래가 부진해서가 아니라 비교 대상 자체가 불공정한
+    것이다(실측: 삼성전자 장중 조회 시 오늘거래량/20일평균 = 11%). exclude_today=True
+    로 호출되면 마지막(당일) 봉을 빼고 확정된 전날까지의 데이터로 계산한다."""
     try:
         if df_price is None or df_price.empty or "Volume" not in df_price.columns:
             return 5
         vol = df_price["Volume"].dropna()
+        if exclude_today and len(vol) >= 6:
+            vol = vol.iloc[:-1]
         if len(vol) < 5:
             return 5
         recent = vol.iloc[-1]
@@ -6901,6 +6937,23 @@ def calc_risk_score(df_price, debt):
         return -1
 
 
+def _last_bar_is_today_kst(df_price):
+    """df_price의 마지막 봉이 '오늘(한국시간 기준)' 날짜인지 확인한다.
+    장이 아직 마감되지 않았다면 오늘 봉의 누적 거래량은 하루 전체가 확정된
+    20일 평균과 비교하기에 본질적으로 불공정하게 낮을 수밖에 없다(아직 절반만
+    쌓였을 뿐 거래가 부진한 게 아님). 이 함수는 그 가능성이 있는지만 판별하고,
+    실제 처리(전날 데이터로 대체)는 calc_volume_score(exclude_today=True)에서 한다."""
+    try:
+        if df_price is None or df_price.empty:
+            return False
+        last_idx = df_price.index[-1]
+        last_date = last_idx.date() if hasattr(last_idx, "date") else pd.Timestamp(last_idx).date()
+        today_kst = pd.Timestamp.now(tz="Asia/Seoul").date()
+        return last_date == today_kst
+    except Exception:
+        return False
+
+
 def _ai_score_debug_info(df_price, kospi_closes=None):
     """점수 산출에 실제로 쓰인 원본 수치를 사람이 읽을 수 있는 형태로 반환한다.
     '왜 0점/저점이 나왔는지' 코드를 다시 열어보지 않고도 화면에서 바로 확인하기 위한
@@ -6908,7 +6961,7 @@ def _ai_score_debug_info(df_price, kospi_closes=None):
     info = {}
     try:
         if df_price is None or df_price.empty:
-            info["데이터"] = "가격 데이터를 가져오지 못했습니다."
+            info["데이터"] = "가격 데이터를 가져오지 못했습니다 (조회 실패 또는, 야후 가격이 실제가와 크게 어긋나 안전상 자동 제외됨)."
             return info
 
         info["데이터 마지막 날짜"] = str(df_price.index[-1].date()) if hasattr(df_price.index[-1], "date") else str(df_price.index[-1])
@@ -6933,13 +6986,18 @@ def _ai_score_debug_info(df_price, kospi_closes=None):
                 kospi_ret20 = (kospi_closes[-1] / kospi_closes[-21] - 1) * 100
                 info["(참고) 같은 기간 코스피"] = f"{kospi_ret20:+.1f}%"
 
+        today_incomplete = _last_bar_is_today_kst(df_price)
         if "Volume" in df_price.columns:
             vol = df_price["Volume"].dropna()
-            if len(vol) >= 5:
-                recent = vol.iloc[-1]
-                avg20 = vol.tail(20).mean() if len(vol) >= 20 else vol.mean()
+            vol_calc = vol.iloc[:-1] if (today_incomplete and len(vol) >= 6) else vol
+            if len(vol_calc) >= 5:
+                recent = vol_calc.iloc[-1]
+                avg20 = vol_calc.tail(20).mean() if len(vol_calc) >= 20 else vol_calc.mean()
                 if avg20 > 0:
-                    info["오늘 거래량 / 20일 평균"] = f"{recent:,.0f} / {avg20:,.0f}  (비율 {recent / avg20 * 100:.0f}%)"
+                    label = "전일(확정) 거래량 / 20일 평균" if today_incomplete else "오늘 거래량 / 20일 평균"
+                    info[label] = f"{recent:,.0f} / {avg20:,.0f}  (비율 {recent / avg20 * 100:.0f}%)"
+        if today_incomplete:
+            info["⏳ 참고"] = "오늘 장이 아직 진행 중일 수 있어, 거래량 점수는 전일까지의 확정 데이터로 계산했습니다."
     except Exception:
         info["오류"] = "진단 정보 계산 중 문제가 발생했습니다."
     return info
@@ -6971,8 +7029,10 @@ def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=
         except Exception:
             df_annual = None
 
+    today_incomplete = _last_bar_is_today_kst(df_price)
+
     trend      = calc_trend_score(df_price)
-    volume     = calc_volume_score(df_price)
+    volume     = calc_volume_score(df_price, exclude_today=today_incomplete)
     momentum   = calc_momentum_score(df_price, kospi_closes)
     pattern    = calc_pattern_score(df_price, volume)
     risk       = calc_risk_score(df_price, debt)
