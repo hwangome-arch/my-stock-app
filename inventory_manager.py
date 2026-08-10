@@ -6750,7 +6750,7 @@ def calc_trend_score(df_price):
 
 
 def calc_volume_score(df_price, exclude_today=False):
-    """📊 거래량 점수 (0~100) = 최근 거래량 ÷ 20일 평균 거래량 비율
+    """📊 거래량 점수 (0~100) = 당일 거래량 스파이크(0~60) + 최근 5일 평균 지속성(0~40)
 
     ⚠️ [버그 수정 1] 기존에는 ratio < 0.7(오늘 거래량이 20일 평균의 70% 미만)이면
     무조건 0점으로 처리했다. 이 구간이 너무 넓어서(0%~69%가 전부 0점), 실제로는
@@ -6764,6 +6764,11 @@ def calc_volume_score(df_price, exclude_today=False):
     점수가 뚝뚝 끊김)을 그대로 두면 배율이 조금만 달라도 같은 계단에 갇혀 점수가
     안 움직였다. _lerp_score로 같은 경계값들 사이를 선형보간해서, ratio가 1.3배든
     1.45배든(둘 다 예전엔 '5점' 계단에 갇힘) 배율에 비례해 촘촘하게 점수가 갈리도록 했다.
+
+    ⚠️ [입체화] 예전엔 '당일 거래량 ÷ 20일 평균' 하나만 봐서, 하루 반짝 터진 거래량과
+    며칠째 이어지는 거래 증가세가 똑같이 취급됐다. 지금은 당일 스파이크(0~60)와
+    최근 5일 평균의 지속성(0~40)을 나눠서 합산한다 — 하루짜리 반짝 거래량은 스파이크
+    점수만 받고, 여러 날 이어지는 거래 증가는 지속성 점수까지 추가로 받는다.
 
     ⚠️ [버그 수정 2] 장중(당일 미마감)에 조회하면 df_price의 마지막 봉은 "오늘"의
     아직 다 쌓이지 않은 누적 거래량이다. 이걸 하루 전체가 확정된 20일 평균과
@@ -6779,47 +6784,67 @@ def calc_volume_score(df_price, exclude_today=False):
             vol = vol.iloc[:-1]
         if len(vol) < 5:
             return 50.0
-        recent = vol.iloc[-1]
         avg20 = vol.tail(20).mean() if len(vol) >= 20 else vol.mean()
         if avg20 <= 0:
             return 50.0
-        ratio = recent / avg20
-        score = _lerp_score(ratio, [
-            (0.0, 0), (0.4, 10), (0.6, 20), (0.8, 30), (1.0, 40),
-            (1.2, 50), (1.5, 60), (2.0, 80), (3.0, 100),
+
+        recent = vol.iloc[-1]
+        spike_ratio = recent / avg20
+        spike = _lerp_score(spike_ratio, [
+            (0.0, 0), (0.4, 6), (0.6, 12), (0.8, 18), (1.0, 24),
+            (1.2, 30), (1.5, 36), (2.0, 48), (3.0, 60),
         ])
-        return round(score, 1)
+
+        avg5 = vol.tail(5).mean() if len(vol) >= 5 else recent
+        sustain_ratio = avg5 / avg20
+        sustain = _lerp_score(sustain_ratio, [
+            (0.0, 0), (0.5, 8), (0.8, 16), (1.0, 24), (1.3, 32), (1.8, 40),
+        ])
+
+        return round(min(100.0, spike + sustain), 1)
     except Exception:
         return 50.0
 
 
 def calc_momentum_score(df_price, kospi_closes=None):
-    """🚀 모멘텀 점수 (0~100) = 최근 20일 상승률(0~80) + 코스피 대비 상대강도 RS 보너스(0~20)
+    """🚀 모멘텀 점수 (0~100) = 단기 5일(0~20) + 중기 20일(0~40) + 장기 60일(0~20)
+       + 코스피 대비 상대강도 RS 보너스(0~20)
 
     ⚠️ [1000점 리뉴얼] 기존엔 ret20 < -10%면 무조건 base=0으로 죽어서, -10.1%짜리
     하락과 -34%짜리 폭락이 똑같은 0점으로 표시됐다(실측: 삼성전자 -17.7%, SK하이닉스
     -34.1%가 둘 다 모멘텀 0/10). 지금은 -30% 지점까지는 하락폭에 비례해 점수가 계속
-    줄어들고, 그 밑으로 더 빠지면 0에서 바닥을 잡는다. RS 보너스도 코스피 대비
-    초과/열위 정도에 비례해 연속적으로 움직인다."""
+    줄어들고, 그 밑으로 더 빠지면 0에서 바닥을 잡는다.
+
+    ⚠️ [입체화] 예전엔 20일 수익률 하나로만 모멘텀을 판단해서, '최근 5일은 반등 중인데
+    20일 전체로는 마이너스'인 종목과 '5일도 20일도 계속 빠지는' 종목이 구분되지 않았다.
+    지금은 5일(단기)·20일(중기)·60일(장기) 수익률을 각각 채점해서 더한다 — 단기 반등
+    조짐이나 장기 추세 이탈을 20일 수익률 하나보다 입체적으로 잡아낸다. 데이터가 모자라
+    특정 기간을 못 구하면(예: 상장 60일 미만) 그 구간만 중립값으로 채운다."""
     try:
         if df_price is None or df_price.empty:
             return 50.0
         closes = df_price["Close"].dropna()
-        if len(closes) < 21:
+        if len(closes) < 6:
             return 50.0
-        ret20 = (closes.iloc[-1] / closes.iloc[-21] - 1) * 100
 
-        base = _lerp_score(ret20, [
-            (-30, 0), (-10, 10), (0, 30), (5, 50), (10, 60), (20, 80),
-        ])
+        def ret_pct(n):
+            if len(closes) < n + 1:
+                return None
+            return (closes.iloc[-1] / closes.iloc[-(n + 1)] - 1) * 100
+
+        ret5, ret20, ret60 = ret_pct(5), ret_pct(20), ret_pct(60)
+
+        s5 = 10.0 if ret5 is None else _lerp_score(ret5, [(-15, 0), (-5, 5), (0, 10), (3, 15), (8, 20)])
+        s20 = 20.0 if ret20 is None else _lerp_score(ret20, [(-30, 0), (-10, 5), (0, 15), (5, 25), (10, 30), (20, 40)])
+        s60 = 10.0 if ret60 is None else _lerp_score(ret60, [(-40, 0), (-15, 5), (0, 10), (10, 15), (20, 20)])
 
         rs_bonus = 10.0  # 코스피 비교 데이터가 없을 때의 중립값
-        if kospi_closes and len(kospi_closes) >= 21:
+        if ret20 is not None and kospi_closes and len(kospi_closes) >= 21:
             kospi_ret20 = (kospi_closes[-1] / kospi_closes[-21] - 1) * 100
             diff = ret20 - kospi_ret20
             rs_bonus = _lerp_score(diff, [(-15, 0), (0, 10), (10, 20)])
 
-        return round(max(0, min(100, base + rs_bonus)), 1)
+        return round(max(0, min(100, s5 + s20 + s60 + rs_bonus)), 1)
     except Exception:
         return 50.0
 
@@ -6856,12 +6881,19 @@ def calc_flow_score(code, days=20):
         return 100.0
 
 
-def calc_financial_score_detailed(df_annual, roe):
-    """💹 재무 점수 (0~150) = ROE(0~80) + 영업이익 증가율 YoY(0~50) + EPS 흐름(0~20)
+def calc_financial_score_detailed(df_annual, roe, debt=None):
+    """💹 재무 점수 (0~180) = ROE(0~80) + 영업이익 증가율 YoY(0~50) + EPS 흐름(0~20)
+       + 부채비율 건전성(0~30, NEW)
 
     ⚠️ [1000점 리뉴얼] ROE 12%와 14%가 예전엔 같은 계단(4점)에 갇혔다. 지금은
     ROE·영업이익 증가율·EPS 증가율 모두 실제 %값을 그대로 _lerp_score에 넣어
-    연속적으로 채점한다."""
+    연속적으로 채점한다.
+
+    ⚠️ [카테고리 정합성 수정] 예전엔 부채비율이 '리스크' 감점에서만 쓰이고, 정작
+    카테고리 이름이 '재무'인 여기엔 반영이 안 됐다 — 저부채 우량기업이 재무 점수로
+    플러스 혜택을 못 받는 구조였다. 지금은 부채비율이 낮을수록 여기서도 가산점을
+    받도록 추가했다(리스크 쪽 감점은 그대로 유지 — '재무 건전성 가점'과 '변동성·
+    부실 리스크 감점'은 서로 다른 관점이라 중복이 아니라 상호 보완으로 봤다)."""
     try:
         if roe is None or roe == -999:
             s_roe = 40.0
@@ -6891,16 +6923,27 @@ def calc_financial_score_detailed(df_annual, roe):
                 elif latest_eps is not None:
                     s_eps = 0.0
 
-        return round(max(0, min(150, s_roe + s_op + s_eps)), 1)
+        if debt is None or debt < 0:
+            s_debt = 15.0  # 데이터 없을 때의 중립값
+        else:
+            s_debt = _lerp_score(debt, [(0, 30), (30, 30), (60, 20), (100, 10), (150, 5), (300, 0)])
+
+        return round(max(0, min(180, s_roe + s_op + s_eps + s_debt)), 1)
     except Exception:
-        return 70.0
+        return 85.0
 
 
-def calc_valuation_score_detailed(per, pbr, roe):
-    """📉 밸류 점수 (0~100) = PER(0~50) + PBR(0~30) + PEG 근사(0~20, PER÷ROE)
+def calc_valuation_score_detailed(per, pbr, roe, div=None):
+    """📉 밸류 점수 (0~120) = PER(0~50) + PBR(0~30) + PEG 근사(0~20, PER÷ROE)
+       + 배당수익률(0~20, NEW)
 
     ⚠️ [1000점 리뉴얼] PER 8.5배와 11.5배가 예전엔 같은 계단(4점)에 갇혔다.
-    지금은 PER·PBR·PEG 실제 값을 그대로 _lerp_score에 넣어 연속적으로 채점한다."""
+    지금은 PER·PBR·PEG 실제 값을 그대로 _lerp_score에 넣어 연속적으로 채점한다.
+
+    ⚠️ [버그 수정] div(배당수익률)는 calc_ai_scores_detailed에 파라미터로 넘어오면서도
+    정작 8개 항목 어디에도 쓰이지 않았다(화면 디버그 정보에는 표시되지만 점수엔 반영 안
+    됐던 값). 배당수익률은 '싸게 사는지'를 보는 밸류 관점에도 들어맞는 지표라 여기에
+    가산점으로 추가했다."""
     try:
         if per is None or per <= 0:
             s_per = 20.0
@@ -6918,9 +6961,14 @@ def calc_valuation_score_detailed(per, pbr, roe):
         else:
             s_peg = 10.0
 
-        return round(max(0, min(100, s_per + s_pbr + s_peg)), 1)
+        if div is None or div <= 0:
+            s_div = 0.0
+        else:
+            s_div = _lerp_score(div, [(0, 0), (1, 5), (2, 10), (3.5, 15), (5, 20)])
+
+        return round(max(0, min(120, s_per + s_pbr + s_peg + s_div)), 1)
     except Exception:
-        return 50.0
+        return 60.0
 
 
 def calc_pattern_score(df_price, volume_score):
@@ -6954,25 +7002,55 @@ def calc_pattern_score(df_price, volume_score):
         return 50.0
 
 
-def calc_risk_score(df_price, debt):
-    """⚠️ 리스크 점수 (-50~0, 감점 전용) = 변동성(0~30 감점) + 부채비율(0~20 감점)
+def calc_risk_score(df_price, debt, drop_pct=None):
+    """⚠️ 리스크 점수 (-80~0, 감점 전용)
+       = 변동성(0~30 감점) + 부채비율(0~20 감점) + 52주 고점대비 하락폭(0~20 감점, NEW)
+       + 최근 연속 하락일수(0~10 감점, NEW)
 
     ⚠️ [1000점 리뉴얼] 변동성 CV 5%와 7%가 예전엔 같은 감점 계단에 갇혔다.
-    지금은 CV%와 부채비율(%) 값을 그대로 보간해 감점 폭이 연속적으로 커진다."""
+    지금은 CV%와 부채비율(%) 값을 그대로 보간해 감점 폭이 연속적으로 커진다.
+
+    ⚠️ [버그 수정] drop_pct(52주 고점 대비 하락률, 스크리너의 '고점대비(%)' 컬럼)는
+    calc_ai_scores_detailed에 파라미터로 넘어오면서도 정작 8개 항목 어디에도 쓰이지
+    않았다(화면 디버그 정보엔 표시되지만 점수엔 반영 안 됐던 값). '이미 많이 빠진
+    종목일수록 추가 변동성·투자심리 리스크가 크다'는 관점에서 여기 반영했다. (추세
+    점수의 '52주 고점 근접도'는 df_price로 직접 계산한 별개 값이고, 그쪽은 고점에
+    가까울수록 가점을 주는 '현재 추세 강도' 관점이라 여기의 '하락폭이 클수록 감점'하는
+    하방 리스크 관점과는 결이 다르다 — 같은 값의 중복 반영이 아니다.)
+
+    ⚠️ [입체화] 변동성·부채, 두 가지뿐이던 리스크 요인에 '최근 며칠째 연속으로
+    빠지고 있는지'를 추가했다 — 단기 급락이 이어지는 종목을 더 민감하게 잡아낸다."""
     try:
         penalty = 0.0
-        if df_price is not None and not df_price.empty:
-            closes = df_price["Close"].dropna().tail(20)
-            if len(closes) >= 5 and closes.mean() > 0:
-                cv = (closes.std() / closes.mean()) * 100
+        closes = df_price["Close"].dropna() if df_price is not None and not df_price.empty else None
+
+        if closes is not None and len(closes) >= 5:
+            recent20 = closes.tail(20)
+            if recent20.mean() > 0:
+                cv = (recent20.std() / recent20.mean()) * 100
                 penalty += _lerp_score(cv, [(0, 0), (2, 10), (4, 20), (6, 30)])
 
         if debt is not None and debt > 0:
             penalty += _lerp_score(debt, [(0, 0), (100, 10), (200, 20)])
 
-        return -round(max(0, min(50, penalty)), 1)
+        if drop_pct is None or drop_pct == 0.0:
+            penalty += 5.0  # 데이터 없을 때의 중립값
+        else:
+            penalty += _lerp_score(drop_pct, [(-60, 20), (-40, 14), (-20, 6), (-10, 2), (0, 0)])
+
+        if closes is not None and len(closes) >= 6:
+            diffs = closes.tail(6).diff().dropna()
+            down_streak = 0
+            for d in diffs.iloc[::-1]:
+                if d < 0:
+                    down_streak += 1
+                else:
+                    break
+            penalty += _lerp_score(down_streak, [(0, 0), (2, 3), (4, 7), (5, 10)])
+
+        return -round(max(0, min(80, penalty)), 1)
     except Exception:
-        return -10.0
+        return -15.0
 
 
 def _last_bar_is_today_kst(df_price):
@@ -7044,14 +7122,24 @@ def _ai_score_debug_info(df_price, kospi_closes=None):
 def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=None, screener_df=None):
     """세분화된 AI 종합점수(0~1000). 8개 항목 배점을 그대로 합산한다.
 
-        추세(0~200) · 수급(0~200) · 거래량(0~100) · 재무(0~150) ·
-        밸류(0~100) · 모멘텀(0~100) · AI패턴(0~100) · 리스크(-50~0)
+        추세(0~200) · 수급(0~200) · 거래량(0~100) · 재무(0~180) ·
+        밸류(0~120) · 모멘텀(0~100) · AI패턴(0~100) · 리스크(-80~0)
 
     ⚠️ [1000점 리뉴얼] 기존 100점 만점(각 항목 계단식 정수 점수)을 그대로 ×10 해서
     보여주기만 하면 눈금 자체는 예전과 똑같아서(여전히 10점 단위로만 움직임) 숫자만
     커 보이고 실제 정밀도는 늘지 않는다. 그래서 각 항목 계산 함수(calc_trend_score
     등) 내부를 전부 _lerp_score 기반 연속 보간으로 다시 짜서, 만점 자체도 ×10 하고
     동시에 입력값이 조금만 달라져도 점수가 소수점 단위로 촘촘하게 갈리도록 했다.
+
+    ⚠️ [배점 재조정] 리스크를 제외한 7개 항목의 만점 합이 정확히 1000이 되도록
+    재무(150→180)·밸류(100→120)를 조정했다. 예전엔 8개 만점을 그냥 더하면 95/100이라
+    100점 만점을 이론상으로도 못 채웠는데, 지금은 리스크 감점이 0이면(=무위험) 정확히
+    1000점이 최고점이 되도록 맞췄다.
+
+    ⚠️ [버그 수정] div(배당수익률)·drop_pct(52주 고점대비 하락률)가 파라미터로 넘어오면서도
+    정작 8개 항목 어디에도 쓰이지 않던 문제를 고쳤다 — div는 밸류 점수에, drop_pct는
+    리스크 점수에 반영된다. debt(부채비율)도 기존엔 리스크 감점에서만 쓰였는데, 이제
+    재무 점수의 가점 요소로도 반영된다(자세한 이유는 각 함수 docstring 참고).
 
     df_annual을 미리 전달하면(재무 데이터를 이미 조회한 경우) 재조회를 생략한다."""
     code = normalize_kr_code(code)
@@ -7079,10 +7167,10 @@ def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=
     volume     = calc_volume_score(df_price, exclude_today=today_incomplete)
     momentum   = calc_momentum_score(df_price, kospi_closes)
     pattern    = calc_pattern_score(df_price, volume)
-    risk       = calc_risk_score(df_price, debt)
+    risk       = calc_risk_score(df_price, debt, drop_pct)
     flow       = calc_flow_score(code)
-    financial  = calc_financial_score_detailed(df_annual, roe)
-    valuation  = calc_valuation_score_detailed(per, pbr, roe)
+    financial  = calc_financial_score_detailed(df_annual, roe, debt)
+    valuation  = calc_valuation_score_detailed(per, pbr, roe, div)
 
     total = int(round(max(0, min(1000, trend + flow + volume + financial + valuation + momentum + pattern + risk))))
 
@@ -7091,11 +7179,11 @@ def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=
         "trend": trend,         "trend_max": 200,    "trend_min": 0,
         "flow": flow,           "flow_max": 200,     "flow_min": 0,
         "volume": volume,       "volume_max": 100,   "volume_min": 0,
-        "financial": financial, "financial_max": 150, "financial_min": 0,
-        "valuation": valuation, "valuation_max": 100, "valuation_min": 0,
+        "financial": financial, "financial_max": 180, "financial_min": 0,
+        "valuation": valuation, "valuation_max": 120, "valuation_min": 0,
         "momentum": momentum,   "momentum_max": 100, "momentum_min": 0,
         "pattern": pattern,     "pattern_max": 100,  "pattern_min": 0,
-        "risk": risk,           "risk_max": 0,       "risk_min": -50,
+        "risk": risk,           "risk_max": 0,       "risk_min": -80,
         "debug": _ai_score_debug_info(df_price, kospi_closes),
     }
 
