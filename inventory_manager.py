@@ -6697,7 +6697,15 @@ def calc_trend_score(df_price):
 
 
 def calc_volume_score(df_price):
-    """📊 거래량 점수 (0~10) = 최근 거래량 ÷ 20일 평균 거래량 비율"""
+    """📊 거래량 점수 (0~10) = 최근 거래량 ÷ 20일 평균 거래량 비율
+
+    ⚠️ [버그 수정] 기존에는 ratio < 0.7(오늘 거래량이 20일 평균의 70% 미만)이면
+    무조건 0점으로 처리했다. 이 구간이 너무 넓어서(0%~69%가 전부 0점), 실제로는
+    "약간 조용한 날"과 "거래가 사실상 없는 날"이 구분되지 않고 똑같이 0점으로
+    표시되는 문제가 있었다. 특히 삼성전자·SK하이닉스처럼 평소 거래량 절대량이
+    크고 안정적인 초대형주는 평균 대비 50~65% 수준으로만 줄어도 이 넓은 0점
+    구간에 자주 걸려, 다른 종목과 비교했을 때 데이터가 안 들어오는 것처럼
+    보이는 원인이 됐다. 0.4~1.0 사이를 세분화해서 이 문제를 없앴다."""
     try:
         if df_price is None or df_price.empty or "Volume" not in df_price.columns:
             return 5
@@ -6712,8 +6720,11 @@ def calc_volume_score(df_price):
         if ratio >= 3:     return 10
         elif ratio >= 2:   return 8
         elif ratio >= 1.5: return 6
+        elif ratio >= 1.2: return 5
         elif ratio >= 1.0: return 4
-        elif ratio >= 0.7: return 2
+        elif ratio >= 0.8: return 3
+        elif ratio >= 0.6: return 2
+        elif ratio >= 0.4: return 1
         else:              return 0
     except Exception:
         return 5
@@ -6890,6 +6901,50 @@ def calc_risk_score(df_price, debt):
         return -1
 
 
+def _ai_score_debug_info(df_price, kospi_closes=None):
+    """점수 산출에 실제로 쓰인 원본 수치를 사람이 읽을 수 있는 형태로 반환한다.
+    '왜 0점/저점이 나왔는지' 코드를 다시 열어보지 않고도 화면에서 바로 확인하기 위한
+    진단용 부가 정보. 계산 실패해도 앱 전체가 죽지 않도록 개별 항목마다 방어한다."""
+    info = {}
+    try:
+        if df_price is None or df_price.empty:
+            info["데이터"] = "가격 데이터를 가져오지 못했습니다."
+            return info
+
+        info["데이터 마지막 날짜"] = str(df_price.index[-1].date()) if hasattr(df_price.index[-1], "date") else str(df_price.index[-1])
+
+        closes = df_price["Close"].dropna()
+        if len(closes) >= 1:
+            info["최근 종가"] = f"{closes.iloc[-1]:,.0f}"
+
+        if len(closes) >= 20:
+            ma5 = closes.tail(5).mean()
+            ma20 = closes.tail(20).mean()
+            ma60 = closes.tail(60).mean() if len(closes) >= 60 else ma20
+            info["MA5 / MA20 / MA60"] = f"{ma5:,.0f} / {ma20:,.0f} / {ma60:,.0f}"
+            high52 = closes.max()
+            if high52 > 0:
+                info["52주 고점 대비"] = f"-{(high52 - closes.iloc[-1]) / high52 * 100:.1f}%"
+
+        if len(closes) >= 21:
+            ret20 = (closes.iloc[-1] / closes.iloc[-21] - 1) * 100
+            info["최근 20일 수익률"] = f"{ret20:+.1f}%"
+            if kospi_closes and len(kospi_closes) >= 21:
+                kospi_ret20 = (kospi_closes[-1] / kospi_closes[-21] - 1) * 100
+                info["(참고) 같은 기간 코스피"] = f"{kospi_ret20:+.1f}%"
+
+        if "Volume" in df_price.columns:
+            vol = df_price["Volume"].dropna()
+            if len(vol) >= 5:
+                recent = vol.iloc[-1]
+                avg20 = vol.tail(20).mean() if len(vol) >= 20 else vol.mean()
+                if avg20 > 0:
+                    info["오늘 거래량 / 20일 평균"] = f"{recent:,.0f} / {avg20:,.0f}  (비율 {recent / avg20 * 100:.0f}%)"
+    except Exception:
+        info["오류"] = "진단 정보 계산 중 문제가 발생했습니다."
+    return info
+
+
 def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=None, screener_df=None):
     """세분화된 AI 종합점수(0~100). 8개 항목 배점을 그대로 합산한다.
 
@@ -6937,6 +6992,7 @@ def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=
         "momentum": momentum,   "momentum_max": 10,  "momentum_min": 0,
         "pattern": pattern,     "pattern_max": 10,   "pattern_min": 0,
         "risk": risk,           "risk_max": 0,       "risk_min": -5,
+        "debug": _ai_score_debug_info(df_price, kospi_closes),
     }
 
 
@@ -7315,6 +7371,13 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         '</div>'
     )
     st.markdown(html, unsafe_allow_html=True)
+
+    debug_info = detailed.get("debug") or {}
+    if debug_info:
+        with st.expander("🔍 점수 산출 원본 수치 보기 (왜 이 점수인지 확인용)"):
+            for k, v in debug_info.items():
+                st.markdown(f"- **{k}**: {v}")
+
     scores = legacy_scores  # 아래 _build_ai_comment 호출부와의 변수명 호환
 
     def _escape_and_mark(text):
