@@ -2912,7 +2912,14 @@ def fetch_screener_data_generator():
     if high52_c:
         final_df['52주고점'] = pd.to_numeric(final_df[high52_c].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0)
         mask_high = (final_df['현재가'] > 0) & (final_df['52주고점'] > 0)
-        final_df['고점대비(%)'] = 0.0
+        # ⚠️ [버그 수정] 예전엔 mask_high에 안 걸리는(52주고점 데이터를 못 구한) 종목도
+        # 고점대비(%)를 0.0으로 채웠다. 그러면 '52주 고점을 모른다'와 '지금 딱 52주
+        # 고점이다(0% 하락)'가 똑같은 0.0으로 뭉개져서, 다음 단계(get_ai_diagnosis_inputs
+        # → calc_risk_score)에서 진짜 데이터를 '데이터 없음'으로 오인하는 원인이 됐다.
+        # 실측: 삼성전자 리스크 점수가 실제 하락폭(-36.5%, 감점 12.6점)이 아니라 데이터
+        # 없음 취급(중립 감점 5.0점)으로 계산돼 -46.7점이어야 할 게 -39.1점으로 나왔다.
+        # NaN으로 남겨서 '모른다'를 명확히 구분한다.
+        final_df['고점대비(%)'] = np.nan
         final_df.loc[mask_high, '고점대비(%)'] = ((final_df.loc[mask_high, '현재가'] - final_df.loc[mask_high, '52주고점']) / final_df.loc[mask_high, '52주고점']) * 100
         final_df = final_df[['종목코드', '종목명', '시장', '현재가', '52주고점', '고점대비(%)', 'PER', 'PBR', '배당수익률', 'ROE', '부채비율']]
     else:
