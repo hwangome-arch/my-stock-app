@@ -7070,7 +7070,7 @@ def _last_bar_is_today_kst(df_price):
         return False
 
 
-def _ai_score_debug_info(df_price, kospi_closes=None):
+def _ai_score_debug_info(df_price, kospi_closes=None, debt=None, drop_pct=None):
     """점수 산출에 실제로 쓰인 원본 수치를 사람이 읽을 수 있는 형태로 반환한다.
     '왜 0점/저점이 나왔는지' 코드를 다시 열어보지 않고도 화면에서 바로 확인하기 위한
     진단용 부가 정보. 계산 실패해도 앱 전체가 죽지 않도록 개별 항목마다 방어한다."""
@@ -7114,6 +7114,30 @@ def _ai_score_debug_info(df_price, kospi_closes=None):
                     info[label] = f"{recent:,.0f} / {avg20:,.0f}  (비율 {recent / avg20 * 100:.0f}%)"
         if today_incomplete:
             info["⏳ 참고"] = "오늘 장이 아직 진행 중일 수 있어, 거래량 점수는 전일까지의 확정 데이터로 계산했습니다."
+
+        # ⚠️ [버그 수정] 리스크 점수(변동성/부채/하락폭/연속하락)에 실제로 쓰이는 원본
+        # 수치가 이 패널에 하나도 없어서, "왜 리스크가 -39점인지" 화면에서 확인할 방법이
+        # 없었다. 다른 항목들과 동일하게 계산 근거를 노출한다.
+        if len(closes) >= 5:
+            recent20 = closes.tail(20)
+            if recent20.mean() > 0:
+                cv = (recent20.std() / recent20.mean()) * 100
+                info["변동성(최근 20일 CV)"] = f"{cv:.2f}%"
+
+        if len(closes) >= 6:
+            diffs = closes.tail(6).diff().dropna()
+            down_streak = 0
+            for d in diffs.iloc[::-1]:
+                if d < 0:
+                    down_streak += 1
+                else:
+                    break
+            info["최근 연속 하락일수"] = f"{down_streak}일"
+
+        if debt is not None and debt >= 0:
+            info["부채비율"] = f"{debt:.1f}%"
+        if drop_pct is not None and drop_pct != 0.0:
+            info["52주 고점대비(스크리너 기준)"] = f"{drop_pct:+.1f}%"
     except Exception:
         info["오류"] = "진단 정보 계산 중 문제가 발생했습니다."
     return info
@@ -7184,7 +7208,7 @@ def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=
         "momentum": momentum,   "momentum_max": 100, "momentum_min": 0,
         "pattern": pattern,     "pattern_max": 100,  "pattern_min": 0,
         "risk": risk,           "risk_max": 0,       "risk_min": -80,
-        "debug": _ai_score_debug_info(df_price, kospi_closes),
+        "debug": _ai_score_debug_info(df_price, kospi_closes, debt, drop_pct),
     }
 
 
