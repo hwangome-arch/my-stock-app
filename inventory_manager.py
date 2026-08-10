@@ -6585,7 +6585,7 @@ def calc_ai_scores(per, pbr, roe, debt, drop_pct, div):
     }
 
 def get_ai_total_score(code, screener_df=None):
-    """관심종목 카드 등에서 재사용: 종목코드만으로 AI 종합점수(0~100)를 계산. 실패 시 None.
+    """관심종목 카드 등에서 재사용: 종목코드만으로 AI 종합점수(0~1000)를 계산. 실패 시 None.
     screener_df를 미리 전달하면(예: 관심종목 병렬조회) 백그라운드 스레드에서 다시
     load_screener_df()를 호출하지 않아도 되어 session_state 접근을 피할 수 있다.
 
@@ -6683,48 +6683,74 @@ def fetch_price_history_for_score(code, period="1y"):
         return pd.DataFrame()
 
 
+def _lerp_score(x, points):
+    """구간별 '계단식' 점수 대신, 지정한 (x좌표, 점수) 앵커 사이를 선형보간해
+    연속값을 반환한다. 이렇게 하면 같은 구간 안에 있다는 이유만으로 서로 다른
+    입력값(예: -12% 하락과 -34% 하락)이 완전히 동일한 점수로 뭉개지는 문제가
+    없어지고, 입력값이 조금만 달라져도 점수가 그에 비례해 미세하게 움직인다.
+
+    points: [(x0,score0), (x1,score1), ...] — x좌표 오름차순으로 정렬해서 전달.
+    x가 points의 범위를 벗어나면 양 끝 점수로 고정(clamp)한다."""
+    if x is None:
+        return points[0][1]
+    if x <= points[0][0]:
+        return float(points[0][1])
+    if x >= points[-1][0]:
+        return float(points[-1][1])
+    for (x0, s0), (x1, s1) in zip(points, points[1:]):
+        if x0 <= x <= x1:
+            if x1 == x0:
+                return float(s0)
+            ratio = (x - x0) / (x1 - x0)
+            return s0 + (s1 - s0) * ratio
+    return float(points[-1][1])
+
+
 def calc_trend_score(df_price):
-    """📈 추세 점수 (0~20) = MA 정배열(0~10) + 52주 신고가 근접도(0~6) + 추세 지속성(0~4)"""
+    """📈 추세 점수 (0~200) = MA 정배열(0~100) + 52주 신고가 근접도(0~60) + 추세 지속성(0~40)
+
+    ⚠️ [1000점 리뉴얼] 기존엔 'ma5>ma20>ma60'이면 무조건 10점, 아니면 6점 또는 2점 이런 식으로
+    딱 3단계로만 나뉘어 있었다. 그래서 정배열이 아주 살짝 무너진 경우와 완전히 역배열인 경우가
+    같은 점수로 뭉개졌다. 지금은 이동평균선 사이의 실제 이격도(%)를 연속값으로 계산해서
+    _lerp_score로 부드럽게 보간한다 — 정배열이 강할수록, 신고가에 가까울수록, 눌림 없이
+    버틴 날이 많을수록 점수가 촘촘하게 올라간다."""
     try:
         if df_price is None or df_price.empty:
-            return 10
+            return 100.0
         closes = df_price["Close"].dropna()
         if len(closes) < 20:
-            return 10
+            return 100.0
 
         ma5 = closes.tail(5).mean()
         ma20 = closes.tail(20).mean()
         ma60 = closes.tail(60).mean() if len(closes) >= 60 else ma20
         cur = closes.iloc[-1]
 
-        if ma5 > ma20 > ma60:      s_align = 10
-        elif ma5 > ma20 or ma20 > ma60: s_align = 6
-        else:                       s_align = 2
+        # MA 정배열 강도(%): ma5 vs ma20, ma20 vs ma60의 이격도를 합산 — 값이 클수록 강한 정배열
+        gap_short = (ma5 - ma20) / ma20 * 100 if ma20 else 0
+        gap_long = (ma20 - ma60) / ma60 * 100 if ma60 else 0
+        align_pct = gap_short + gap_long
+        s_align = _lerp_score(align_pct, [(-8, 10), (0, 40), (3, 70), (8, 100)])
 
         high52 = closes.max()
         if high52 > 0:
             dist = (high52 - cur) / high52 * 100
-            if dist <= 3:    s_high = 6
-            elif dist <= 10: s_high = 4
-            elif dist <= 20: s_high = 2
-            else:            s_high = 0
+            s_high = _lerp_score(dist, [(0, 60), (3, 60), (10, 40), (20, 20), (35, 0)])
         else:
-            s_high = 0
+            s_high = 0.0
 
         recent20 = closes.tail(20)
         ma20_series = closes.rolling(20).mean().reindex(recent20.index)
         above_ratio = (recent20 > ma20_series).sum() / len(recent20)
-        if above_ratio >= 0.8:   s_persist = 4
-        elif above_ratio >= 0.5: s_persist = 2
-        else:                     s_persist = 0
+        s_persist = _lerp_score(above_ratio, [(0, 0), (0.3, 10), (0.5, 20), (0.8, 40), (1.0, 40)])
 
-        return int(max(0, min(20, s_align + s_high + s_persist)))
+        return round(max(0, min(200, s_align + s_high + s_persist)), 1)
     except Exception:
-        return 10
+        return 100.0
 
 
 def calc_volume_score(df_price, exclude_today=False):
-    """📊 거래량 점수 (0~10) = 최근 거래량 ÷ 20일 평균 거래량 비율
+    """📊 거래량 점수 (0~100) = 최근 거래량 ÷ 20일 평균 거래량 비율
 
     ⚠️ [버그 수정 1] 기존에는 ratio < 0.7(오늘 거래량이 20일 평균의 70% 미만)이면
     무조건 0점으로 처리했다. 이 구간이 너무 넓어서(0%~69%가 전부 0점), 실제로는
@@ -6732,7 +6758,12 @@ def calc_volume_score(df_price, exclude_today=False):
     표시되는 문제가 있었다. 특히 삼성전자·SK하이닉스처럼 평소 거래량 절대량이
     크고 안정적인 초대형주는 평균 대비 50~65% 수준으로만 줄어도 이 넓은 0점
     구간에 자주 걸려, 다른 종목과 비교했을 때 데이터가 안 들어오는 것처럼
-    보이는 원인이 됐다. 0.4~1.0 사이를 세분화해서 이 문제를 없앴다.
+    보이는 원인이 됐다.
+
+    ⚠️ [1000점 리뉴얼] 기존 9단계 계단(ratio 0.4/0.6/0.8/1.0/1.2/1.5/2/3배 경계마다
+    점수가 뚝뚝 끊김)을 그대로 두면 배율이 조금만 달라도 같은 계단에 갇혀 점수가
+    안 움직였다. _lerp_score로 같은 경계값들 사이를 선형보간해서, ratio가 1.3배든
+    1.45배든(둘 다 예전엔 '5점' 계단에 갇힘) 배율에 비례해 촘촘하게 점수가 갈리도록 했다.
 
     ⚠️ [버그 수정 2] 장중(당일 미마감)에 조회하면 df_price의 마지막 봉은 "오늘"의
     아직 다 쌓이지 않은 누적 거래량이다. 이걸 하루 전체가 확정된 20일 평균과
@@ -6742,101 +6773,102 @@ def calc_volume_score(df_price, exclude_today=False):
     로 호출되면 마지막(당일) 봉을 빼고 확정된 전날까지의 데이터로 계산한다."""
     try:
         if df_price is None or df_price.empty or "Volume" not in df_price.columns:
-            return 5
+            return 50.0
         vol = df_price["Volume"].dropna()
         if exclude_today and len(vol) >= 6:
             vol = vol.iloc[:-1]
         if len(vol) < 5:
-            return 5
+            return 50.0
         recent = vol.iloc[-1]
         avg20 = vol.tail(20).mean() if len(vol) >= 20 else vol.mean()
         if avg20 <= 0:
-            return 5
+            return 50.0
         ratio = recent / avg20
-        if ratio >= 3:     return 10
-        elif ratio >= 2:   return 8
-        elif ratio >= 1.5: return 6
-        elif ratio >= 1.2: return 5
-        elif ratio >= 1.0: return 4
-        elif ratio >= 0.8: return 3
-        elif ratio >= 0.6: return 2
-        elif ratio >= 0.4: return 1
-        else:              return 0
+        score = _lerp_score(ratio, [
+            (0.0, 0), (0.4, 10), (0.6, 20), (0.8, 30), (1.0, 40),
+            (1.2, 50), (1.5, 60), (2.0, 80), (3.0, 100),
+        ])
+        return round(score, 1)
     except Exception:
-        return 5
+        return 50.0
 
 
 def calc_momentum_score(df_price, kospi_closes=None):
-    """🚀 모멘텀 점수 (0~10) = 최근 20일 상승률(0~8) + 코스피 대비 상대강도 RS 보너스(0~2)"""
+    """🚀 모멘텀 점수 (0~100) = 최근 20일 상승률(0~80) + 코스피 대비 상대강도 RS 보너스(0~20)
+
+    ⚠️ [1000점 리뉴얼] 기존엔 ret20 < -10%면 무조건 base=0으로 죽어서, -10.1%짜리
+    하락과 -34%짜리 폭락이 똑같은 0점으로 표시됐다(실측: 삼성전자 -17.7%, SK하이닉스
+    -34.1%가 둘 다 모멘텀 0/10). 지금은 -30% 지점까지는 하락폭에 비례해 점수가 계속
+    줄어들고, 그 밑으로 더 빠지면 0에서 바닥을 잡는다. RS 보너스도 코스피 대비
+    초과/열위 정도에 비례해 연속적으로 움직인다."""
     try:
         if df_price is None or df_price.empty:
-            return 5
+            return 50.0
         closes = df_price["Close"].dropna()
         if len(closes) < 21:
-            return 5
+            return 50.0
         ret20 = (closes.iloc[-1] / closes.iloc[-21] - 1) * 100
 
-        if ret20 >= 20:    base = 8
-        elif ret20 >= 10:  base = 6
-        elif ret20 >= 5:   base = 5
-        elif ret20 >= 0:   base = 3
-        elif ret20 >= -10: base = 1
-        else:              base = 0
+        base = _lerp_score(ret20, [
+            (-30, 0), (-10, 10), (0, 30), (5, 50), (10, 60), (20, 80),
+        ])
 
-        rs_bonus = 1  # 코스피 비교 데이터가 없을 때의 중립값
+        rs_bonus = 10.0  # 코스피 비교 데이터가 없을 때의 중립값
         if kospi_closes and len(kospi_closes) >= 21:
             kospi_ret20 = (kospi_closes[-1] / kospi_closes[-21] - 1) * 100
             diff = ret20 - kospi_ret20
-            if diff >= 10:  rs_bonus = 2
-            elif diff >= 0: rs_bonus = 1
-            else:            rs_bonus = 0
+            rs_bonus = _lerp_score(diff, [(-15, 0), (0, 10), (10, 20)])
 
-        return int(max(0, min(10, base + rs_bonus)))
+        return round(max(0, min(100, base + rs_bonus)), 1)
     except Exception:
-        return 5
+        return 50.0
 
 
 def _investor_side_score(buy_days, n, net_sum):
-    """기관 또는 외국인 한쪽의 수급 점수(0~10). 순매수일 비율과 누적 순매수 부호를 함께 본다."""
+    """기관 또는 외국인 한쪽의 수급 점수(0~100). 순매수일 비율과 누적 순매수 부호를 함께 본다.
+
+    ⚠️ [1000점 리뉴얼] 기존엔 순매수일 비율이 5단계 계단(0.3/0.5/0.7 경계)으로만
+    나뉘어 있었다. 지금은 net_sum 부호로 어느 커브를 쓸지 고른 뒤, 그 안에서
+    비율(ratio)에 비례해 연속적으로 점수를 매긴다 — 순매수 68%와 72%가 예전엔
+    같은 계단(5점)에 갇혔지만 이제는 미세하게 갈린다."""
     if n <= 0:
-        return 5
+        return 50.0
     ratio = buy_days / n
-    if net_sum > 0 and ratio >= 0.7: return 10
-    if net_sum > 0 and ratio >= 0.5: return 7
-    if net_sum > 0:                  return 5
-    if net_sum <= 0 and ratio <= 0.3: return 0
-    if net_sum <= 0:                  return 3
-    return 5
+    if net_sum > 0:
+        return _lerp_score(ratio, [(0, 30), (0.3, 40), (0.5, 70), (0.7, 100), (1.0, 100)])
+    else:
+        return _lerp_score(ratio, [(0, 0), (0.3, 0), (0.5, 30), (0.7, 50), (1.0, 60)])
 
 
 def calc_flow_score(code, days=20):
-    """💰 수급 점수 (0~20) = 기관 순매수 점수(0~10) + 외국인 순매수 점수(0~10)"""
+    """💰 수급 점수 (0~200) = 기관 순매수 점수(0~100) + 외국인 순매수 점수(0~100)"""
     try:
         df = fetch_investor_trend_by_code(code, days=days)
         if df.empty or '기관순매매' not in df.columns or '외국인순매매' not in df.columns:
-            return 10
+            return 100.0
         inst = df['기관순매매']
         frgn = df['외국인순매매']
         n = len(df)
         inst_score = _investor_side_score(int((inst > 0).sum()), n, inst.sum())
         frgn_score = _investor_side_score(int((frgn > 0).sum()), n, frgn.sum())
-        return int(max(0, min(20, inst_score + frgn_score)))
+        return round(max(0, min(200, inst_score + frgn_score)), 1)
     except Exception:
-        return 10
+        return 100.0
 
 
 def calc_financial_score_detailed(df_annual, roe):
-    """💹 재무 점수 (0~15) = ROE(0~8) + 영업이익 증가율 YoY(0~5) + EPS 흐름(0~2)"""
-    try:
-        if roe is None or roe == -999: s_roe = 4
-        elif roe >= 20: s_roe = 8
-        elif roe >= 15: s_roe = 6
-        elif roe >= 10: s_roe = 4
-        elif roe >= 5:  s_roe = 2
-        elif roe >= 0:  s_roe = 1
-        else:            s_roe = 0
+    """💹 재무 점수 (0~150) = ROE(0~80) + 영업이익 증가율 YoY(0~50) + EPS 흐름(0~20)
 
-        s_op, s_eps = 2, 1  # 데이터 없을 때의 중립값
+    ⚠️ [1000점 리뉴얼] ROE 12%와 14%가 예전엔 같은 계단(4점)에 갇혔다. 지금은
+    ROE·영업이익 증가율·EPS 증가율 모두 실제 %값을 그대로 _lerp_score에 넣어
+    연속적으로 채점한다."""
+    try:
+        if roe is None or roe == -999:
+            s_roe = 40.0
+        else:
+            s_roe = _lerp_score(roe, [(-10, 0), (0, 10), (5, 20), (10, 40), (15, 60), (20, 80)])
+
+        s_op, s_eps = 20.0, 10.0  # 데이터 없을 때의 중립값
 
         if df_annual is not None and not df_annual.empty and len(df_annual) >= 2:
             if '영업이익' in df_annual.columns:
@@ -6844,97 +6876,103 @@ def calc_financial_score_detailed(df_annual, roe):
                 latest = _to_float_safe(df_annual.iloc[-1]['영업이익'])
                 if prev not in (None, 0) and latest is not None:
                     growth = (latest - prev) / abs(prev) * 100
-                    if growth >= 20:  s_op = 5
-                    elif growth >= 10: s_op = 3
-                    elif growth >= 0:  s_op = 1
-                    else:               s_op = 0
+                    s_op = _lerp_score(growth, [(-30, 0), (0, 10), (10, 30), (20, 50)])
 
             eps_col = next((c for c in df_annual.columns if 'EPS' in str(c)), None)
             if eps_col:
                 prev_eps = _to_float_safe(df_annual.iloc[-2][eps_col])
                 latest_eps = _to_float_safe(df_annual.iloc[-1][eps_col])
                 if latest_eps is not None and latest_eps > 0:
-                    s_eps = 2 if (prev_eps is not None and latest_eps > prev_eps) else 1
+                    if prev_eps not in (None, 0):
+                        eps_growth = (latest_eps - prev_eps) / abs(prev_eps) * 100
+                        s_eps = _lerp_score(eps_growth, [(-20, 0), (0, 10), (15, 20)])
+                    else:
+                        s_eps = 15.0  # 직전 EPS가 없어 증가율은 못 구하지만 현재 EPS는 흑자
                 elif latest_eps is not None:
-                    s_eps = 0
+                    s_eps = 0.0
 
-        return int(max(0, min(15, s_roe + s_op + s_eps)))
+        return round(max(0, min(150, s_roe + s_op + s_eps)), 1)
     except Exception:
-        return 7
+        return 70.0
 
 
 def calc_valuation_score_detailed(per, pbr, roe):
-    """📉 밸류 점수 (0~10) = PER(0~5) + PBR(0~3) + PEG 근사(0~2, PER÷ROE)"""
-    try:
-        if per is None or per <= 0: s_per = 2
-        elif per <= 8:  s_per = 5
-        elif per <= 12: s_per = 4
-        elif per <= 18: s_per = 3
-        elif per <= 25: s_per = 1
-        else:            s_per = 0
+    """📉 밸류 점수 (0~100) = PER(0~50) + PBR(0~30) + PEG 근사(0~20, PER÷ROE)
 
-        if pbr is None or pbr <= 0: s_pbr = 1
-        elif pbr <= 1:   s_pbr = 3
-        elif pbr <= 1.5: s_pbr = 2
-        elif pbr <= 2.5: s_pbr = 1
-        else:             s_pbr = 0
+    ⚠️ [1000점 리뉴얼] PER 8.5배와 11.5배가 예전엔 같은 계단(4점)에 갇혔다.
+    지금은 PER·PBR·PEG 실제 값을 그대로 _lerp_score에 넣어 연속적으로 채점한다."""
+    try:
+        if per is None or per <= 0:
+            s_per = 20.0
+        else:
+            s_per = _lerp_score(per, [(8, 50), (12, 40), (18, 30), (25, 10), (40, 0)])
+
+        if pbr is None or pbr <= 0:
+            s_pbr = 10.0
+        else:
+            s_pbr = _lerp_score(pbr, [(1, 30), (1.5, 20), (2.5, 10), (4, 0)])
 
         if per and per > 0 and roe and roe != -999 and roe > 0:
             peg = per / roe
-            if peg <= 1:   s_peg = 2
-            elif peg <= 1.5: s_peg = 1
-            else:             s_peg = 0
+            s_peg = _lerp_score(peg, [(0.5, 20), (1, 20), (1.5, 10), (2.5, 0)])
         else:
-            s_peg = 1
+            s_peg = 10.0
 
-        return int(max(0, min(10, s_per + s_pbr + s_peg)))
+        return round(max(0, min(100, s_per + s_pbr + s_peg)), 1)
     except Exception:
-        return 5
+        return 50.0
 
 
 def calc_pattern_score(df_price, volume_score):
-    """🔥 AI 패턴 점수 (0~10, ⚠️ 규칙 기반 근사 휴리스틱 — 실제 ML 유사도 검색 아님)
-    = 직전 20일 저항선(고점) 돌파(0~5) + 거래량 동반(0~3) + 최근 상승 우위(0~2)"""
+    """🔥 AI 패턴 점수 (0~100, ⚠️ 규칙 기반 근사 휴리스틱 — 실제 ML 유사도 검색 아님)
+    = 직전 20일 저항선(고점) 돌파(0~50) + 거래량 동반(0~30) + 최근 상승 우위(0~20)
+
+    ⚠️ [1000점 리뉴얼] '돌파했다/안 했다', '거래량 동반이다/아니다'처럼 이분법으로
+    끊던 걸, 저항선까지 남은 거리(%)와 거래량 점수(이미 연속값) 자체를 그대로
+    보간에 사용해 연속적으로 채점하도록 바꿨다."""
     try:
         if df_price is None or df_price.empty or len(df_price) < 21:
-            return 5
+            return 50.0
         closes = df_price["Close"].dropna()
         cur = closes.iloc[-1]
         prior20_high = closes.iloc[-21:-1].max()
 
-        score = 0
-        if prior20_high > 0 and cur >= prior20_high:
-            score += 5
-        if volume_score >= 6:
-            score += 3
-        recent5 = closes.tail(6).diff().dropna()
-        if int((recent5 > 0).sum()) >= 3:
-            score += 2
+        if prior20_high > 0:
+            gap_to_high = (cur - prior20_high) / prior20_high * 100
+            score_breakout = _lerp_score(gap_to_high, [(-10, 0), (0, 35), (5, 50)])
+        else:
+            score_breakout = 0.0
 
-        return int(max(0, min(10, score)))
+        score_volume = _lerp_score(volume_score, [(0, 0), (40, 10), (60, 30), (100, 30)])
+
+        recent5 = closes.tail(6).diff().dropna()
+        up_ratio = (recent5 > 0).sum() / len(recent5) if len(recent5) else 0.5
+        score_updays = _lerp_score(up_ratio, [(0, 0), (0.5, 10), (0.6, 20)])
+
+        return round(max(0, min(100, score_breakout + score_volume + score_updays)), 1)
     except Exception:
-        return 5
+        return 50.0
 
 
 def calc_risk_score(df_price, debt):
-    """⚠️ 리스크 점수 (-5~0, 감점 전용) = 변동성(0~3 감점) + 부채비율(0~2 감점)"""
+    """⚠️ 리스크 점수 (-50~0, 감점 전용) = 변동성(0~30 감점) + 부채비율(0~20 감점)
+
+    ⚠️ [1000점 리뉴얼] 변동성 CV 5%와 7%가 예전엔 같은 감점 계단에 갇혔다.
+    지금은 CV%와 부채비율(%) 값을 그대로 보간해 감점 폭이 연속적으로 커진다."""
     try:
-        penalty = 0
+        penalty = 0.0
         if df_price is not None and not df_price.empty:
             closes = df_price["Close"].dropna().tail(20)
             if len(closes) >= 5 and closes.mean() > 0:
                 cv = (closes.std() / closes.mean()) * 100
-                if cv >= 6:   penalty += 3
-                elif cv >= 4: penalty += 2
-                elif cv >= 2: penalty += 1
+                penalty += _lerp_score(cv, [(0, 0), (2, 10), (4, 20), (6, 30)])
 
         if debt is not None and debt > 0:
-            if debt > 200:   penalty += 2
-            elif debt > 100: penalty += 1
+            penalty += _lerp_score(debt, [(0, 0), (100, 10), (200, 20)])
 
-        return -int(max(0, min(5, penalty)))
+        return -round(max(0, min(50, penalty)), 1)
     except Exception:
-        return -1
+        return -10.0
 
 
 def _last_bar_is_today_kst(df_price):
@@ -7004,10 +7042,16 @@ def _ai_score_debug_info(df_price, kospi_closes=None):
 
 
 def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=None, screener_df=None):
-    """세분화된 AI 종합점수(0~100). 8개 항목 배점을 그대로 합산한다.
+    """세분화된 AI 종합점수(0~1000). 8개 항목 배점을 그대로 합산한다.
 
-        추세(0~20) · 수급(0~20) · 거래량(0~10) · 재무(0~15) ·
-        밸류(0~10) · 모멘텀(0~10) · AI패턴(0~10) · 리스크(-5~0)
+        추세(0~200) · 수급(0~200) · 거래량(0~100) · 재무(0~150) ·
+        밸류(0~100) · 모멘텀(0~100) · AI패턴(0~100) · 리스크(-50~0)
+
+    ⚠️ [1000점 리뉴얼] 기존 100점 만점(각 항목 계단식 정수 점수)을 그대로 ×10 해서
+    보여주기만 하면 눈금 자체는 예전과 똑같아서(여전히 10점 단위로만 움직임) 숫자만
+    커 보이고 실제 정밀도는 늘지 않는다. 그래서 각 항목 계산 함수(calc_trend_score
+    등) 내부를 전부 _lerp_score 기반 연속 보간으로 다시 짜서, 만점 자체도 ×10 하고
+    동시에 입력값이 조금만 달라져도 점수가 소수점 단위로 촘촘하게 갈리도록 했다.
 
     df_annual을 미리 전달하면(재무 데이터를 이미 조회한 경우) 재조회를 생략한다."""
     code = normalize_kr_code(code)
@@ -7040,28 +7084,28 @@ def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=
     financial  = calc_financial_score_detailed(df_annual, roe)
     valuation  = calc_valuation_score_detailed(per, pbr, roe)
 
-    total = int(max(0, min(100, trend + flow + volume + financial + valuation + momentum + pattern + risk)))
+    total = int(round(max(0, min(1000, trend + flow + volume + financial + valuation + momentum + pattern + risk))))
 
     return {
         "total": total,
-        "trend": trend,         "trend_max": 20,     "trend_min": 0,
-        "flow": flow,           "flow_max": 20,      "flow_min": 0,
-        "volume": volume,       "volume_max": 10,    "volume_min": 0,
-        "financial": financial, "financial_max": 15, "financial_min": 0,
-        "valuation": valuation, "valuation_max": 10, "valuation_min": 0,
-        "momentum": momentum,   "momentum_max": 10,  "momentum_min": 0,
-        "pattern": pattern,     "pattern_max": 10,   "pattern_min": 0,
-        "risk": risk,           "risk_max": 0,       "risk_min": -5,
+        "trend": trend,         "trend_max": 200,    "trend_min": 0,
+        "flow": flow,           "flow_max": 200,     "flow_min": 0,
+        "volume": volume,       "volume_max": 100,   "volume_min": 0,
+        "financial": financial, "financial_max": 150, "financial_min": 0,
+        "valuation": valuation, "valuation_max": 100, "valuation_min": 0,
+        "momentum": momentum,   "momentum_max": 100, "momentum_min": 0,
+        "pattern": pattern,     "pattern_max": 100,  "pattern_min": 0,
+        "risk": risk,           "risk_max": 0,       "risk_min": -50,
         "debug": _ai_score_debug_info(df_price, kospi_closes),
     }
 
 
 def _ai_score_color(total):
-    if total >= 85:   return "#7C3AED"
-    elif total >= 70: return "#2563EB"
-    elif total >= 55: return "#16A34A"
-    elif total >= 40: return "#D97706"
-    else:             return "#DC2626"
+    if total >= 850:   return "#7C3AED"
+    elif total >= 700: return "#2563EB"
+    elif total >= 550: return "#16A34A"
+    elif total >= 400: return "#D97706"
+    else:               return "#DC2626"
 
 def _fmt_shares(v):
     v = abs(v)
@@ -7361,11 +7405,11 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
     detailed = calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div)
     total = detailed["total"]
 
-    if total >= 85:   total_color = "#7C3AED"; total_label = "최우량"
-    elif total >= 70: total_color = "#2563EB"; total_label = "우량"
-    elif total >= 55: total_color = "#16A34A"; total_label = "양호"
-    elif total >= 40: total_color = "#D97706"; total_label = "보통"
-    else:             total_color = "#DC2626"; total_label = "주의"
+    if total >= 850:   total_color = "#7C3AED"; total_label = "최우량"
+    elif total >= 700: total_color = "#2563EB"; total_label = "우량"
+    elif total >= 550: total_color = "#16A34A"; total_label = "양호"
+    elif total >= 400: total_color = "#D97706"; total_label = "보통"
+    else:               total_color = "#DC2626"; total_label = "주의"
 
     grade_badge = (
         f'<span style="font-size:11px; background:#EEF2FF; color:#4F46E5; '
@@ -7382,7 +7426,9 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         elif ratio >= 0.5:  bar_color = "#16A34A"
         elif ratio >= 0.35: bar_color = "#D97706"
         else:               bar_color = "#DC2626"
-        label = f"{score}/{max_val}" if min_val == 0 else f"{score}점"
+        # 세부 항목은 이제 연속값(소수점)이라, 소수 1자리까지 보여줘서 새로 생긴
+        # 정밀도가 실제로 눈에 보이게 한다(예: "62.4/100" vs 예전의 "6/10").
+        label = f"{score:.1f}/{max_val}" if min_val == 0 else f"{score:.1f}점"
         return (
             '<div style="display:flex; align-items:center; gap:10px; margin-bottom:8px;">'
             '<div style="width:52px; font-size:12px; color:#64748B; text-align:right;">' + label + '</div>'
@@ -7415,7 +7461,7 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         '<div style="display:flex; align-items:center; gap:12px; margin-bottom:14px;">'
         '<div style="text-align:center;">'
         '<div style="font-size:32px; font-weight:900; color:' + total_color + '; line-height:1;">' + str(total) + '</div>'
-        '<div style="font-size:11px; color:#94A3B8;">/ 100점</div>'
+        '<div style="font-size:11px; color:#94A3B8;">/ 1000점</div>'
         '</div>'
         '<div>'
         '<div style="font-size:14px; font-weight:700; color:#0F172A;">AI 종합 점수' + grade_badge + '</div>'
