@@ -7726,6 +7726,97 @@ def _build_ai_comment(name, code, per, pbr, roe, debt, drop_pct, div, scores, to
 
     return sections
 
+def _score_one_for_ai_batch(code, per, pbr, roe, debt, drop_pct, div):
+    """AI 종합점수(1000점 만점 중 total)만 뽑아내는 배치 계산용 래퍼. 실패해도 배치
+    전체가 죽지 않도록 예외를 삼키고 None을 반환한다."""
+    try:
+        return calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div)["total"]
+    except Exception:
+        return None
+
+
+def _render_ai_grade_filter_and_score(display_df, source_df):
+    """[AI 등급 필터] 저평가 등급(S~D) 필터와 완전히 독립된 두 번째 축으로 AI
+    종합점수 등급을 추가한다. AND 조건으로 나란히 적용되며, 어느 한쪽 때문에
+    다른 쪽 후보군이 미리 줄어들지 않는다.
+
+    ⚠️ [설계 배경] AI 종합점수 하나 계산하려면 종목당 df_price(야후)·수급(네이버)·
+    재무(크롤링) 이렇게 최소 3번의 외부 호출이 필요하다. 저평가 등급 필터처럼
+    이미 받아온 데이터로 즉석 계산할 수 있는 게 아니라서, 후보 전체(많으면 150개
+    안팎)에 한 번에 다 걸면 스캔 자체보다 훨씬 무거운 부하가 생긴다. 그래서
+    "S/A/B만 먼저 거르고 그 안에서 AI 점수"가 아니라, 두 필터를 나란히 두되
+    AI 점수는 세션 캐시에 종목코드별로 한 번만 계산해 재사용하고, 아직 캐시에
+    없는 종목은 render_async_multi로 화면 뒤에서 배치(BATCH_SIZE개씩) 계산하며
+    점진적으로 채운다 — 이미 워치리스트 프리페치(_wl_bg_jobs)·대시보드 비동기
+    로딩에서 쓰던 것과 동일한 패턴이다.
+
+    source_df : load_reco_df()가 반환한 '필터링 전' 원본 DataFrame. display_df는
+    매 rerun마다 .copy()+필터링으로 새로 만들어져 id()가 매번 바뀌므로, "새 스캔이
+    돌았는지"는 반드시 이 원본 객체의 identity로 판단해야 한다.
+
+    반환값: (score_map, still_loading)
+      score_map     : {종목코드: AI총점 or None(계산 실패)} — 지금까지 확인된 것만
+      still_loading : 아직 계산 안 끝난 종목이 남아있으면 True (안내 문구 표시용)"""
+    BATCH_SIZE = 20
+
+    # 새 스캔으로 reco_df 자체가 바뀌면(원본 객체 identity 변화) 캐시를 비운다 —
+    # 옛 스캔의 AI 점수를 새 스캔 결과에 잘못 재사용하는 것을 막기 위함.
+    _df_id = id(source_df)
+    if st.session_state.get('_reco_ai_cache_df_id') != _df_id:
+        st.session_state['_reco_ai_cache_df_id'] = _df_id
+        st.session_state['_reco_ai_score_cache'] = {}
+
+    cache = st.session_state.setdefault('_reco_ai_score_cache', {})
+
+    codes_needed = [str(c).zfill(6) for c in display_df['종목코드']]
+    unscored_rows = [row for _, row in display_df.iterrows()
+                      if str(row['종목코드']).zfill(6) not in cache]
+
+    if unscored_rows:
+        batch = unscored_rows[:BATCH_SIZE]
+        batch_codes = [str(r['종목코드']).zfill(6) for r in batch]
+
+        def _submit_ai_batch():
+            executor = get_shared_executor()
+            futures = {}
+            for r in batch:
+                c = str(r['종목코드']).zfill(6)
+                futures[c] = submit_with_ctx(
+                    executor, _score_one_for_ai_batch, c,
+                    r['PER'], r['PBR'], r['ROE'], r['부채비율'],
+                    r['고점 / 하락률'], r.get('배당수익률', 0.0),
+                )
+            return futures
+
+        def _collect_ai_batch(futures):
+            out = {}
+            for c, f in futures.items():
+                if f.done():
+                    try:
+                        out[c] = f.result(timeout=0.1)
+                    except Exception:
+                        out[c] = None
+            return out
+
+        # ready 여부와 무관하게 지금까지 끝난 만큼만 받아 캐시에 반영한다(완전히
+        # 끝날 때까지 화면 전체를 막지 않는다). 아직 안 끝난 건 다음 rerun에서
+        # maybe_run_global_poller()가 자동으로 다시 폴링해준다(render_async_multi가
+        # _bg_jobs에 등록해두므로).
+        partial, _ready = render_async_multi(
+            job_key=f"reco_ai_batch_{'-'.join(batch_codes)}",
+            submit_fn=_submit_ai_batch,
+            collect_fn=_collect_ai_batch,
+            default_result={},
+            spinner_text=f"AI 종합점수 계산 중 ({len(batch)}건)...",
+            overall_timeout=20,
+        )
+        cache.update(partial)
+
+    score_map = {c: cache.get(c) for c in codes_needed}
+    still_loading = any(c not in cache for c in codes_needed)
+    return score_map, still_loading
+
+
 def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_label):
     # 💬 AI 코멘트(강점/약점 서술)는 기존 4항목(건전성/성장성/수익성/배당) 로직을 그대로 쓴다.
     # 화면에 보이는 점수판/총점은 아래 8항목 세분화(calc_ai_scores_detailed)가 "공식" 값이며,
@@ -8062,6 +8153,22 @@ def render_recommendations():
         if selected_grade is None:
             selected_grade = "전체보기"
 
+        # ── [AI 등급 필터] 저평가 등급(S~D, 위 selected_grade)과는 완전히 독립된
+        # 두 번째 필터 축. "S/A/B만 먼저 거르고 그 안에서 AI 점수"가 아니라, 두
+        # 필터를 나란히 두고 AND로 조합한다 — S/A/B급만 되면 후보 자체가 너무
+        # 적어지는 문제를 피하기 위해, 등급 필터는 '전체보기'로 둔 채 AI 점수만으로도
+        # 거를 수 있게 한다. (자세한 이유는 _render_ai_grade_filter_and_score 참고)
+        ai_grade_filter = st.pills(
+            "AI 등급 필터",
+            ["전체보기", "500+", "600+", "700+", "800+"],
+            default="전체보기",
+            label_visibility="collapsed",
+            key="reco_ai_grade_pills",
+            help="AI 종합점수(1000점 만점, 추세·수급·거래량·재무·밸류·모멘텀·패턴·리스크 종합)로 필터링합니다. 저평가 등급 필터와 별개로 동시에 적용됩니다.",
+        )
+        if ai_grade_filter is None:
+            ai_grade_filter = "전체보기"
+
         def assign_grade(row, is_strict):
             per, pbr, roe, debt, drop, div = row['PER'], row['PBR'], row['ROE'], row['부채비율'], row['고점 / 하락률'], row['배당수익률']
             
@@ -8094,16 +8201,35 @@ def render_recommendations():
             grade_key = selected_grade.split()[1] 
             display_df = display_df[display_df['등급'].str.contains(grade_key)]
 
+        _ai_score_map = {}
+        _ai_still_loading = False
+        if ai_grade_filter != "전체보기":
+            _ai_min_score = {"500+": 500, "600+": 600, "700+": 700, "800+": 800}[ai_grade_filter]
+            _ai_score_map, _ai_still_loading = _render_ai_grade_filter_and_score(display_df, _reco_df)
+            display_df = display_df[
+                display_df['종목코드'].apply(
+                    lambda c: (_ai_score_map.get(str(c).zfill(6)) or -1) >= _ai_min_score
+                )
+            ]
+
         display_df = display_df.sort_values('고점 / 하락률', ascending=True).reset_index(drop=True)
 
         username = st.session_state.get("auth_user")
 
+        if _ai_still_loading:
+            st.caption("⏳ 일부 종목은 AI 종합점수를 아직 계산 중입니다 — 계산이 끝나는 대로 조건에 맞으면 자동으로 목록에 추가됩니다.")
+
         if display_df.empty:
-            st.info(f"현재 설정된 필터({market_filter}, {selected_grade})에 부합하는 종목이 없습니다. 조건을 완화해보세요.")
+            st.info(f"현재 설정된 필터({market_filter}, {selected_grade}, AI {ai_grade_filter})에 부합하는 종목이 없습니다. 조건을 완화해보세요.")
         else:
             PAGE_SIZE = 15
             total_n = len(display_df)
-            _reco_filter_sig = (market_filter, strict_debt, selected_grade, total_n)
+            # ⚠️ total_n을 시그니처에 넣지 않는다 — AI 등급 필터가 점진적으로 채워지는
+            # 동안(백그라운드 계산이 끝날 때마다) total_n이 계속 바뀌는데, 그때마다
+            # "결과 보기"가 리셋돼 화면이 계속 접혔다 펼쳐지는 부작용이 생긴다. 대신
+            # len(_reco_df)(원본 후보 개수, 새 스캔이 돌기 전까진 불변)로 "새 스캔이
+            # 돌았는지"만 판단한다.
+            _reco_filter_sig = (market_filter, strict_debt, selected_grade, ai_grade_filter, len(_reco_df))
             if st.session_state.get('_reco_filter_sig') != _reco_filter_sig:
                 st.session_state['_reco_filter_sig'] = _reco_filter_sig
                 st.session_state['_reco_shown'] = False
@@ -8138,6 +8264,13 @@ def render_recommendations():
                     div = row.get('배당수익률', 0.0)
                     grade_label = row['등급']
                     source_badge = row.get('데이터출처', '🌐 실시간')
+                    _ai_score_val = _ai_score_map.get(code)
+                    ai_score_badge_html = (
+                        f'<span style="font-size:10px; font-weight:700; color:#4F46E5; background:#EEF2FF; '
+                        f'border: 1px solid #C7D2FE; padding:2px 7px; border-radius:8px; margin-left:6px;">'
+                        f'🤖 AI {int(_ai_score_val)}</span>'
+                        if _ai_score_val is not None else ''
+                    )
 
                     entry_2nd, entry_3rd = calc_entry_points(price, pbr, drop_pct, price)
                     entry_2nd_pct = round((entry_2nd / price - 1) * 100, 1) if price else 0.0
@@ -8185,7 +8318,7 @@ def render_recommendations():
                                         <span style="font-size:15px; font-weight:700; color:#0F172A;">{name}</span>
                                         <span style="font-size:11px; color:#94A3B8; margin-left:6px;">{code} | {market_str}</span>
                                         <span style="font-size:11px; font-weight:700; color:#111827; background:#FFFFFF; border: 1px solid #D1D5DB; padding:2px 10px; border-radius:10px; margin-left:8px;">{grade_label}</span>
-                                        <span style="font-size:10px; color:#94A3B8; background:#F1F5F9; border: 1px solid #E2E8F0; padding:2px 7px; border-radius:8px; margin-left:6px;">{source_badge}</span>
+                                        <span style="font-size:10px; color:#94A3B8; background:#F1F5F9; border: 1px solid #E2E8F0; padding:2px 7px; border-radius:8px; margin-left:6px;">{source_badge}</span>{ai_score_badge_html}
                                     </div>
                                     <div style="text-align:right;">
                                         <span style="font-size:15px; font-weight:700; color:#0F172A;">{int(price):,}</span>
