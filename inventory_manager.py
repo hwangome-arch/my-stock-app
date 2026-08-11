@@ -7183,6 +7183,23 @@ def _ai_score_debug_info(df_price, kospi_closes=None, debt=None, drop_pct=None):
             info["부채비율"] = f"{debt:.1f}%"
         if drop_pct is not None and drop_pct != 0.0:
             info["52주 고점대비(스크리너 기준)"] = f"{drop_pct:+.1f}%"
+
+        # ⚠️ [투명성 강화] calc_risk_score 내부의 폴백 로직과 완전히 동일한 계산을 여기서도
+        # 그대로 수행해서, "리스크 점수가 실제로 어떤 하락폭 값·어떤 출처를 썼는지"를
+        # 화면에서 바로 확인할 수 있게 했다. 예전엔 최종 리스크 점수를 손으로 역산해야만
+        # 폴백이 진짜 작동했는지 알 수 있었다.
+        _effective_drop = drop_pct
+        _drop_source = "스크리너"
+        if _effective_drop is None or _effective_drop == 0.0:
+            _drop_source = "df_price 폴백"
+            if len(closes) > 0:
+                _high52 = closes.max()
+                if _high52 > 0:
+                    _effective_drop = (closes.iloc[-1] - _high52) / _high52 * 100
+        if _effective_drop is None or _effective_drop == 0.0:
+            info["리스크에 실제로 쓰인 하락폭"] = "값 없음 → 중립값(5점 감점) 적용"
+        else:
+            info["리스크에 실제로 쓰인 하락폭"] = f"{_effective_drop:+.1f}%  (출처: {_drop_source})"
     except Exception:
         info["오류"] = "진단 정보 계산 중 문제가 발생했습니다."
     return info
