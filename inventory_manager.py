@@ -7554,6 +7554,17 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         f'{grade_label}</span>'
     ) if grade_label else ""
 
+    CATEGORY_HELP = {
+        "추세":   "MA 정배열 강도(0~100) + 52주 신고가 근접도(0~60) + 추세 지속성(0~40)을 더합니다. 이동평균선이 위로 잘 정렬돼 있고 고점에 가까울수록 높습니다.",
+        "수급":   "최근 20일간 기관·외국인 순매수 비율과 방향을 각각 0~100점씩 채점해 더합니다(최대 200). 두 주체 모두 꾸준히 순매수 중이면 높습니다.",
+        "거래량": "당일 거래량이 20일 평균보다 얼마나 튀었는지(스파이크, 0~60) + 최근 5일 평균이 얼마나 이어지는지(지속성, 0~40)를 봅니다. 하루짜리 반짝 거래량과 며칠째 이어지는 증가세를 구분합니다.",
+        "재무":   "ROE(0~80) + 영업이익 증가율 YoY(0~50) + EPS 흐름(0~20) + 부채비율 건전성(0~30)을 더합니다. 수익성이 좋고 부채가 낮을수록 높습니다.",
+        "밸류":   "PER(0~50) + PBR(0~30) + PEG 근사(PER÷ROE, 0~20) + 배당수익률(0~20)을 더합니다. 이익·자산 대비 저평가돼 있고 배당이 높을수록 높습니다.",
+        "모멘텀": "5일(0~20) + 20일(0~40) + 60일(0~20) 수익률 + 코스피 대비 상대강도 RS 보너스(0~20)를 더합니다. 단기·중기·장기 모두 오르는 중이고 지수보다 잘 버틸수록 높습니다.",
+        "AI패턴": "⚠️ 과거 급등 사례에서 흔히 보이는 규칙(저항선 돌파·거래량 동반·최근 상승 우위)을 조합한 근사 휴리스틱입니다. 실제 유사도 검색이나 매매 신호가 아닙니다.",
+        "리스크": "감점 전용 항목입니다. 일별 등락률 변동성(0~30) + 부채비율(0~20, 60% 이하는 감점 없음) + 52주 고점대비 하락폭(0~20) + 최근 연속 하락일수(0~10)를 감점으로 뺍니다.",
+    }
+
     def score_bar(score, max_val, min_val=0):
         rng = max_val - min_val
         ratio = (score - min_val) / rng if rng else 1.0
@@ -7585,15 +7596,40 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         ("⚠️", "리스크",   detailed["risk"],       detailed["risk_max"],       detailed["risk_min"]),
     ]
 
+    def _tooltip_label(icon, label):
+        help_text = CATEGORY_HELP.get(label, "")
+        return (
+            '<span class="ai-tip-wrap">' + icon + ' ' + label +
+            '<span class="ai-tip-icon">?</span>'
+            '<span class="ai-tip-box">' + help_text + '</span>'
+            '</span>'
+        )
+
     cat_cards = "".join(
         '<div style="background:#FFFFFF; border:1px solid #E2E8F0; border-radius:8px; padding:10px 12px;">'
-        f'<div style="font-size:11px; color:#94A3B8; margin-bottom:4px;">{icon} {label}</div>'
+        f'<div style="font-size:11px; color:#94A3B8; margin-bottom:4px;">{_tooltip_label(icon, label)}</div>'
         + score_bar(val, max_v, min_v) +
         '</div>'
         for icon, label, val, max_v, min_v in categories
     )
 
+    TOOLTIP_CSS = (
+        '<style>'
+        '.ai-tip-wrap{position:relative; display:inline-flex; align-items:center; cursor:help;}'
+        '.ai-tip-icon{margin-left:4px; font-size:9px; color:#94A3B8; border:1px solid #CBD5E1; '
+        'border-radius:50%; width:12px; height:12px; display:inline-flex; align-items:center; '
+        'justify-content:center; line-height:1;}'
+        '.ai-tip-wrap .ai-tip-box{visibility:hidden; opacity:0; transition:opacity 0.15s ease; '
+        'position:absolute; z-index:80; bottom:135%; left:0; width:210px; max-width:60vw; '
+        'background:#0F172A; color:#F1F5F9; font-size:11px; font-weight:400; line-height:1.5; '
+        'padding:8px 10px; border-radius:6px; box-shadow:0 6px 16px rgba(0,0,0,0.25); '
+        'white-space:normal; text-align:left;}'
+        '.ai-tip-wrap:hover .ai-tip-box{visibility:visible; opacity:1;}'
+        '</style>'
+    )
+
     html = (
+        TOOLTIP_CSS +
         '<div style="background:#FAFBFF; border:1px solid #C7D2FE; border-radius:10px; padding:18px 20px; margin-top:12px;">'
         '<div style="display:flex; align-items:center; gap:12px; margin-bottom:14px;">'
         '<div style="text-align:center;">'
