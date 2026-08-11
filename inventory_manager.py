@@ -7038,6 +7038,15 @@ def calc_risk_score(df_price, debt, drop_pct=None):
     가까울수록 가점을 주는 '현재 추세 강도' 관점이라 여기의 '하락폭이 클수록 감점'하는
     하방 리스크 관점과는 결이 다르다 — 같은 값의 중복 반영이 아니다.)
 
+    ⚠️ [의존성 제거] drop_pct는 원래 관리자가 KRX 52주 고점 CSV를 수동으로 업로드해야만
+    채워지는 스크리너 값이라, 업로드를 안 했거나 스크리너에 없는 종목이면 늘 '데이터
+    없음' 중립값(5점)으로 빠졌다. 그런데 이 함수는 df_price(최근 1년치 일봉)를 이미
+    받고 있고, 여기서 직접 52주 고점을 계산할 수 있다 — 실제로 추세 점수·디버그
+    패널은 이미 이 방법을 쓰고 있었다. 그래서 스크리너 값이 없을 땐 df_price의 최근
+    1년 종가 최고치 기준으로 52주 고점대비를 자체 계산해서 대신 쓰도록 폴백을
+    추가했다. 이제 리스크 점수의 하락폭 반영은 스크리너 업로드 여부와 무관하게
+    항상 동작한다.
+
     ⚠️ [버그 수정] 부채비율 감점이 예전엔 0%부터 바로 시작해서([(0,0),(100,10),(200,20)]),
     부채비율 20~30%처럼 통상 '안정권'으로 보는 건전한 수준도 조금씩 감점을 먹고 있었다.
     재무 점수 쪽 부채 가점 곡선은 이미 '30% 이하는 우량'으로 보는데 리스크 쪽만 다른
@@ -7059,10 +7068,21 @@ def calc_risk_score(df_price, debt, drop_pct=None):
         if debt is not None and debt > 0:
             penalty += _lerp_score(debt, [(0, 0), (60, 0), (100, 8), (150, 15), (200, 20), (300, 20)])
 
-        if drop_pct is None or drop_pct == 0.0:
-            penalty += 5.0  # 데이터 없을 때의 중립값
+        effective_drop_pct = drop_pct
+        if effective_drop_pct is None or effective_drop_pct == 0.0:
+            # 스크리너 값이 없으면 df_price(최근 1년 종가)로 직접 52주 고점대비를 계산해
+            # 대신 쓴다. 디버그 패널의 "52주 고점 대비" 줄과 같은 기준(종가 최고가)을
+            # 써서, 화면에 보이는 검증용 수치와 실제 계산에 쓰이는 값이 항상 일치하도록
+            # 맞췄다(calc_trend_score의 52주 고점 근접도 계산과도 동일 기준).
+            if closes is not None and len(closes) > 0:
+                high52 = closes.max()
+                if high52 > 0:
+                    effective_drop_pct = (closes.iloc[-1] - high52) / high52 * 100
+
+        if effective_drop_pct is None or effective_drop_pct == 0.0:
+            penalty += 5.0  # df_price조차 없어서 진짜 아무 데이터도 못 구했을 때의 중립값
         else:
-            penalty += _lerp_score(drop_pct, [(-60, 20), (-40, 14), (-20, 6), (-10, 2), (0, 0)])
+            penalty += _lerp_score(effective_drop_pct, [(-60, 20), (-40, 14), (-20, 6), (-10, 2), (0, 0)])
 
         if closes is not None and len(closes) >= 6:
             diffs = closes.tail(6).diff().dropna()
