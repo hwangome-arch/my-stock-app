@@ -3151,6 +3151,42 @@ def load_high52_map():
     except:
         return {}
 
+def _fetch_trading_value_eok(code, price):
+    """오늘 누적 거래량을 조회해 '거래대금(억원) 추정치'를 반환한다. 최소 유동성
+    필터(MIN_TRADING_VALUE_EOK)에 쓰기 위한 값이다.
+
+    ⚠️ [검증 필요] 이 realtime 엔드포인트는 이 코드베이스에서 지수(KOSPI/KOSDAQ)
+    거래량 조회에만 검증된 상태로 쓰이고 있었고(fetch_market_index_table 참고),
+    개별 종목 코드에 대해서도 같은 응답 형식을 주는지는 실제 배포 환경에서
+    한 번 확인이 필요하다. 그래서 이 함수는 반드시 '실패하면 None'을 반환하도록
+    설계했다 — 호출부(필터)는 None이면 그 종목을 걸러내지 않고 통과시킨다
+    (fail-open). 필드명이 실제와 다르거나 API가 막혀 있어도 '멀쩡한 종목이
+    필터 때문에 사라지는' 최악의 상황은 피하기 위함이다.
+    거래대금은 정확한 VWAP이 아니라 '누적 거래량 × 현재가'로 근사한 값이다."""
+    try:
+        vol_headers = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://m.stock.naver.com/'}
+        vol_url = f"https://polling.finance.naver.com/api/realtime/domestic/stock/{code}"
+        vres = requests.get(vol_url, headers=vol_headers, timeout=3)
+        vpayload = vres.json()
+        vdatas = vpayload.get("datas") or []
+        vdata = vdatas[0] if vdatas else {}
+        vol_raw = vdata.get("accumulatedTradingVolumeRaw", None)
+        if vol_raw in (None, ""):
+            vol_raw = re.sub(r"[^\d]", "", str(vdata.get("accumulatedTradingVolume", ""))) or None
+        if vol_raw and price > 0:
+            volume = int(str(vol_raw).replace(',', ''))
+            return round(volume * price / 1e8, 1)  # 억원 단위
+    except Exception:
+        pass
+    return None
+
+
+# 최소 유동성 기준. 일평균(오늘 누적) 거래대금이 이 값(억원) 미만이면 추천 후보에서
+# 제외한다. 다만 위 함수가 None(조회 실패/미검증)을 반환한 종목은 판단 근거가 없으므로
+# 걸러내지 않고 통과시킨다 — 값을 확실히 구한 경우에만 필터를 적용한다.
+MIN_TRADING_VALUE_EOK = 10.0
+
+
 def check_naver_52w_robust(row_dict):
     code = str(row_dict['종목코드']).replace('.0','').zfill(6)
     mkt = row_dict.get('시장', '코스피')
@@ -3172,6 +3208,7 @@ def check_naver_52w_robust(row_dict):
                 "현재가_num": price, "52주최고": high, "고점 / 하락률": drop_pct,
                 "PER": row_dict['PER'], "PBR": row_dict['PBR'], "ROE": row_dict['ROE'],
                 "부채비율": row_dict['부채비율'], "배당수익률": row_dict.get('배당수익률', 0.0),
+                "거래대금(억원)": _fetch_trading_value_eok(code, price),
                 "데이터출처": "📂 스크리너 연동"
             }
         return None  
@@ -3216,6 +3253,7 @@ def check_naver_52w_robust(row_dict):
                 "현재가_num": price, "52주최고": high, "고점 / 하락률": drop_pct,
                 "PER": row_dict['PER'], "PBR": row_dict['PBR'], "ROE": row_dict['ROE'],
                 "부채비율": row_dict['부채비율'], "배당수익률": row_dict.get('배당수익률', 0.0),
+                "거래대금(억원)": _fetch_trading_value_eok(code, price),
                 "데이터출처": "🌐 실시간 보완"
             }
     return None
@@ -3358,6 +3396,20 @@ def _unified_scan_worker(job_id):
     finally:
         for f in _futures:
             f.cancel()
+
+    # ── [최소 유동성 필터] 거래대금(억원)을 확실히 구한 종목 중, MIN_TRADING_VALUE_EOK
+    # 미만인 종목은 추천 후보에서 제외한다. "삼전·SK하이닉스처럼 원래 거래가 큰
+    # 종목도 거래량 점수는 낮게 나올 수 있다"는 것과는 별개로, 실제로 하루 거래대금이
+    # 너무 작아 사고팔기 어려운 초소형주는 지표가 아무리 좋아도 추천 의미가 적다는
+    # 판단에서 추가했다. _fetch_trading_value_eok가 값을 못 구해 None을 반환한
+    # 종목은 걸러내지 않는다(fail-open) — 조회 실패를 "유동성 부족"으로 오인해
+    # 멀쩡한 종목을 지워버리는 상황을 피하기 위함이다.
+    before_n = len(rows)
+    rows = [r for r in rows
+            if r.get("거래대금(억원)") is None or r["거래대금(억원)"] >= MIN_TRADING_VALUE_EOK]
+    filtered_n = before_n - len(rows)
+    if filtered_n > 0:
+        _DEBUG_STORE["_reco_liquidity_filtered_count"] = filtered_n
 
     set_progress("✨ 스캔 완료! (스크리너 + 추천 종목 데이터가 함께 갱신되었습니다)", 100)
     state["done"] = True
