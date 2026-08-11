@@ -6720,13 +6720,24 @@ def _lerp_score(x, points):
 
 
 def calc_trend_score(df_price):
-    """📈 추세 점수 (0~200) = MA 정배열(0~100) + 52주 신고가 근접도(0~60) + 추세 지속성(0~40)
+    """📈 추세 점수 (0~200) = MA 정배열 강도(0~130) + 추세 지속성(0~70)
 
     ⚠️ [1000점 리뉴얼] 기존엔 'ma5>ma20>ma60'이면 무조건 10점, 아니면 6점 또는 2점 이런 식으로
     딱 3단계로만 나뉘어 있었다. 그래서 정배열이 아주 살짝 무너진 경우와 완전히 역배열인 경우가
     같은 점수로 뭉개졌다. 지금은 이동평균선 사이의 실제 이격도(%)를 연속값으로 계산해서
-    _lerp_score로 부드럽게 보간한다 — 정배열이 강할수록, 신고가에 가까울수록, 눌림 없이
-    버틴 날이 많을수록 점수가 촘촘하게 올라간다."""
+    _lerp_score로 부드럽게 보간한다 — 정배열이 강할수록, 눌림 없이 버틴 날이 많을수록
+    점수가 촘촘하게 올라간다.
+
+    ⚠️ [방향 충돌 수정] 원래 여기 있던 '52주 신고가 근접도(0~60)'는 "52주 고점에
+    가까울수록 가점"이었는데, 리스크 점수 쪽의 "52주 고점 대비 하락폭이 클수록
+    감점"과 사실상 같은 정보(52주 고점 대비 현재 위치)를 담당하고 있었다. 문제는
+    이 앱의 추천 엔진 목표 자체가 "52주 고점 대비 유의미하게 하락해 안전마진이
+    확보된 종목을 찾는 것"인데, 정작 점수 시스템은 "많이 빠진 종목"에게 추세에서
+    가점을 못 주고 리스크에서 감점까지 이중으로 주고 있어 엔진 철학과 배점이
+    반대로 가는 구조였다. 52주 고점 대비 위치는 이제 리스크 점수 한 곳에서만
+    다루도록 여기서는 제거하고, 비어난 60점만큼을 MA 정배열(100→130)·지속성
+    (40→70)에 비례 재배분했다 — '현재 추세가 얼마나 강하고 꾸준한가'라는 이 함수
+    본연의 역할에만 집중한다."""
     try:
         if df_price is None or df_price.empty:
             return 100.0
@@ -6737,27 +6748,19 @@ def calc_trend_score(df_price):
         ma5 = closes.tail(5).mean()
         ma20 = closes.tail(20).mean()
         ma60 = closes.tail(60).mean() if len(closes) >= 60 else ma20
-        cur = closes.iloc[-1]
 
         # MA 정배열 강도(%): ma5 vs ma20, ma20 vs ma60의 이격도를 합산 — 값이 클수록 강한 정배열
         gap_short = (ma5 - ma20) / ma20 * 100 if ma20 else 0
         gap_long = (ma20 - ma60) / ma60 * 100 if ma60 else 0
         align_pct = gap_short + gap_long
-        s_align = _lerp_score(align_pct, [(-8, 10), (0, 40), (3, 70), (8, 100)])
-
-        high52 = closes.max()
-        if high52 > 0:
-            dist = (high52 - cur) / high52 * 100
-            s_high = _lerp_score(dist, [(0, 60), (3, 60), (10, 40), (20, 20), (35, 0)])
-        else:
-            s_high = 0.0
+        s_align = _lerp_score(align_pct, [(-8, 13), (0, 52), (3, 91), (8, 130)])
 
         recent20 = closes.tail(20)
         ma20_series = closes.rolling(20).mean().reindex(recent20.index)
         above_ratio = (recent20 > ma20_series).sum() / len(recent20)
-        s_persist = _lerp_score(above_ratio, [(0, 0), (0.3, 10), (0.5, 20), (0.8, 40), (1.0, 40)])
+        s_persist = _lerp_score(above_ratio, [(0, 0), (0.3, 17.5), (0.5, 35), (0.8, 70), (1.0, 70)])
 
-        return round(max(0, min(200, s_align + s_high + s_persist)), 1)
+        return round(max(0, min(200, s_align + s_persist)), 1)
     except Exception:
         return 100.0
 
@@ -6862,24 +6865,50 @@ def calc_momentum_score(df_price, kospi_closes=None):
         return 50.0
 
 
-def _investor_side_score(buy_days, n, net_sum):
-    """기관 또는 외국인 한쪽의 수급 점수(0~100). 순매수일 비율과 누적 순매수 부호를 함께 본다.
+def _investor_side_score(buy_days, n, net_sum, avg_volume=None):
+    """기관 또는 외국인 한쪽의 수급 점수(0~100)
+       = 순매수일 비율 기반 지속성(0~80) + 순매수 강도(0~20, NEW)
 
     ⚠️ [1000점 리뉴얼] 기존엔 순매수일 비율이 5단계 계단(0.3/0.5/0.7 경계)으로만
     나뉘어 있었다. 지금은 net_sum 부호로 어느 커브를 쓸지 고른 뒤, 그 안에서
     비율(ratio)에 비례해 연속적으로 점수를 매긴다 — 순매수 68%와 72%가 예전엔
-    같은 계단(5점)에 갇혔지만 이제는 미세하게 갈린다."""
+    같은 계단(5점)에 갇혔지만 이제는 미세하게 갈린다.
+
+    ⚠️ [버그 수정] '순매수한 날의 비율'과 '순매수 금액(규모)의 크기'가 구분이 안
+    됐다. 20일 중 15일 순매수라는 결과만 같으면, 하루 평균 거래량의 0.5%만
+    순매수한 종목과 하루 평균 거래량의 8%씩 순매수한 종목이 거의 같은 점수를
+    받았다 — 실제 수급 강도는 후자가 훨씬 강한데도 구분이 안 됨. 이 함수는 네이버
+    페이지에서 '수량(주)'만 주고 금액(원)은 안 주기 때문에, 종목마다 다른 거래량
+    규모를 감안해 절대 수량 대신 '평균 거래량 대비 하루 평균 순매수 비중(%)'을
+    강도 지표로 쓴다 — 대형주/소형주 상관없이 같은 기준으로 비교 가능하다.
+    avg_volume(최근 N일 평균 거래량)을 못 구하면 강도 항목은 중립값(10)으로 채운다."""
     if n <= 0:
         return 50.0
     ratio = buy_days / n
+
+    # 지속성(0~80): 기존 커브를 그대로 쓰되, 강도(0~20)를 더할 자리를 만들기 위해
+    # 만점을 100→80으로 비례 축소했다 (순서/구간 경계는 기존과 동일하게 유지).
     if net_sum > 0:
-        return _lerp_score(ratio, [(0, 30), (0.3, 40), (0.5, 70), (0.7, 100), (1.0, 100)])
+        s_persist = _lerp_score(ratio, [(0, 24), (0.3, 32), (0.5, 56), (0.7, 80), (1.0, 80)])
     else:
-        return _lerp_score(ratio, [(0, 0), (0.3, 0), (0.5, 30), (0.7, 50), (1.0, 60)])
+        s_persist = _lerp_score(ratio, [(0, 0), (0.3, 0), (0.5, 24), (0.7, 40), (1.0, 48)])
+
+    if avg_volume and avg_volume > 0 and n > 0:
+        avg_daily_net = net_sum / n
+        intensity_pct = avg_daily_net / avg_volume * 100
+        s_intensity = _lerp_score(intensity_pct, [(-10, 0), (-3, 6), (0, 10), (3, 16), (10, 20)])
+    else:
+        s_intensity = 10.0  # 거래량 기준을 못 구했을 때의 중립값
+
+    return round(max(0, min(100, s_persist + s_intensity)), 1)
 
 
-def calc_flow_score(code, days=20):
-    """💰 수급 점수 (0~200) = 기관 순매수 점수(0~100) + 외국인 순매수 점수(0~100)"""
+def calc_flow_score(code, days=20, df_price=None):
+    """💰 수급 점수 (0~200) = 기관 순매수 점수(0~100) + 외국인 순매수 점수(0~100)
+
+    ⚠️ df_price(최근 가격/거래량 데이터)를 전달하면 같은 기간의 평균 거래량을 구해
+    순매수 강도 계산에 쓴다. 이미 calc_ai_scores_detailed에서 다른 점수 계산에
+    쓰려고 조회해둔 데이터를 재사용하는 것이라 추가 호출 비용은 없다."""
     try:
         df = fetch_investor_trend_by_code(code, days=days)
         if df.empty or '기관순매매' not in df.columns or '외국인순매매' not in df.columns:
@@ -6887,41 +6916,89 @@ def calc_flow_score(code, days=20):
         inst = df['기관순매매']
         frgn = df['외국인순매매']
         n = len(df)
-        inst_score = _investor_side_score(int((inst > 0).sum()), n, inst.sum())
-        frgn_score = _investor_side_score(int((frgn > 0).sum()), n, frgn.sum())
+
+        avg_volume = None
+        if df_price is not None and not df_price.empty and "Volume" in df_price.columns:
+            vol_tail = df_price["Volume"].dropna().tail(days)
+            if len(vol_tail) >= 5:
+                avg_volume = vol_tail.mean()
+
+        inst_score = _investor_side_score(int((inst > 0).sum()), n, inst.sum(), avg_volume)
+        frgn_score = _investor_side_score(int((frgn > 0).sum()), n, frgn.sum(), avg_volume)
         return round(max(0, min(200, inst_score + frgn_score)), 1)
     except Exception:
         return 100.0
 
 
-def calc_financial_score_detailed(df_annual, roe, debt=None):
-    """💹 재무 점수 (0~180) = ROE(0~80) + 영업이익 증가율 YoY(0~50) + EPS 흐름(0~20)
-       + 부채비율 건전성(0~30, NEW)
+def calc_financial_score_detailed(df_annual, roe, debt=None, return_breakdown=False):
+    """💹 재무 점수 (0~180) = 수익성(0~60) + 성장성(0~70) + 건전성(0~50)
 
-    ⚠️ [1000점 리뉴얼] ROE 12%와 14%가 예전엔 같은 계단(4점)에 갇혔다. 지금은
-    ROE·영업이익 증가율·EPS 증가율 모두 실제 %값을 그대로 _lerp_score에 넣어
-    연속적으로 채점한다.
+       수익성(60)  = ROE(0~35) + 영업이익률(0~15) + 순이익률(0~10)
+       성장성(70)  = 매출액 YoY(0~20) + 영업이익 YoY(0~30) + EPS YoY(0~20)
+       건전성(50)  = 부채비율(0~50)
 
-    ⚠️ [카테고리 정합성 수정] 예전엔 부채비율이 '리스크' 감점에서만 쓰이고, 정작
-    카테고리 이름이 '재무'인 여기엔 반영이 안 됐다 — 저부채 우량기업이 재무 점수로
-    플러스 혜택을 못 받는 구조였다. 지금은 부채비율이 낮을수록 여기서도 가산점을
-    받도록 추가했다(리스크 쪽 감점은 그대로 유지 — '재무 건전성 가점'과 '변동성·
-    부실 리스크 감점'은 서로 다른 관점이라 중복이 아니라 상호 보완으로 봤다)."""
+    ⚠️ [세분화] 예전엔 'ROE 하나(80점)'가 재무 점수의 절반 가까이를 차지해서, ROE는
+    높은데 영업이익률·매출 성장은 꺾이고 있는 종목과 실제로 전방위로 탄탄한 종목이
+    구분되지 않았다. 지금은 '돈을 잘 버는가(수익성)·성장하고 있는가(성장성)·재무가
+    튼튼한가(건전성)'를 각각 별도 하위 점수로 나눠서 어느 축에서 약한지 바로 보이게
+    했다.
+
+    ⚠️ [데이터 한계로 인한 의도적 축소] 원래 구상은 '현금흐름(영업현금흐름/FCF)'까지
+    네 번째 축으로 넣는 것이었지만, 이 코드베이스가 실제로 가져오는 재무 데이터
+    (FnGuide/네이버 WiseReport)에는 현금흐름표·유동비율·이자보상배율이 아예 없다.
+    없는 데이터를 있는 것처럼 흉내내는 대신, 현재 확보 가능한 지표(매출액·영업이익·
+    당기순이익·영업이익률·순이익률·ROE·부채비율·EPS)만으로 정직하게 3축을 구성했다.
+    현금흐름을 실제로 넣으려면 DART 재무제표(현금흐름표) API 연동이 먼저 필요하다.
+
+    ⚠️ [1000점 리뉴얼] ROE 12%와 14%가 예전엔 같은 계단(4점)에 갇혔다. 지금도
+    모든 하위 지표는 실제 %값을 그대로 _lerp_score에 넣어 연속적으로 채점한다.
+
+    ⚠️ [카테고리 정합성 유지] 부채비율은 '리스크' 감점과 '재무' 가점에 동시에 쓰인다.
+    '재무 건전성 가점'과 '변동성·부실 리스크 감점'은 서로 다른 관점이라 중복이
+    아니라 상호 보완으로 본다(자세한 이유는 calc_risk_score 참고).
+
+    return_breakdown=True로 호출하면 총점 대신 하위 카테고리 점수까지 담은 dict를
+    반환한다 (UI에서 '재무 몇 점 중 성장성이 특히 약하다' 같은 설명에 사용)."""
     try:
+        # ── 수익성 (0~60) ──
         if roe is None or roe == -999:
-            s_roe = 40.0
+            s_roe = 17.5  # 데이터 없을 때의 중립값 (35점 만점의 절반)
         else:
-            s_roe = _lerp_score(roe, [(-10, 0), (0, 10), (5, 20), (10, 40), (15, 60), (20, 80)])
+            s_roe = _lerp_score(roe, [(-10, 0), (0, 4.4), (5, 8.75), (10, 17.5), (15, 26.25), (20, 35)])
 
-        s_op, s_eps = 20.0, 10.0  # 데이터 없을 때의 중립값
+        s_op_margin, s_ni_margin = 7.5, 5.0  # 데이터 없을 때의 중립값
+
+        op_margin = ni_margin = None
+        if df_annual is not None and not df_annual.empty:
+            if '영업이익률' in df_annual.columns:
+                op_margin = _to_float_safe(df_annual.iloc[-1]['영업이익률'])
+            if '순이익률' in df_annual.columns:
+                ni_margin = _to_float_safe(df_annual.iloc[-1]['순이익률'])
+
+        if op_margin is not None:
+            s_op_margin = _lerp_score(op_margin, [(-10, 0), (0, 3), (5, 8), (10, 12), (15, 15), (25, 15)])
+        if ni_margin is not None:
+            s_ni_margin = _lerp_score(ni_margin, [(-10, 0), (0, 2), (5, 5), (10, 8), (15, 10), (25, 10)])
+
+        s_profitability = s_roe + s_op_margin + s_ni_margin
+
+        # ── 성장성 (0~70) ──
+        s_revenue, s_op, s_eps = 10.0, 15.0, 10.0  # 데이터 없을 때의 중립값
 
         if df_annual is not None and not df_annual.empty and len(df_annual) >= 2:
+            if '매출액' in df_annual.columns:
+                prev_rev = _to_float_safe(df_annual.iloc[-2]['매출액'])
+                latest_rev = _to_float_safe(df_annual.iloc[-1]['매출액'])
+                if prev_rev not in (None, 0) and latest_rev is not None:
+                    rev_growth = (latest_rev - prev_rev) / abs(prev_rev) * 100
+                    s_revenue = _lerp_score(rev_growth, [(-20, 0), (0, 5), (10, 12), (20, 20)])
+
             if '영업이익' in df_annual.columns:
                 prev = _to_float_safe(df_annual.iloc[-2]['영업이익'])
                 latest = _to_float_safe(df_annual.iloc[-1]['영업이익'])
                 if prev not in (None, 0) and latest is not None:
                     growth = (latest - prev) / abs(prev) * 100
-                    s_op = _lerp_score(growth, [(-30, 0), (0, 10), (10, 30), (20, 50)])
+                    s_op = _lerp_score(growth, [(-30, 0), (0, 6), (10, 18), (20, 30)])
 
             eps_col = next((c for c in df_annual.columns if 'EPS' in str(c)), None)
             if eps_col:
@@ -6936,13 +7013,30 @@ def calc_financial_score_detailed(df_annual, roe, debt=None):
                 elif latest_eps is not None:
                     s_eps = 0.0
 
-        if debt is None or debt < 0:
-            s_debt = 15.0  # 데이터 없을 때의 중립값
-        else:
-            s_debt = _lerp_score(debt, [(0, 30), (30, 30), (60, 20), (100, 10), (150, 5), (300, 0)])
+        s_growth = s_revenue + s_op + s_eps
 
-        return round(max(0, min(180, s_roe + s_op + s_eps + s_debt)), 1)
+        # ── 건전성 (0~50) ──
+        if debt is None or debt < 0:
+            s_debt = 25.0  # 데이터 없을 때의 중립값
+        else:
+            s_debt = _lerp_score(debt, [(0, 50), (30, 50), (60, 33.3), (100, 16.7), (150, 8.3), (300, 0)])
+
+        s_stability = s_debt
+
+        total = round(max(0, min(180, s_profitability + s_growth + s_stability)), 1)
+
+        if return_breakdown:
+            return {
+                "total": total,
+                "수익성": round(s_profitability, 1), "수익성_max": 60,
+                "성장성": round(s_growth, 1), "성장성_max": 70,
+                "건전성": round(s_stability, 1), "건전성_max": 50,
+            }
+        return total
     except Exception:
+        if return_breakdown:
+            return {"total": 85.0, "수익성": 28.0, "수익성_max": 60,
+                    "성장성": 32.0, "성장성_max": 70, "건전성": 25.0, "건전성_max": 50}
         return 85.0
 
 
@@ -7033,10 +7127,15 @@ def calc_risk_score(df_price, debt, drop_pct=None):
     ⚠️ [버그 수정] drop_pct(52주 고점 대비 하락률, 스크리너의 '고점대비(%)' 컬럼)는
     calc_ai_scores_detailed에 파라미터로 넘어오면서도 정작 8개 항목 어디에도 쓰이지
     않았다(화면 디버그 정보엔 표시되지만 점수엔 반영 안 됐던 값). '이미 많이 빠진
-    종목일수록 추가 변동성·투자심리 리스크가 크다'는 관점에서 여기 반영했다. (추세
-    점수의 '52주 고점 근접도'는 df_price로 직접 계산한 별개 값이고, 그쪽은 고점에
-    가까울수록 가점을 주는 '현재 추세 강도' 관점이라 여기의 '하락폭이 클수록 감점'하는
-    하방 리스크 관점과는 결이 다르다 — 같은 값의 중복 반영이 아니다.)
+    종목일수록 추가 변동성·투자심리 리스크가 크다'는 관점에서 여기 반영했다.
+
+    ⚠️ [방향 충돌 수정] 예전엔 calc_trend_score에도 '52주 고점 근접도(0~60, 고점에
+    가까울수록 가점)'가 따로 있어서, 52주 고점 대비 위치라는 같은 정보를 추세(가점)와
+    리스크(감점) 양쪽에서 반대 방향으로 이중 반영하고 있었다. 문제는 이 앱의 추천
+    엔진 목표 자체가 '52주 고점 대비 하락해 안전마진이 확보된 종목 찾기'인데, 정작
+    많이 빠진 종목이 추세에서 가점을 못 받고 여기서 감점까지 두 번 맞는 구조라 엔진
+    철학과 배점이 어긋났었다. 이제 52주 고점 대비 위치는 여기(리스크) 한 곳에서만
+    다루도록 trend에서 해당 항목을 제거했다 — 하락폭 반영은 여기 하나로 정리됐다.
 
     ⚠️ [의존성 제거] drop_pct는 원래 관리자가 KRX 52주 고점 CSV를 수동으로 업로드해야만
     채워지는 스크리너 값이라, 업로드를 안 했거나 스크리너에 없는 종목이면 늘 '데이터
@@ -7073,7 +7172,7 @@ def calc_risk_score(df_price, debt, drop_pct=None):
             # 스크리너 값이 없으면 df_price(최근 1년 종가)로 직접 52주 고점대비를 계산해
             # 대신 쓴다. 디버그 패널의 "52주 고점 대비" 줄과 같은 기준(종가 최고가)을
             # 써서, 화면에 보이는 검증용 수치와 실제 계산에 쓰이는 값이 항상 일치하도록
-            # 맞췄다(calc_trend_score의 52주 고점 근접도 계산과도 동일 기준).
+            # 맞췄다.
             if closes is not None and len(closes) > 0:
                 high52 = closes.max()
                 if high52 > 0:
@@ -7254,7 +7353,7 @@ def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=
     momentum   = calc_momentum_score(df_price, kospi_closes)
     pattern    = calc_pattern_score(df_price, volume)
     risk       = calc_risk_score(df_price, debt, drop_pct)
-    flow       = calc_flow_score(code)
+    flow       = calc_flow_score(code, df_price=df_price)
     financial  = calc_financial_score_detailed(df_annual, roe, debt)
     valuation  = calc_valuation_score_detailed(per, pbr, roe, div)
 
@@ -7592,10 +7691,10 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
     ) if grade_label else ""
 
     CATEGORY_HELP = {
-        "추세":   "MA 정배열 강도(0~100) + 52주 신고가 근접도(0~60) + 추세 지속성(0~40)을 더합니다. 이동평균선이 위로 잘 정렬돼 있고 고점에 가까울수록 높습니다.",
-        "수급":   "최근 20일간 기관·외국인 순매수 비율과 방향을 각각 0~100점씩 채점해 더합니다(최대 200). 두 주체 모두 꾸준히 순매수 중이면 높습니다.",
+        "추세":   "MA 정배열 강도(0~130) + 추세 지속성(0~70)을 더합니다. 이동평균선이 위로 잘 정렬돼 있고 눌림 없이 버틴 날이 많을수록 높습니다. (52주 고점 대비 위치는 '리스크' 항목에서 별도로 반영합니다.)",
+        "수급":   "최근 20일간 기관·외국인 각각의 순매수일 비율(0~80)과 순매수 강도(0~20, 평균 거래량 대비 순매수 규모)를 더해 0~100점씩 채점합니다(최대 200). 두 주체 모두 꾸준히, 큰 규모로 순매수 중이면 높습니다.",
         "거래량": "당일 거래량이 20일 평균보다 얼마나 튀었는지(스파이크, 0~60) + 최근 5일 평균이 얼마나 이어지는지(지속성, 0~40)를 봅니다. 하루짜리 반짝 거래량과 며칠째 이어지는 증가세를 구분합니다.",
-        "재무":   "ROE(0~80) + 영업이익 증가율 YoY(0~50) + EPS 흐름(0~20) + 부채비율 건전성(0~30)을 더합니다. 수익성이 좋고 부채가 낮을수록 높습니다.",
+        "재무":   "수익성(0~60: ROE+영업이익률+순이익률) + 성장성(0~70: 매출·영업이익·EPS 증가율) + 건전성(0~50: 부채비율)을 더합니다. 돈을 잘 벌고, 성장하고, 빚이 적을수록 높습니다.",
         "밸류":   "PER(0~50) + PBR(0~30) + PEG 근사(PER÷ROE, 0~20) + 배당수익률(0~20)을 더합니다. 이익·자산 대비 저평가돼 있고 배당이 높을수록 높습니다.",
         "모멘텀": "5일(0~20) + 20일(0~40) + 60일(0~20) 수익률 + 코스피 대비 상대강도 RS 보너스(0~20)를 더합니다. 단기·중기·장기 모두 오르는 중이고 지수보다 잘 버틸수록 높습니다.",
         "AI패턴": "⚠️ 과거 급등 사례에서 흔히 보이는 규칙(저항선 돌파·거래량 동반·최근 상승 우위)을 조합한 근사 휴리스틱입니다. 실제 유사도 검색이나 매매 신호가 아닙니다.",
@@ -7649,6 +7748,38 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         '</div>'
         for icon, label, val, max_v, min_v in categories
     )
+
+    # ── [종합 판단 배지] 항목별 raw 점수만 나열하면 "846점이 좋은 건지" 한눈에
+    # 안 들어온다. 각 항목이 자기 만점 대비 몇 %인지(score_bar와 동일 기준)를 계산해
+    # 뚜렷하게 강하거나(≥70%) 약한(≤30%) 항목만 골라 "🟢 재무 안정적" 같은 한 줄
+    # 배지로 요약한다 — 항목별 8줄짜리 막대를 다 안 봐도 강점/약점이 바로 보이게.
+    _STRONG_LABEL = {"추세": "추세 강함", "수급": "수급 양호", "거래량": "거래량 활발",
+                      "재무": "재무 안정적", "밸류": "밸류 매력적", "모멘텀": "모멘텀 강함",
+                      "AI패턴": "패턴 긍정적", "리스크": "리스크 낮음"}
+    _WEAK_LABEL = {"추세": "추세 약함", "수급": "수급 부진", "거래량": "거래량 저조",
+                    "재무": "재무 부담", "밸류": "밸류 부담", "모멘텀": "모멘텀 약함",
+                    "AI패턴": "패턴 약함", "리스크": "리스크 높음"}
+
+    badges = []
+    for icon, label, val, max_v, min_v in categories:
+        rng = max_v - min_v
+        ratio = (val - min_v) / rng if rng else 1.0
+        pct = max(0, min(100, ratio * 100))
+        if pct >= 70:
+            badges.append(("#16A34A", "#F0FDF4", "🟢", _STRONG_LABEL.get(label, f"{label} 우수")))
+        elif pct <= 30:
+            badges.append(("#DC2626", "#FEF2F2", "🔴", _WEAK_LABEL.get(label, f"{label} 약함")))
+
+    if badges:
+        badge_html = "".join(
+            f'<span style="display:inline-flex; align-items:center; gap:4px; font-size:11.5px; '
+            f'font-weight:600; color:{fg}; background:{bg}; border-radius:12px; padding:3px 9px; '
+            f'margin:3px 6px 0 0;">{emoji} {text}</span>'
+            for fg, bg, emoji, text in badges
+        )
+        cat_cards += (
+            '<div style="grid-column:1 / -1; margin-top:2px;">' + badge_html + '</div>'
+        )
 
     TOOLTIP_CSS = (
         '<style>'
