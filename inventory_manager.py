@@ -3151,18 +3151,16 @@ def load_high52_map():
     except:
         return {}
 
-def _fetch_trading_value_eok(code, price):
-    """오늘 누적 거래량을 조회해 '거래대금(억원) 추정치'를 반환한다. 최소 유동성
-    필터(MIN_TRADING_VALUE_EOK)에 쓰기 위한 값이다.
+def _fetch_trading_value_eok(code, price=None):
+    """오늘 누적 거래대금(억원)을 조회한다. 최소 유동성 필터(MIN_TRADING_VALUE_EOK)에 쓴다.
 
-    ⚠️ [검증 필요] 이 realtime 엔드포인트는 이 코드베이스에서 지수(KOSPI/KOSDAQ)
-    거래량 조회에만 검증된 상태로 쓰이고 있었고(fetch_market_index_table 참고),
-    개별 종목 코드에 대해서도 같은 응답 형식을 주는지는 실제 배포 환경에서
-    한 번 확인이 필요하다. 그래서 이 함수는 반드시 '실패하면 None'을 반환하도록
-    설계했다 — 호출부(필터)는 None이면 그 종목을 걸러내지 않고 통과시킨다
-    (fail-open). 필드명이 실제와 다르거나 API가 막혀 있어도 '멀쩡한 종목이
-    필터 때문에 사라지는' 최악의 상황은 피하기 위함이다.
-    거래대금은 정확한 VWAP이 아니라 '누적 거래량 × 현재가'로 근사한 값이다."""
+    ✅ [검증 완료 2026-08-11] 삼성전자(005930) 실제 응답으로 확인함 — 이 엔드포인트는
+    개별 종목 코드에도 정상 동작하고, datas[0] 최상위에 accumulatedTradingValueRaw
+    필드가 '원' 단위 거래대금을 직접 준다(예: "5510876000000" = 5.51조원). 처음엔
+    이 필드 존재를 몰라서 '누적거래량 × 현재가'로 근사하려 했는데, 실제로는 거래대금을
+    바로 주므로 그쪽을 우선 사용한다(장중 체결가가 종가와 다르므로 이 방식이 더 정확).
+    accumulatedTradingValueRaw가 없는 예외적인 경우에만 거래량×price로 근사한다.
+    그래도 실패하면 None을 반환하고, 호출부는 None인 종목을 걸러내지 않는다(fail-open)."""
     try:
         vol_headers = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://m.stock.naver.com/'}
         vol_url = f"https://polling.finance.naver.com/api/realtime/domestic/stock/{code}"
@@ -3170,12 +3168,18 @@ def _fetch_trading_value_eok(code, price):
         vpayload = vres.json()
         vdatas = vpayload.get("datas") or []
         vdata = vdatas[0] if vdatas else {}
+
+        val_raw = vdata.get("accumulatedTradingValueRaw", None)
+        if val_raw not in (None, ""):
+            return round(float(str(val_raw).replace(',', '')) / 1e8, 1)  # 억원 단위
+
+        # 폴백: 거래대금 필드가 없는 경우에만 거래량 × 현재가로 근사
         vol_raw = vdata.get("accumulatedTradingVolumeRaw", None)
         if vol_raw in (None, ""):
             vol_raw = re.sub(r"[^\d]", "", str(vdata.get("accumulatedTradingVolume", ""))) or None
-        if vol_raw and price > 0:
+        if vol_raw and price:
             volume = int(str(vol_raw).replace(',', ''))
-            return round(volume * price / 1e8, 1)  # 억원 단위
+            return round(volume * price / 1e8, 1)
     except Exception:
         pass
     return None
