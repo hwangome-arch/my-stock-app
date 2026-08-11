@@ -7020,8 +7020,15 @@ def calc_risk_score(df_price, debt, drop_pct=None):
        = 변동성(0~30 감점) + 부채비율(0~20 감점) + 52주 고점대비 하락폭(0~20 감점, NEW)
        + 최근 연속 하락일수(0~10 감점, NEW)
 
-    ⚠️ [1000점 리뉴얼] 변동성 CV 5%와 7%가 예전엔 같은 감점 계단에 갇혔다.
-    지금은 CV%와 부채비율(%) 값을 그대로 보간해 감점 폭이 연속적으로 커진다.
+    ⚠️ [지표 교체] '20일 종가의 표준편차÷평균(CV)'은 사실 변동성보다 '추세가 얼마나
+    강했는지'에 더 가까운 지표였다 — 하루하루는 잔잔해도 20일간 한 방향으로 꾸준히
+    움직이기만 하면 가격이 평균에서 계속 멀어져서 CV가 높게 나온다(실측: 삼성전자가
+    20일간 완만하게 -18% 정도만 빠졌는데도 CV 7.97%로 만점 문턱 6%를 이미 넘었다).
+    반대로 하루하루 크게 출렁여도 20일 뒤 제자리로 돌아온 종목은 CV가 낮게 나와
+    "진짜 변동성"과 "그냥 한 방향으로 흐른 추세"가 구분이 안 됐다. 지금은 종가 자체가
+    아니라 '전일 대비 일별 등락률의 표준편차'를 쓴다 — 방향(추세)과 무관하게 하루하루
+    얼마나 출렁였는지만 잡아내므로, 완만하게 꾸준히 빠진 종목은 감점이 줄고 급등락을
+    반복하는 진짜 변동성 큰 종목만 감점이 크게 걸린다.
 
     ⚠️ [버그 수정] drop_pct(52주 고점 대비 하락률, 스크리너의 '고점대비(%)' 컬럼)는
     calc_ai_scores_detailed에 파라미터로 넘어오면서도 정작 8개 항목 어디에도 쓰이지
@@ -7031,20 +7038,26 @@ def calc_risk_score(df_price, debt, drop_pct=None):
     가까울수록 가점을 주는 '현재 추세 강도' 관점이라 여기의 '하락폭이 클수록 감점'하는
     하방 리스크 관점과는 결이 다르다 — 같은 값의 중복 반영이 아니다.)
 
+    ⚠️ [버그 수정] 부채비율 감점이 예전엔 0%부터 바로 시작해서([(0,0),(100,10),(200,20)]),
+    부채비율 20~30%처럼 통상 '안정권'으로 보는 건전한 수준도 조금씩 감점을 먹고 있었다.
+    재무 점수 쪽 부채 가점 곡선은 이미 '30% 이하는 우량'으로 보는데 리스크 쪽만 다른
+    기준을 쓰던 불일치이기도 했다. 감점 없는 구간을 60%까지로 두고, 그 이상부터
+    100%→8점, 150%→15점, 200% 이상→20점(만점)으로 상대적으로 타이트하게 올라간다.
+
     ⚠️ [입체화] 변동성·부채, 두 가지뿐이던 리스크 요인에 '최근 며칠째 연속으로
     빠지고 있는지'를 추가했다 — 단기 급락이 이어지는 종목을 더 민감하게 잡아낸다."""
     try:
         penalty = 0.0
         closes = df_price["Close"].dropna() if df_price is not None and not df_price.empty else None
 
-        if closes is not None and len(closes) >= 5:
-            recent20 = closes.tail(20)
-            if recent20.mean() > 0:
-                cv = (recent20.std() / recent20.mean()) * 100
-                penalty += _lerp_score(cv, [(0, 0), (2, 10), (4, 20), (6, 30)])
+        if closes is not None and len(closes) >= 6:
+            daily_ret = closes.tail(21).pct_change().dropna() * 100
+            if len(daily_ret) >= 5:
+                ret_std = daily_ret.std()
+                penalty += _lerp_score(ret_std, [(0, 0), (1.0, 5), (1.5, 12), (2.5, 20), (4.0, 30)])
 
         if debt is not None and debt > 0:
-            penalty += _lerp_score(debt, [(0, 0), (100, 10), (200, 20)])
+            penalty += _lerp_score(debt, [(0, 0), (60, 0), (100, 8), (150, 15), (200, 20), (300, 20)])
 
         if drop_pct is None or drop_pct == 0.0:
             penalty += 5.0  # 데이터 없을 때의 중립값
@@ -7131,11 +7144,10 @@ def _ai_score_debug_info(df_price, kospi_closes=None, debt=None, drop_pct=None):
         # ⚠️ [버그 수정] 리스크 점수(변동성/부채/하락폭/연속하락)에 실제로 쓰이는 원본
         # 수치가 이 패널에 하나도 없어서, "왜 리스크가 -39점인지" 화면에서 확인할 방법이
         # 없었다. 다른 항목들과 동일하게 계산 근거를 노출한다.
-        if len(closes) >= 5:
-            recent20 = closes.tail(20)
-            if recent20.mean() > 0:
-                cv = (recent20.std() / recent20.mean()) * 100
-                info["변동성(최근 20일 CV)"] = f"{cv:.2f}%"
+        if len(closes) >= 6:
+            daily_ret = closes.tail(21).pct_change().dropna() * 100
+            if len(daily_ret) >= 5:
+                info["변동성(최근 20일 일별 등락률 표준편차)"] = f"{daily_ret.std():.2f}%"
 
         if len(closes) >= 6:
             diffs = closes.tail(6).diff().dropna()
