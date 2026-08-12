@@ -3212,7 +3212,6 @@ def check_naver_52w_robust(row_dict):
                 "현재가_num": price, "52주최고": high, "고점 / 하락률": drop_pct,
                 "PER": row_dict['PER'], "PBR": row_dict['PBR'], "ROE": row_dict['ROE'],
                 "부채비율": row_dict['부채비율'], "배당수익률": row_dict.get('배당수익률', 0.0),
-                "거래대금(억원)": _fetch_trading_value_eok(code, price),
                 "데이터출처": "📂 스크리너 연동"
             }
         return None  
@@ -3257,7 +3256,6 @@ def check_naver_52w_robust(row_dict):
                 "현재가_num": price, "52주최고": high, "고점 / 하락률": drop_pct,
                 "PER": row_dict['PER'], "PBR": row_dict['PBR'], "ROE": row_dict['ROE'],
                 "부채비율": row_dict['부채비율'], "배당수익률": row_dict.get('배당수익률', 0.0),
-                "거래대금(억원)": _fetch_trading_value_eok(code, price),
                 "데이터출처": "🌐 실시간 보완"
             }
     return None
@@ -3401,24 +3399,22 @@ def _unified_scan_worker(job_id):
         for f in _futures:
             f.cancel()
 
-    # ── [최소 유동성 필터] 거래대금(억원)을 확실히 구한 종목 중, MIN_TRADING_VALUE_EOK
-    # 미만인 종목은 추천 후보에서 제외한다. "삼전·SK하이닉스처럼 원래 거래가 큰
-    # 종목도 거래량 점수는 낮게 나올 수 있다"는 것과는 별개로, 실제로 하루 거래대금이
-    # 너무 작아 사고팔기 어려운 초소형주는 지표가 아무리 좋아도 추천 의미가 적다는
-    # 판단에서 추가했다. _fetch_trading_value_eok가 값을 못 구해 None을 반환한
-    # 종목은 걸러내지 않는다(fail-open) — 조회 실패를 "유동성 부족"으로 오인해
-    # 멀쩡한 종목을 지워버리는 상황을 피하기 위함이다.
-    before_n = len(rows)
-    rows = [r for r in rows
-            if r.get("거래대금(억원)") is None or r["거래대금(억원)"] >= MIN_TRADING_VALUE_EOK]
-    filtered_n = before_n - len(rows)
-    if filtered_n > 0:
-        _DEBUG_STORE["_reco_liquidity_filtered_count"] = filtered_n
+    # ⚠️ [버그 수정: 유동성 필터를 스캔 단계로 되돌리지 말 것] 예전엔 여기서
+    # 후보마다 _fetch_trading_value_eok()를 동기 호출해 즉시 걸러냈었다. 그런데 이
+    # 함수는 네이버 realtime API를 추가로 한 번 더 부르는 함수라, 안 그래도 빠듯한
+    # 스캔 시간 예산(전체 25초 + 종목당 8초) 안에서 이미 다른 스레드들과 스레드풀을
+    # 나눠 쓰는 중에 후보마다 왕복 하나씩을 더 얹은 셈이었다. 그 결과 시간 안에
+    # 못 끝나는 스레드가 늘어나 "AI 필터와 전혀 상관없이" 후보 자체가 덜 걸러지는
+    # 회귀가 생겼다(실측: S급 8개 → 1개). 유동성 필터는 이제 AI 등급 필터와 동일하게
+    # render_recommendations()에서 '화면에 실제로 보여줄 후보'에 대해서만 지연
+    # 계산한다(_render_liquidity_filter_and_value 참고) — 스캔 자체의 속도/후보
+    # 개수는 원래대로 건드리지 않는다.
 
     set_progress("✨ 스캔 완료! (스크리너 + 추천 종목 데이터가 함께 갱신되었습니다)", 100)
     state["done"] = True
     state["success"] = True
     state["reco_df"] = pd.DataFrame(rows) if rows else None
+
 
 
 def run_unified_market_scan_async(job_key="unified_scan", overall_timeout=150):
@@ -7735,6 +7731,66 @@ def _score_one_for_ai_batch(code, per, pbr, roe, debt, drop_pct, div):
         return None
 
 
+def _render_liquidity_filter_and_value(display_df, source_df):
+    """[최소 유동성 필터] AI 등급 필터와 완전히 동일한 지연 계산 패턴을 쓴다.
+
+    ⚠️ [설계 변경 이력] 원래는 스캔 단계(check_naver_52w_robust)에서 후보마다
+    거래대금을 동기적으로 조회해 즉시 걸러내려 했었다. 그런데 그 방식은 네이버
+    realtime API 호출을 후보 하나하나에 추가로 얹는 것이었고, 스캔의 빠듯한 시간
+    예산(전체 25초) 안에서 다른 스레드들과 스레드풀을 나눠 쓰다 보니 시간 안에
+    못 끝나는 스레드가 늘어 "필터와 무관하게 후보 자체가 줄어드는" 회귀를 냈다
+    (실측: S급 8개 → 1개). 그래서 AI 등급 필터와 똑같이, 스캔 자체는 건드리지 않고
+    '화면에 실제로 보여줄 후보'에 대해서만 배치로 지연 계산한다."""
+    BATCH_SIZE = 20
+
+    _df_id = id(source_df)
+    if st.session_state.get('_reco_liq_cache_df_id') != _df_id:
+        st.session_state['_reco_liq_cache_df_id'] = _df_id
+        st.session_state['_reco_liq_value_cache'] = {}
+
+    cache = st.session_state.setdefault('_reco_liq_value_cache', {})
+
+    codes_needed = [str(c).zfill(6) for c in display_df['종목코드']]
+    unscored_rows = [row for _, row in display_df.iterrows()
+                      if str(row['종목코드']).zfill(6) not in cache]
+
+    if unscored_rows:
+        batch = unscored_rows[:BATCH_SIZE]
+        batch_codes = [str(r['종목코드']).zfill(6) for r in batch]
+
+        def _submit_liq_batch():
+            executor = get_shared_executor()
+            futures = {}
+            for r in batch:
+                c = str(r['종목코드']).zfill(6)
+                futures[c] = submit_with_ctx(executor, _fetch_trading_value_eok, c, r['현재가_num'])
+            return futures
+
+        def _collect_liq_batch(futures):
+            out = {}
+            for c, f in futures.items():
+                if f.done():
+                    try:
+                        out[c] = f.result(timeout=0.1)
+                    except Exception:
+                        out[c] = None
+            return out
+
+        partial, _ready = render_async_multi(
+            job_key=f"reco_liq_batch_{'-'.join(batch_codes)}",
+            submit_fn=_submit_liq_batch,
+            collect_fn=_collect_liq_batch,
+            default_result={},
+            spinner_text=f"거래대금 확인 중 ({len(batch)}건)...",
+            overall_timeout=15,
+        )
+        cache.update(partial)
+
+    value_map = {c: cache.get(c) for c in codes_needed}
+    still_loading = any(c not in cache for c in codes_needed)
+    return value_map, still_loading
+
+
 def _render_ai_grade_filter_and_score(display_df, source_df):
     """[AI 등급 필터] 저평가 등급(S~D) 필터와 완전히 독립된 두 번째 축으로 AI
     종합점수 등급을 추가한다. AND 조건으로 나란히 적용되며, 어느 한쪽 때문에
@@ -8169,6 +8225,15 @@ def render_recommendations():
         if ai_grade_filter is None:
             ai_grade_filter = "전체보기"
 
+        # ── [최소 유동성 필터] 기본은 꺼짐(opt-in) — AI 등급 필터처럼 화면에 보여줄
+        # 후보에만 지연 계산되므로 평소엔 부담이 없지만, 그래도 "매번 자동으로
+        # 네트워크 조회가 도는" 걸 원치 않을 수 있어 명시적으로 켜야 동작한다.
+        min_liquidity_filter = st.toggle(
+            "최소 거래대금(10억원 미만 종목 제외)",
+            value=False, key="reco_liq_filter_toggle",
+            help="오늘 누적 거래대금이 10억원 미만인 종목을 제외합니다. 화면에 보여줄 후보에 대해서만 지연 계산되어 스캔 속도에는 영향을 주지 않습니다.",
+        )
+
         def assign_grade(row, is_strict):
             per, pbr, roe, debt, drop, div = row['PER'], row['PBR'], row['ROE'], row['부채비율'], row['고점 / 하락률'], row['배당수익률']
             
@@ -8212,12 +8277,25 @@ def render_recommendations():
                 )
             ]
 
+        _liq_still_loading = False
+        if min_liquidity_filter:
+            _liq_value_map, _liq_still_loading = _render_liquidity_filter_and_value(display_df, _reco_df)
+            display_df = display_df[
+                display_df['종목코드'].apply(
+                    # 조회 실패(None)는 fail-open으로 통과시킨다 — API 오류를
+                    # "유동성 부족"으로 오인해 멀쩡한 종목을 지우지 않기 위함.
+                    lambda c: (lambda v: v is None or v >= MIN_TRADING_VALUE_EOK)(_liq_value_map.get(str(c).zfill(6)))
+                )
+            ]
+
         display_df = display_df.sort_values('고점 / 하락률', ascending=True).reset_index(drop=True)
 
         username = st.session_state.get("auth_user")
 
         if _ai_still_loading:
             st.caption("⏳ 일부 종목은 AI 종합점수를 아직 계산 중입니다 — 계산이 끝나는 대로 조건에 맞으면 자동으로 목록에 추가됩니다.")
+        if _liq_still_loading:
+            st.caption("⏳ 일부 종목은 거래대금을 아직 확인 중입니다 — 확인되는 대로 자동으로 반영됩니다.")
 
         if display_df.empty:
             st.info(f"현재 설정된 필터({market_filter}, {selected_grade}, AI {ai_grade_filter})에 부합하는 종목이 없습니다. 조건을 완화해보세요.")
@@ -8229,7 +8307,7 @@ def render_recommendations():
             # "결과 보기"가 리셋돼 화면이 계속 접혔다 펼쳐지는 부작용이 생긴다. 대신
             # len(_reco_df)(원본 후보 개수, 새 스캔이 돌기 전까진 불변)로 "새 스캔이
             # 돌았는지"만 판단한다.
-            _reco_filter_sig = (market_filter, strict_debt, selected_grade, ai_grade_filter, len(_reco_df))
+            _reco_filter_sig = (market_filter, strict_debt, selected_grade, ai_grade_filter, min_liquidity_filter, len(_reco_df))
             if st.session_state.get('_reco_filter_sig') != _reco_filter_sig:
                 st.session_state['_reco_filter_sig'] = _reco_filter_sig
                 st.session_state['_reco_shown'] = False
