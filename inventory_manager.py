@@ -3550,6 +3550,15 @@ def run_unified_market_scan_async(job_key="unified_scan", overall_timeout=150):
                 os.remove(RECO_PATH)
             except Exception:
                 pass
+        # 후보가 아예 없어지면 이전 스캔의 AI/유동성 디스크 캐시는 어차피
+        # 서명(_candidates_signature) 불일치로 다음에도 안 쓰이지만, 고아 파일로
+        # 계속 남는 걸 막기 위해 같이 정리한다.
+        for _stale_path in (AI_SCORE_CACHE_PATH, LIQ_VALUE_CACHE_PATH):
+            if os.path.exists(_stale_path):
+                try:
+                    os.remove(_stale_path)
+                except Exception:
+                    pass
         st.warning(state.get("warning") or "분석 결과 고점 대비 유의미하게 하락한 종목이 없습니다.")
 
     st.success("✨ 스캔 완료! (스크리너 + 추천 종목 데이터가 함께 갱신되었습니다)")
@@ -7763,6 +7772,48 @@ def _score_one_for_ai_batch(code, per, pbr, roe, debt, drop_pct, div):
         return None
 
 
+# ── [캐시 영속화] AI 점수·유동성 조회 결과를 세션 메모리뿐 아니라 디스크에도
+# 저장한다. reco_df를 CSV로 저장해두는 것과 같은 이유 — 브라우저 새로고침이나
+# (특히 Streamlit Cloud에서 흔한) 앱 재시작으로 세션 메모리가 날아가도, 이미
+# 계산해둔 종목까지 다시 계산하지 않게 하기 위함.
+AI_SCORE_CACHE_PATH = "saved_ai_score_cache.json"
+LIQ_VALUE_CACHE_PATH = "saved_liq_value_cache.json"
+
+
+def _candidates_signature(df):
+    """후보 목록(종목코드 집합)의 내용 기반 서명. id()는 프로세스가 재시작되면
+    의미가 없어지므로(재시작 후엔 완전히 새 객체가 만들어짐) 쓸 수 없다 — 대신
+    '어떤 종목들이 후보인가'라는 내용 자체로 서명을 만들어서, 같은 스캔 결과를
+    다시 불러온 것이면(재시작 후에도) 이전 캐시를 그대로 재사용할 수 있게 한다."""
+    codes = sorted(str(c).zfill(6) for c in df['종목코드'])
+    return hashlib.md5(",".join(codes).encode()).hexdigest()
+
+
+def _load_disk_cache(path, expected_sig):
+    """서명이 일치할 때만 디스크 캐시를 불러온다. 종목 구성이 다른(=다른 스캔의)
+    캐시를 잘못 재사용하는 일을 막기 위함이다."""
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if payload.get("sig") == expected_sig:
+                return dict(payload.get("scores", {}))
+    except Exception:
+        pass
+    return {}
+
+
+def _save_disk_cache(path, sig, cache_dict):
+    """계산 배치가 끝날 때마다 호출해 그때그때 저장한다(스캔 끝날 때 한 번에 몰아
+    저장하지 않는 이유: 배치 계산은 여러 rerun에 걸쳐 점진적으로 끝나는데, 그 중간에
+    세션이 끊기거나 앱이 재시작될 수 있어 "끝난 만큼은 최대한 잃지 않는" 쪽을 택했다)."""
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"sig": sig, "scores": cache_dict}, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
 def _render_liquidity_filter_and_value(display_df, source_df):
     """[최소 유동성 필터] AI 등급 필터와 완전히 동일한 지연 계산 패턴을 쓴다.
 
@@ -7775,10 +7826,12 @@ def _render_liquidity_filter_and_value(display_df, source_df):
     '화면에 실제로 보여줄 후보'에 대해서만 배치로 지연 계산한다."""
     BATCH_SIZE = 20
 
-    _df_id = id(source_df)
-    if st.session_state.get('_reco_liq_cache_df_id') != _df_id:
-        st.session_state['_reco_liq_cache_df_id'] = _df_id
-        st.session_state['_reco_liq_value_cache'] = {}
+    _sig = _candidates_signature(source_df)
+    if st.session_state.get('_reco_liq_cache_sig') != _sig:
+        st.session_state['_reco_liq_cache_sig'] = _sig
+        # 세션 메모리에 없으면(새로고침/재시작 직후) 디스크에서 같은 서명의
+        # 캐시를 먼저 찾아본다 — 있으면 재계산 없이 그대로 재사용.
+        st.session_state['_reco_liq_value_cache'] = _load_disk_cache(LIQ_VALUE_CACHE_PATH, _sig)
 
     cache = st.session_state.setdefault('_reco_liq_value_cache', {})
 
@@ -7816,7 +7869,9 @@ def _render_liquidity_filter_and_value(display_df, source_df):
             spinner_text=f"거래대금 확인 중 ({len(batch)}건)...",
             overall_timeout=15,
         )
-        cache.update(partial)
+        if partial:
+            cache.update(partial)
+            _save_disk_cache(LIQ_VALUE_CACHE_PATH, _sig, cache)
 
     value_map = {c: cache.get(c) for c in codes_needed}
     still_loading = any(c not in cache for c in codes_needed)
@@ -7840,19 +7895,21 @@ def _render_ai_grade_filter_and_score(display_df, source_df):
 
     source_df : load_reco_df()가 반환한 '필터링 전' 원본 DataFrame. display_df는
     매 rerun마다 .copy()+필터링으로 새로 만들어져 id()가 매번 바뀌므로, "새 스캔이
-    돌았는지"는 반드시 이 원본 객체의 identity로 판단해야 한다.
+    돌았는지"는 반드시 이 원본의 종목코드 구성(내용) 기준으로 판단해야 한다.
 
     반환값: (score_map, still_loading)
       score_map     : {종목코드: AI총점 or None(계산 실패)} — 지금까지 확인된 것만
       still_loading : 아직 계산 안 끝난 종목이 남아있으면 True (안내 문구 표시용)"""
     BATCH_SIZE = 20
 
-    # 새 스캔으로 reco_df 자체가 바뀌면(원본 객체 identity 변화) 캐시를 비운다 —
-    # 옛 스캔의 AI 점수를 새 스캔 결과에 잘못 재사용하는 것을 막기 위함.
-    _df_id = id(source_df)
-    if st.session_state.get('_reco_ai_cache_df_id') != _df_id:
-        st.session_state['_reco_ai_cache_df_id'] = _df_id
-        st.session_state['_reco_ai_score_cache'] = {}
+    # ⚠️ [캐시 영속화] id(source_df)는 프로세스가 재시작되면 의미가 없어져서(같은
+    # 스캔 결과라도 재시작 후엔 완전히 새 객체) 디스크 캐시와 맞물릴 수 없었다.
+    # 대신 후보 종목코드 구성 자체로 서명을 만들어, 세션이 끊겼다 다시 열려도
+    # '같은 스캔 결과'라면 디스크에 저장해둔 점수를 그대로 재사용한다.
+    _sig = _candidates_signature(source_df)
+    if st.session_state.get('_reco_ai_cache_sig') != _sig:
+        st.session_state['_reco_ai_cache_sig'] = _sig
+        st.session_state['_reco_ai_score_cache'] = _load_disk_cache(AI_SCORE_CACHE_PATH, _sig)
 
     cache = st.session_state.setdefault('_reco_ai_score_cache', {})
 
@@ -7898,7 +7955,9 @@ def _render_ai_grade_filter_and_score(display_df, source_df):
             spinner_text=f"AI 종합점수 계산 중 ({len(batch)}건)...",
             overall_timeout=20,
         )
-        cache.update(partial)
+        if partial:
+            cache.update(partial)
+            _save_disk_cache(AI_SCORE_CACHE_PATH, _sig, cache)
 
     score_map = {c: cache.get(c) for c in codes_needed}
     still_loading = any(c not in cache for c in codes_needed)
