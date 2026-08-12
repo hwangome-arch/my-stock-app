@@ -7378,23 +7378,55 @@ def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=
     리스크 점수에 반영된다. debt(부채비율)도 기존엔 리스크 감점에서만 쓰였는데, 이제
     재무 점수의 가점 요소로도 반영된다(자세한 이유는 각 함수 docstring 참고).
 
-    df_annual을 미리 전달하면(재무 데이터를 이미 조회한 경우) 재조회를 생략한다."""
+    df_annual을 미리 전달하면(재무 데이터를 이미 조회한 경우) 재조회를 생략한다.
+
+    ⚠️ [최적화: 내부 호출 병렬화] 원래는 df_price → 스파크라인 → 재무 → (calc_flow_score
+    내부의) 수급, 이렇게 4번의 외부 호출이 전부 순차적으로 실행됐다. 종목 하나를
+    처음 계산할 때(캐시 미스) 이 넷을 하나씩 기다리면 지연이 그대로 합산된다.
+    지금은 넷을 동시에 던지고 기다려서, 지연이 '합'이 아니라 '가장 느린 것 하나'
+    수준으로 줄어든다.
+
+    ⚠️ 반드시 get_shared_executor()가 아니라 get_orchestration_executor()(완전히
+    분리된 별도 풀)를 쓴다. 이 함수는 AI 등급 필터의 배치 계산(_score_one_for_ai_batch)
+    처럼 '이미 get_shared_executor()의 워커 스레드 안'에서 호출되는 경우가 있다.
+    그 상태에서 같은 공유 풀에 또 작업을 던지고 기다리면, 공유 풀 워커가 전부
+    서로를 기다리게 되는 자기 자신을 기다리는 교착상태가 생길 수 있다(관심종목
+    프리페치에서 이미 한 번 겪었던 문제와 동일한 패턴 — get_yf_safety_executor/
+    get_orchestration_executor 관련 주석 참고). 메인 스레드에서 직접 호출되는
+    경우(카드를 열어 AI 진단을 볼 때)에도 문제없이 동작한다."""
     code = normalize_kr_code(code)
 
+    _executor = get_orchestration_executor()
+    _futs = {
+        "price": submit_with_ctx(_executor, fetch_price_history_for_score, code),
+        "sparkline": submit_with_ctx(_executor, fetch_sparkline_data),
+        "investor": submit_with_ctx(_executor, fetch_investor_trend_by_code, code),
+    }
+    if df_annual is None:
+        _futs["financial"] = submit_with_ctx(_executor, fetch_financial_data, code)
+
     try:
-        df_price = fetch_price_history_for_score(code)
+        df_price = _futs["price"].result(timeout=12)
     except Exception:
         df_price = pd.DataFrame()
 
     kospi_closes = None
     try:
-        kospi_closes = fetch_sparkline_data().get("kospi")
+        kospi_closes = _futs["sparkline"].result(timeout=12).get("kospi")
+    except Exception:
+        pass
+
+    # investor 결과 자체는 여기서 안 쓴다 — fetch_investor_trend_by_code의
+    # @st.cache_data 캐시를 미리 데워두는 게 목적이다. 이 result()를 기다려야
+    # 아래 calc_flow_score 내부의 (같은 인자로 부르는) 호출이 캐시 히트를 보장받는다.
+    try:
+        _futs["investor"].result(timeout=12)
     except Exception:
         pass
 
     if df_annual is None:
         try:
-            df_annual, _, _ = fetch_financial_data(code)
+            df_annual, _, _ = _futs["financial"].result(timeout=12)
         except Exception:
             df_annual = None
 
@@ -7405,7 +7437,7 @@ def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=
     momentum   = calc_momentum_score(df_price, kospi_closes)
     pattern    = calc_pattern_score(df_price, volume)
     risk       = calc_risk_score(df_price, debt, drop_pct)
-    flow       = calc_flow_score(code, df_price=df_price)
+    flow       = calc_flow_score(code, df_price=df_price)  # 위에서 캐시를 데워둬서 여기선 빠르다
     financial  = calc_financial_score_detailed(df_annual, roe, debt)
     valuation  = calc_valuation_score_detailed(per, pbr, roe, div)
 
@@ -8216,7 +8248,7 @@ def render_recommendations():
         # 거를 수 있게 한다. (자세한 이유는 _render_ai_grade_filter_and_score 참고)
         ai_grade_filter = st.pills(
             "AI 등급 필터",
-            ["전체보기", "500+", "600+", "700+", "800+"],
+            ["전체보기", "800+", "700+", "600+", "500+", "400+"],
             default="전체보기",
             label_visibility="collapsed",
             key="reco_ai_grade_pills",
@@ -8276,7 +8308,7 @@ def render_recommendations():
         # AI 800+ 조건에 맞는 종목이 하나도 없는 상태에서 유동성 필터까지 켜진 경우).
         # 그래서 각 필터 전에 "이미 비어있지 않을 때만 적용"하도록 막았다.
         if ai_grade_filter != "전체보기" and not display_df.empty:
-            _ai_min_score = {"500+": 500, "600+": 600, "700+": 700, "800+": 800}[ai_grade_filter]
+            _ai_min_score = {"400+": 400, "500+": 500, "600+": 600, "700+": 700, "800+": 800}[ai_grade_filter]
             _ai_score_map, _ai_still_loading = _render_ai_grade_filter_and_score(display_df, _reco_df)
             display_df = display_df[
                 display_df['종목코드'].apply(
