@@ -8223,15 +8223,10 @@ def render_recommendations():
     if not _reco_df.empty:
         st.markdown("<hr style='margin: 25px 0 20px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
         st.markdown("<h4 style='font-size: 16px; margin-bottom:15px;'>🎛️ 추천 종목 제어판 (실시간 필터링)</h4>", unsafe_allow_html=True)
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            market_filter = st.selectbox("시장 분류", ["전체", "코스피", "코스닥"], key="reco_mkt_filter")
-        with col2:
-            st.markdown("<div style='padding-top:28px;'></div>", unsafe_allow_html=True)
-            strict_debt = st.toggle("부채비율 '엄격 기준' 적용 (권장)", value=True, help="해제 시 모든 등급의 부채비율 허들을 300%로 완화하여 더 많은 종목을 탐색합니다.")
 
-        st.markdown("<br>", unsafe_allow_html=True)
+        market_filter = st.selectbox("시장 분류", ["전체", "코스피", "코스닥"], key="reco_mkt_filter")
+
+        st.markdown("<div style='font-size:13px; font-weight:600; color:#475569; margin:14px 0 6px;'>📊 저평가 등급 필터</div>", unsafe_allow_html=True)
         selected_grade = st.pills(
             "등급 필터",
             ["전체보기", "💎 S급", "🥇 A급", "🥈 B급", "🥉 C급", "👀 D급"],
@@ -8246,9 +8241,12 @@ def render_recommendations():
         # 필터를 나란히 두고 AND로 조합한다 — S/A/B급만 되면 후보 자체가 너무
         # 적어지는 문제를 피하기 위해, 등급 필터는 '전체보기'로 둔 채 AI 점수만으로도
         # 거를 수 있게 한다. (자세한 이유는 _render_ai_grade_filter_and_score 참고)
+        # ⚠️ [UI] 등급 필터 pills(이모지+한글)와 시각적 통일감을 주기 위해 점수
+        # 구간마다 등급처럼 느껴지는 이모지를 하나씩 붙였다(🚀최상~🌱입문).
+        st.markdown("<div style='font-size:13px; font-weight:600; color:#475569; margin:14px 0 6px;'>🤖 AI 종합점수 필터</div>", unsafe_allow_html=True)
         ai_grade_filter = st.pills(
             "AI 등급 필터",
-            ["전체보기", "800+", "700+", "600+", "500+", "400+"],
+            ["전체보기", "🚀 800+", "🔥 700+", "⭐ 600+", "✨ 500+", "🌱 400+"],
             default="전체보기",
             label_visibility="collapsed",
             key="reco_ai_grade_pills",
@@ -8257,14 +8255,21 @@ def render_recommendations():
         if ai_grade_filter is None:
             ai_grade_filter = "전체보기"
 
-        # ── [최소 유동성 필터] 기본은 꺼짐(opt-in) — AI 등급 필터처럼 화면에 보여줄
-        # 후보에만 지연 계산되므로 평소엔 부담이 없지만, 그래도 "매번 자동으로
-        # 네트워크 조회가 도는" 걸 원치 않을 수 있어 명시적으로 켜야 동작한다.
-        min_liquidity_filter = st.toggle(
-            "최소 거래대금(10억원 미만 종목 제외)",
-            value=False, key="reco_liq_filter_toggle",
-            help="오늘 누적 거래대금이 10억원 미만인 종목을 제외합니다. 화면에 보여줄 후보에 대해서만 지연 계산되어 스캔 속도에는 영향을 주지 않습니다.",
-        )
+        # ── [추가 옵션] 등급 필터·AI 필터처럼 후보를 고르는 축이 아니라, 채점
+        # 기준 자체를 조정하는 온오프 토글류라서 따로 묶었다.
+        st.markdown("<div style='font-size:13px; font-weight:600; color:#475569; margin:14px 0 6px;'>⚙️ 추가 옵션</div>", unsafe_allow_html=True)
+        opt_col1, opt_col2 = st.columns(2)
+        with opt_col1:
+            strict_debt = st.toggle("부채비율 '엄격 기준' 적용 (권장)", value=True, help="해제 시 모든 등급의 부채비율 허들을 300%로 완화하여 더 많은 종목을 탐색합니다.")
+        with opt_col2:
+            # ⚠️ 기본은 꺼짐(opt-in) — AI 등급 필터처럼 화면에 보여줄 후보에만
+            # 지연 계산되므로 평소엔 부담이 없지만, 그래도 "매번 자동으로 네트워크
+            # 조회가 도는" 걸 원치 않을 수 있어 명시적으로 켜야 동작한다.
+            min_liquidity_filter = st.toggle(
+                "최소 거래대금(10억원 미만 제외)",
+                value=False, key="reco_liq_filter_toggle",
+                help="오늘 누적 거래대금이 10억원 미만인 종목을 제외합니다. 화면에 보여줄 후보에 대해서만 지연 계산되어 스캔 속도에는 영향을 주지 않습니다.",
+            )
 
         def assign_grade(row, is_strict):
             per, pbr, roe, debt, drop, div = row['PER'], row['PBR'], row['ROE'], row['부채비율'], row['고점 / 하락률'], row['배당수익률']
@@ -8308,7 +8313,7 @@ def render_recommendations():
         # AI 800+ 조건에 맞는 종목이 하나도 없는 상태에서 유동성 필터까지 켜진 경우).
         # 그래서 각 필터 전에 "이미 비어있지 않을 때만 적용"하도록 막았다.
         if ai_grade_filter != "전체보기" and not display_df.empty:
-            _ai_min_score = {"400+": 400, "500+": 500, "600+": 600, "700+": 700, "800+": 800}[ai_grade_filter]
+            _ai_min_score = {"🌱 400+": 400, "✨ 500+": 500, "⭐ 600+": 600, "🔥 700+": 700, "🚀 800+": 800}[ai_grade_filter]
             _ai_score_map, _ai_still_loading = _render_ai_grade_filter_and_score(display_df, _reco_df)
             display_df = display_df[
                 display_df['종목코드'].apply(
