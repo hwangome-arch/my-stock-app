@@ -8390,12 +8390,20 @@ def render_recommendations():
                     grade_label = row['등급']
                     source_badge = row.get('데이터출처', '🌐 실시간')
                     _ai_score_val = _ai_score_map.get(code)
+                    # ⚠️ [UI 정리] 등급·AI점수·출처 배지 3개의 font-size/padding/
+                    # border-radius가 제각각이라 크기가 안 맞아 보였다. 세 배지 모두
+                    # 같은 크기 규격(10px / 2px 8px / 9px)으로 통일하고, 색상만
+                    # 종류별로 다르게 줘서 구분한다. 순서도 "지금 이 카드를 판단하는 데
+                    # 중요한 순서"로 맞췄다: 등급(1차 분류) → AI 종합점수(2차 판단
+                    # 근거) → 데이터출처(참고용 메타정보, 가장 덜 중요).
+                    _BADGE_BASE = "font-size:10px; font-weight:700; padding:2px 8px; border-radius:9px; margin-left:6px;"
+                    grade_badge_html = f'<span style="{_BADGE_BASE} color:#111827; background:#FFFFFF; border:1px solid #D1D5DB;">{grade_label}</span>'
                     ai_score_badge_html = (
-                        f'<span style="font-size:10px; font-weight:700; color:#4F46E5; background:#EEF2FF; '
-                        f'border: 1px solid #C7D2FE; padding:2px 7px; border-radius:8px; margin-left:6px;">'
-                        f'🤖 AI {int(_ai_score_val)}</span>'
+                        f'<span style="{_BADGE_BASE} color:#4F46E5; background:#EEF2FF; border:1px solid #C7D2FE;">'
+                        f'🎯 AI {int(_ai_score_val)}</span>'
                         if _ai_score_val is not None else ''
                     )
+                    source_badge_html = f'<span style="{_BADGE_BASE} font-weight:500; color:#64748B; background:#F1F5F9; border:1px solid #E2E8F0;">{source_badge}</span>'
 
                     entry_2nd, entry_3rd = calc_entry_points(price, pbr, drop_pct, price)
                     entry_2nd_pct = round((entry_2nd / price - 1) * 100, 1) if price else 0.0
@@ -8442,8 +8450,7 @@ def render_recommendations():
                                     <div>
                                         <span style="font-size:15px; font-weight:700; color:#0F172A;">{name}</span>
                                         <span style="font-size:11px; color:#94A3B8; margin-left:6px;">{code} | {market_str}</span>
-                                        <span style="font-size:11px; font-weight:700; color:#111827; background:#FFFFFF; border: 1px solid #D1D5DB; padding:2px 10px; border-radius:10px; margin-left:8px;">{grade_label}</span>
-                                        <span style="font-size:10px; color:#94A3B8; background:#F1F5F9; border: 1px solid #E2E8F0; padding:2px 7px; border-radius:8px; margin-left:6px;">{source_badge}</span>{ai_score_badge_html}
+                                        {grade_badge_html}{ai_score_badge_html}{source_badge_html}
                                     </div>
                                     <div style="text-align:right;">
                                         <span style="font-size:15px; font-weight:700; color:#0F172A;">{int(price):,}</span>
