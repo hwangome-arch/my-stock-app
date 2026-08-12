@@ -8285,6 +8285,21 @@ def render_recommendations():
 
         market_filter = st.selectbox("시장 분류", ["전체", "코스피", "코스닥"], key="reco_mkt_filter")
 
+        # ⚠️ [UI] st.pills는 버튼 너비/높이를 직접 지정하는 파라미터가 없고, 라벨
+        # 텍스트 길이(+이모지 글리프 크기)에 따라 자동으로 크기가 정해진다. 등급
+        # pills("💎 S급" 등, 2글자)와 AI 점수 pills("🚀 800+" 등, 4글자)가 텍스트
+        # 길이도 다르고 쓰인 이모지도 서로 달라서, 두 줄이 자연스럽게는 크기가
+        # 안 맞았다. 두 그룹 모두 같은 최소 너비/높이를 갖도록 CSS로 강제한다.
+        st.markdown("""
+            <style>
+            div[data-testid="stPills"] button {
+                min-width: 92px;
+                min-height: 34px;
+                font-size: 13px;
+            }
+            </style>
+        """, unsafe_allow_html=True)
+
         st.markdown("<div style='font-size:13px; font-weight:600; color:#475569; margin:14px 0 6px;'>📊 저평가 등급 필터</div>", unsafe_allow_html=True)
         selected_grade = st.pills(
             "등급 필터",
@@ -8437,6 +8452,19 @@ def render_recommendations():
                 page_count = st.session_state.get('_reco_page_count', 1)
                 n_show = min(page_count * PAGE_SIZE, total_n)
                 page_df = display_df.iloc[:n_show]
+
+                # ⚠️ [버그 수정] AI 등급 필터가 "전체보기"일 때 _ai_score_map이 계속
+                # 빈 채로 남아있어서, 필터를 켜지 않으면 카드에 AI 점수 배지 자체가
+                # 아예 안 뜨는 문제가 있었다. "필터링용 계산"과 "배지 표시용 계산"을
+                # 분리한다 — 필터가 꺼져 있어도 지금 화면에 실제로 그려질 page_df
+                # (최대 PAGE_SIZE 단위, 전체 후보가 아님)에 대해서만 배경에서 계산해
+                # 배지를 채운다. 전체 후보(최대 150개 안팎)를 매번 계산하는 게
+                # 아니라 "지금 보이는 만큼만"이라, 애초에 AI 필터 자체를 설계할 때
+                # 세웠던 원칙(_render_ai_grade_filter_and_score 참고)을 그대로 지킨다.
+                if ai_grade_filter == "전체보기" and not page_df.empty:
+                    _ai_score_map, _ai_still_loading = _render_ai_grade_filter_and_score(page_df, _reco_df)
+                    if _ai_still_loading:
+                        st.caption("⏳ 화면에 보이는 종목의 AI 종합점수를 계산 중입니다...")
 
                 for _, row in page_df.iterrows():
                     name  = row['종목명']
