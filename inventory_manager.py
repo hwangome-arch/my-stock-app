@@ -7389,53 +7389,33 @@ def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=
 
     df_annual을 미리 전달하면(재무 데이터를 이미 조회한 경우) 재조회를 생략한다.
 
-    ⚠️ [최적화: 내부 호출 병렬화] 원래는 df_price → 스파크라인 → 재무 → (calc_flow_score
-    내부의) 수급, 이렇게 4번의 외부 호출이 전부 순차적으로 실행됐다. 종목 하나를
-    처음 계산할 때(캐시 미스) 이 넷을 하나씩 기다리면 지연이 그대로 합산된다.
-    지금은 넷을 동시에 던지고 기다려서, 지연이 '합'이 아니라 '가장 느린 것 하나'
-    수준으로 줄어든다.
-
-    ⚠️ 반드시 get_shared_executor()가 아니라 get_orchestration_executor()(완전히
-    분리된 별도 풀)를 쓴다. 이 함수는 AI 등급 필터의 배치 계산(_score_one_for_ai_batch)
-    처럼 '이미 get_shared_executor()의 워커 스레드 안'에서 호출되는 경우가 있다.
-    그 상태에서 같은 공유 풀에 또 작업을 던지고 기다리면, 공유 풀 워커가 전부
-    서로를 기다리게 되는 자기 자신을 기다리는 교착상태가 생길 수 있다(관심종목
-    프리페치에서 이미 한 번 겪었던 문제와 동일한 패턴 — get_yf_safety_executor/
-    get_orchestration_executor 관련 주석 참고). 메인 스레드에서 직접 호출되는
-    경우(카드를 열어 AI 진단을 볼 때)에도 문제없이 동작한다."""
+    ⚠️ [되돌림: 내부 호출 병렬화 롤백 — 2026-08-12] 한때 df_price/스파크라인/재무/
+    수급을 get_orchestration_executor()로 동시에 던져서 병렬화했었는데, 실제
+    배포 환경 로그에서 "'공유' 풀/'오케스트레이션' 풀이 25초 이상 완전히 막혀있어
+    새 풀로 교체함"이 반복적으로 찍히며 대시보드 페이지가 몇십 초씩 응답을
+    못 하는 현상이 실측됐다. 원인은 순환 대기(circular wait) 교착상태였다:
+    전체 스캔(_unified_scan_worker)은 get_orchestration_executor()에서 돌면서
+    내부적으로 get_shared_executor()의 작업들을 기다리는데, 반대로 AI 점수
+    배치(_score_one_for_ai_batch)는 get_shared_executor()에서 돌면서 이 함수가
+    get_orchestration_executor()의 작업을 기다리고 있었다 — 두 풀이 서로를
+    기다리며 아무도 못 움직이는 상황. 순수 순차 호출로 되돌린다. 처음 계산
+    시(캐시 미스) 조금 느리더라도, 세션이 통째로 멈추는 것보다는 훨씬 낫다."""
     code = normalize_kr_code(code)
 
-    _executor = get_orchestration_executor()
-    _futs = {
-        "price": submit_with_ctx(_executor, fetch_price_history_for_score, code),
-        "sparkline": submit_with_ctx(_executor, fetch_sparkline_data),
-        "investor": submit_with_ctx(_executor, fetch_investor_trend_by_code, code),
-    }
-    if df_annual is None:
-        _futs["financial"] = submit_with_ctx(_executor, fetch_financial_data, code)
-
     try:
-        df_price = _futs["price"].result(timeout=12)
+        df_price = fetch_price_history_for_score(code)
     except Exception:
         df_price = pd.DataFrame()
 
     kospi_closes = None
     try:
-        kospi_closes = _futs["sparkline"].result(timeout=12).get("kospi")
-    except Exception:
-        pass
-
-    # investor 결과 자체는 여기서 안 쓴다 — fetch_investor_trend_by_code의
-    # @st.cache_data 캐시를 미리 데워두는 게 목적이다. 이 result()를 기다려야
-    # 아래 calc_flow_score 내부의 (같은 인자로 부르는) 호출이 캐시 히트를 보장받는다.
-    try:
-        _futs["investor"].result(timeout=12)
+        kospi_closes = fetch_sparkline_data().get("kospi")
     except Exception:
         pass
 
     if df_annual is None:
         try:
-            df_annual, _, _ = _futs["financial"].result(timeout=12)
+            df_annual, _, _ = fetch_financial_data(code)
         except Exception:
             df_annual = None
 
@@ -8453,19 +8433,16 @@ def render_recommendations():
                 n_show = min(page_count * PAGE_SIZE, total_n)
                 page_df = display_df.iloc[:n_show]
 
-                # ⚠️ [버그 수정] AI 등급 필터가 "전체보기"일 때 _ai_score_map이 계속
-                # 빈 채로 남아있어서, 필터를 켜지 않으면 카드에 AI 점수 배지 자체가
-                # 아예 안 뜨는 문제가 있었다. "필터링용 계산"과 "배지 표시용 계산"을
-                # 분리한다 — 필터가 꺼져 있어도 지금 화면에 실제로 그려질 page_df
-                # (최대 PAGE_SIZE 단위, 전체 후보가 아님)에 대해서만 배경에서 계산해
-                # 배지를 채운다. 전체 후보(최대 150개 안팎)를 매번 계산하는 게
-                # 아니라 "지금 보이는 만큼만"이라, 애초에 AI 필터 자체를 설계할 때
-                # 세웠던 원칙(_render_ai_grade_filter_and_score 참고)을 그대로 지킨다.
-                if ai_grade_filter == "전체보기" and not page_df.empty:
-                    _ai_score_map, _ai_still_loading = _render_ai_grade_filter_and_score(page_df, _reco_df)
-                    if _ai_still_loading:
-                        st.caption("⏳ 화면에 보이는 종목의 AI 종합점수를 계산 중입니다...")
-
+                # ⚠️ [되돌림 — 2026-08-12] "AI 필터가 꺼져있어도 화면에 보이는
+                # page_df만큼은 자동으로 배지를 계산해서 보여준다"는 기능을 넣었었는데,
+                # 실측 로그에서 스캔이 끝난 뒤에도 '추천 종목' 페이지가 0.1~1초 간격의
+                # 재실행 스팸을 계속 일으키며 '공유'/'오케스트레이션' 풀이 번갈아
+                # "완전히 막혀있어 새 풀로 교체함" 상태에 빠지는 게 확인됐다. 페이지에
+                # 진입할 때마다(=폴링 재실행마다) 배경 계산이 계속 재점화되면서
+                # 스레드풀에 부담이 누적된 것으로 보인다. 그래서 AI 점수 배지는
+                # 다시 "AI 등급 필터를 켰을 때만" 계산하도록 보수적인 방식으로
+                # 되돌린다 — 화면에 자동으로 배지가 뜨는 편의는 포기하더라도,
+                # 안정성을 우선한다.
                 for _, row in page_df.iterrows():
                     name  = row['종목명']
                     code  = str(row['종목코드']).zfill(6)
