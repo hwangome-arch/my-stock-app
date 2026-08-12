@@ -8268,7 +8268,14 @@ def render_recommendations():
 
         _ai_score_map = {}
         _ai_still_loading = False
-        if ai_grade_filter != "전체보기":
+        # ⚠️ [버그 수정] display_df가 이미 0행일 때 그 위에 .apply() 기반 필터를
+        # 또 적용하면, pandas가 빈 Series의 dtype을 제대로 추론하지 못해 boolean
+        # 마스크가 아닌 이상한 타입이 되고, 그걸로 인덱싱하면 행뿐 아니라 컬럼까지
+        # 통째로 날아간다(실측: KeyError('고점 / 하락률') at sort_values). AI
+        # 필터에서 이미 0건이 된 뒤 유동성 필터까지 체이닝될 때 재현됐다(예:
+        # AI 800+ 조건에 맞는 종목이 하나도 없는 상태에서 유동성 필터까지 켜진 경우).
+        # 그래서 각 필터 전에 "이미 비어있지 않을 때만 적용"하도록 막았다.
+        if ai_grade_filter != "전체보기" and not display_df.empty:
             _ai_min_score = {"500+": 500, "600+": 600, "700+": 700, "800+": 800}[ai_grade_filter]
             _ai_score_map, _ai_still_loading = _render_ai_grade_filter_and_score(display_df, _reco_df)
             display_df = display_df[
@@ -8278,7 +8285,7 @@ def render_recommendations():
             ]
 
         _liq_still_loading = False
-        if min_liquidity_filter:
+        if min_liquidity_filter and not display_df.empty:
             _liq_value_map, _liq_still_loading = _render_liquidity_filter_and_value(display_df, _reco_df)
             display_df = display_df[
                 display_df['종목코드'].apply(
@@ -8288,8 +8295,6 @@ def render_recommendations():
                 )
             ]
 
-        display_df = display_df.sort_values('고점 / 하락률', ascending=True).reset_index(drop=True)
-
         username = st.session_state.get("auth_user")
 
         if _ai_still_loading:
@@ -8297,9 +8302,14 @@ def render_recommendations():
         if _liq_still_loading:
             st.caption("⏳ 일부 종목은 거래대금을 아직 확인 중입니다 — 확인되는 대로 자동으로 반영됩니다.")
 
+        # ⚠️ [방어 코드] 위 필터링 과정에서 어떤 이유로든(pandas 버전 이슈 포함)
+        # display_df가 컬럼까지 잃어버린 채로 넘어오는 상황을 대비해, sort_values를
+        # 부르기 전에 반드시 empty 여부부터 확인한다 — 근본 원인이 또 있더라도
+        # 화면이 통째로 죽는 것만은 막기 위함.
         if display_df.empty:
             st.info(f"현재 설정된 필터({market_filter}, {selected_grade}, AI {ai_grade_filter})에 부합하는 종목이 없습니다. 조건을 완화해보세요.")
         else:
+            display_df = display_df.sort_values('고점 / 하락률', ascending=True).reset_index(drop=True)
             PAGE_SIZE = 15
             total_n = len(display_df)
             # ⚠️ total_n을 시그니처에 넣지 않는다 — AI 등급 필터가 점진적으로 채워지는
