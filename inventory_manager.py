@@ -573,7 +573,31 @@ _BG_JOB_OWNER_PAGES = {
     "investor_monthly_kosdaq": {"대시보드 홈"},
     "watchlist_prefetch_new": {"관심종목"},
 }
+# ⚠️ [버그 수정] 추천 종목 탭의 AI 점수/유동성 배치는 job_key가 매 배치마다
+# 종목코드 조합으로 달라지는 동적 키(reco_ai_batch_005930-000660-..., 등)라서
+# 위의 고정 키 딕셔너리로는 등록할 수 없었다. 그래서 이 job들이 소유 페이지
+# 매핑에서 계속 빠진 채로 남아있었고, 사용자가 '추천 종목'을 벗어나도 정리가
+# 안 돼서 전역 폴러가 다른 페이지에 있을 때까지 계속 재실행을 유발했다(실측:
+# 대시보드/기업 재무 분석 등 무관한 페이지에서까지 재실행 스팸 + 스레드풀
+# 반복 고갈 + 화면 전환 시 이전 페이지 DOM이 덜 지워지는 것으로 추정되는
+# 렌더링 겹침 현상). 접두사 기반으로도 소유 페이지를 판별하도록 확장했다.
+_BG_JOB_OWNER_PREFIXES = {
+    "reco_ai_batch_": {"추천 종목"},
+    "reco_liq_batch_": {"추천 종목"},
+}
 _SCAN_JOB_OWNER_PAGES = {"대시보드 홈", "종목 스크리너"}
+
+
+def _bg_job_owners(key):
+    """job_key의 소유 페이지 집합을 반환한다. 고정 키 딕셔너리에 없으면 접두사
+    매칭도 시도한다. 둘 다 없으면 None(소유 페이지를 모름 → 안전하게 보존)."""
+    owners = _BG_JOB_OWNER_PAGES.get(key)
+    if owners is not None:
+        return owners
+    for prefix, prefix_owners in _BG_JOB_OWNER_PREFIXES.items():
+        if key.startswith(prefix):
+            return prefix_owners
+    return None
 
 
 def _purge_orphaned_jobs():
@@ -582,7 +606,7 @@ def _purge_orphaned_jobs():
     bg_jobs = st.session_state.get("_bg_jobs")
     if bg_jobs:
         for key in list(bg_jobs.keys()):
-            owners = _BG_JOB_OWNER_PAGES.get(key)
+            owners = _bg_job_owners(key)
             if owners is None or current in owners:
                 continue  # 소유 페이지를 모르거나(안전하게 보존) 지금 그 페이지에 있으면 건드리지 않음
             futures = bg_jobs[key].get("futures", {})
