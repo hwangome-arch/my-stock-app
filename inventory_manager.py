@@ -8324,7 +8324,7 @@ def render_recommendations():
         st.markdown("<div style='font-size:13px; font-weight:600; color:#475569; margin:14px 0 6px;'>🤖 AI 종합점수 필터</div>", unsafe_allow_html=True)
         ai_grade_filter = st.pills(
             "AI 등급 필터",
-            ["전체보기", "🚀 800+", "🔥 700+", "⭐ 600+", "✨ 500+", "🌱 400+"],
+            ["전체보기", "🚀 800~1000", "🔥 700~799", "⭐ 600~699", "✨ 500~599", "🌱 400~499"],
             default="전체보기",
             label_visibility="collapsed",
             key="reco_ai_grade_pills",
@@ -8391,11 +8391,20 @@ def render_recommendations():
         # AI 800+ 조건에 맞는 종목이 하나도 없는 상태에서 유동성 필터까지 켜진 경우).
         # 그래서 각 필터 전에 "이미 비어있지 않을 때만 적용"하도록 막았다.
         if ai_grade_filter != "전체보기" and not display_df.empty:
-            _ai_min_score = {"🌱 400+": 400, "✨ 500+": 500, "⭐ 600+": 600, "🔥 700+": 700, "🚀 800+": 800}[ai_grade_filter]
+            # ⚠️ [배타적 구간으로 변경] 예전엔 ">= min_score"(누적, 상한 없음)라서
+            # "600+"를 골라도 700점·800점짜리가 다 같이 나왔다. 지금은 각 pill이
+            # 정확히 그 구간(예: 600~699)만 가리키도록 (min, max) 튜플로 바꿨다.
+            # 맨 위 구간(800~1000)만 사실상 상한이 없는 것과 같은 효과를 내도록
+            # max를 1000으로 둔다(1000점 만점이라 자연스러운 상한).
+            _ai_score_bands = {
+                "🌱 400~499": (400, 499), "✨ 500~599": (500, 599), "⭐ 600~699": (600, 699),
+                "🔥 700~799": (700, 799), "🚀 800~1000": (800, 1000),
+            }
+            _ai_min_score, _ai_max_score = _ai_score_bands[ai_grade_filter]
             _ai_score_map, _ai_still_loading = _render_ai_grade_filter_and_score(display_df, _reco_df)
             display_df = display_df[
                 display_df['종목코드'].apply(
-                    lambda c: (_ai_score_map.get(str(c).zfill(6)) or -1) >= _ai_min_score
+                    lambda c: (lambda v: v is not None and _ai_min_score <= v <= _ai_max_score)(_ai_score_map.get(str(c).zfill(6)))
                 )
             ]
 
