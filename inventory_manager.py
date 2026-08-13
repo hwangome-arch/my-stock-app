@@ -8730,9 +8730,14 @@ def render_screener():
     st.markdown("<hr style='margin: 10px 0 15px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
 
     preset_names = list(SCREENER_PRESETS.keys())
-    selected_preset = st.pills("필터 단계", preset_names, default=preset_names[0], key="screener_preset", label_visibility="collapsed")
-    if selected_preset is None:
-        selected_preset = preset_names[0]
+    col_tabs, col_scan_btn = st.columns([5, 1.6])
+    with col_tabs:
+        selected_preset = st.pills("필터 단계", preset_names, default=preset_names[0], key="screener_preset", label_visibility="collapsed")
+        if selected_preset is None:
+            selected_preset = preset_names[0]
+    with col_scan_btn:
+        st.markdown("<div style='height: 2px;'></div>", unsafe_allow_html=True)
+        _screener_scan_clicked = st.button("실시간 데이터 ⚡초고속 스캔 실행", use_container_width=True, key="screener_scan_btn")
     preset = SCREENER_PRESETS[selected_preset]
 
     if preset:
@@ -8760,7 +8765,6 @@ def render_screener():
         </div>
     """, unsafe_allow_html=True)
 
-    _screener_scan_clicked = st.button("실시간 데이터 ⚡초고속 스캔 실행")
     if _screener_scan_clicked or "unified_scan" in st.session_state.get("_scan_jobs", {}):
         run_unified_market_scan_async()
 
@@ -9440,11 +9444,15 @@ def render_dividend():
     with col_btn:
         st.button("조회", key="dividend_search_btn", use_container_width=True)
 
-    col_refresh, col_caption2, col_toggle = st.columns([1.5, 5, 1.5])
+    col_refresh, col_scan, col_caption2, col_toggle = st.columns([1.5, 1.5, 4, 1.5])
     with col_refresh:
-        if st.button("데이터 새로고침"):
+        if st.button("데이터 새로고침", use_container_width=True):
             fetch_dividend_ranking.clear()
             st.session_state["dividend_scanned"] = True
+    with col_scan:
+        if not st.session_state.get("dividend_scanned"):
+            if st.button("🔍 배당 데이터 조회", key="dividend_manual_scan_btn", type="primary", use_container_width=True):
+                st.session_state["dividend_scanned"] = True
     with col_toggle:
         st.markdown("<div style='display:flex; justify-content:flex-end; align-items:center; padding-top:4px; width:100%;'>", unsafe_allow_html=True)
         st.toggle(
@@ -9460,9 +9468,7 @@ def render_dividend():
     # 블로킹됐다. 그래서 다른 탭으로 빠르게 넘어가려 해도 이 스캔이 끝날 때까지 클릭이
     # 씹혔다. 이제는 사용자가 명시적으로 버튼을 눌러야만 스캔을 시작하도록 변경.
     if not st.session_state.get("dividend_scanned"):
-        st.info("💡 아직 배당 데이터를 조회하지 않았습니다. 아래 버튼을 눌러 조회해주세요. (약 5~15초 소요)")
-        if st.button("🔍 배당 데이터 조회", key="dividend_manual_scan_btn", type="primary"):
-            st.session_state["dividend_scanned"] = True
+        st.info("💡 아직 배당 데이터를 조회하지 않았습니다. 위 [배당 데이터 조회] 버튼을 눌러 조회해주세요. (약 5~15초 소요)")
         return
 
     df = run_with_progress("마켓 데이터 수집 중...", fetch_dividend_ranking)
