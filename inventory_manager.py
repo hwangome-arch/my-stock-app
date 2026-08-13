@@ -7730,6 +7730,27 @@ def _save_disk_cache(path, sig, cache_dict):
         pass
 
 
+def _track_batch_progress_stall(tracker_key, done_count, stall_threshold=25):
+    """[진행률 정체 감지] AI 종합점수/거래대금 배치 계산이 여러 rerun에 걸쳐
+    점진적으로 채워지는 도중, done_count(완료 개수)가 stall_threshold초 이상
+    전혀 늘지 않으면 '정체됨(stalled)'으로 판단해 True를 반환한다.
+
+    ⚠️ [주의: 한계] 이 판정은 페이지 스크립트가 실제로 다시 실행돼야만(rerun)
+    동작한다. 만약 브라우저 탭이 백그라운드로 밀리거나 웹소켓 연결 자체가
+    끊겨서 재실행 자체가 아예 안 일어나는 상황이라면, 이 함수를 포함한 모든
+    코드가 실행되지 않으므로 정체 안내 문구조차 띄울 수 없다 — 그런 경우는
+    사용자가 직접 새로고침하는 것 외에는 서버 쪽 코드로 해결할 수 없다.
+    이 함수는 어디까지나 "재실행은 계속 되는데 계산 자체가 같은 자리에서
+    맴도는" 경우(예: 같은 종목이 매번 타임아웃되어 재시도만 반복)를 잡기 위함이다."""
+    tracker = st.session_state.setdefault('_batch_progress_tracker', {})
+    now = time.time()
+    prev = tracker.get(tracker_key)
+    if prev is None or prev.get('done') != done_count:
+        tracker[tracker_key] = {'done': done_count, 'ts': now}
+        return False
+    return (now - prev['ts']) > stall_threshold
+
+
 def _render_liquidity_filter_and_value(display_df, source_df):
     """[최소 유동성 필터] AI 등급 필터와 완전히 동일한 지연 계산 패턴을 쓴다.
 
@@ -7796,7 +7817,18 @@ def _render_liquidity_filter_and_value(display_df, source_df):
     # "c가 cache 안에 키로 존재하는지"로 완료 여부를 판단해야 한다.
     done_count = sum(1 for c in codes_needed if c in cache)
     total_count = len(codes_needed)
-    return value_map, still_loading, done_count, total_count
+
+    # ── [진단 로그] 전체 스캔의 [DEBUG SCAN ...]과 동일한 취지 — 배치 계산이
+    # 왜/언제 멈췄는지 다음에 로그만 보고도 재구성할 수 있게 남긴다.
+    print(f"[DEBUG 유동성배치 {datetime.datetime.now().strftime('%H:%M:%S')}] "
+          f"sig={_sig[:8]} done={done_count}/{total_count} still_loading={still_loading}",
+          file=sys.stderr, flush=True)
+
+    stalled = False
+    if still_loading:
+        stalled = _track_batch_progress_stall(f"liq_{_sig}", done_count)
+
+    return value_map, still_loading, done_count, total_count, stalled
 
 
 def _render_ai_grade_filter_and_score(display_df, source_df):
@@ -7886,7 +7918,18 @@ def _render_ai_grade_filter_and_score(display_df, source_df):
     # 존재하는지"를 완료 기준으로 삼는다 (실패해도 None으로 캐시에 남으므로 완료로 집계).
     done_count = sum(1 for c in codes_needed if c in cache)
     total_count = len(codes_needed)
-    return score_map, still_loading, done_count, total_count
+
+    # ── [진단 로그] 전체 스캔의 [DEBUG SCAN ...]과 동일한 취지 — 배치 계산이
+    # 왜/언제 멈췄는지 다음에 로그만 보고도 재구성할 수 있게 남긴다.
+    print(f"[DEBUG AI배치 {datetime.datetime.now().strftime('%H:%M:%S')}] "
+          f"sig={_sig[:8]} done={done_count}/{total_count} still_loading={still_loading}",
+          file=sys.stderr, flush=True)
+
+    stalled = False
+    if still_loading:
+        stalled = _track_batch_progress_stall(f"ai_{_sig}", done_count)
+
+    return score_map, still_loading, done_count, total_count, stalled
 
 
 def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_label):
@@ -8295,6 +8338,7 @@ def render_recommendations():
         _ai_score_map = {}
         _ai_still_loading = False
         _ai_done, _ai_total = 0, 0
+        _ai_stalled = False
         # ⚠️ [버그 수정] display_df가 이미 0행일 때 그 위에 .apply() 기반 필터를
         # 또 적용하면, pandas가 빈 Series의 dtype을 제대로 추론하지 못해 boolean
         # 마스크가 아닌 이상한 타입이 되고, 그걸로 인덱싱하면 행뿐 아니라 컬럼까지
@@ -8313,7 +8357,7 @@ def render_recommendations():
                 "🔥 700~799": (700, 799), "🚀 800~1000": (800, 1000),
             }
             _ai_min_score, _ai_max_score = _ai_score_bands[ai_grade_filter]
-            _ai_score_map, _ai_still_loading, _ai_done, _ai_total = _render_ai_grade_filter_and_score(display_df, _reco_df)
+            _ai_score_map, _ai_still_loading, _ai_done, _ai_total, _ai_stalled = _render_ai_grade_filter_and_score(display_df, _reco_df)
             display_df = display_df[
                 display_df['종목코드'].apply(
                     lambda c: (lambda v: v is not None and _ai_min_score <= v <= _ai_max_score)(_ai_score_map.get(str(c).zfill(6)))
@@ -8322,8 +8366,9 @@ def render_recommendations():
 
         _liq_still_loading = False
         _liq_done, _liq_total = 0, 0
+        _liq_stalled = False
         if min_liquidity_filter and not display_df.empty:
-            _liq_value_map, _liq_still_loading, _liq_done, _liq_total = _render_liquidity_filter_and_value(display_df, _reco_df)
+            _liq_value_map, _liq_still_loading, _liq_done, _liq_total, _liq_stalled = _render_liquidity_filter_and_value(display_df, _reco_df)
             display_df = display_df[
                 display_df['종목코드'].apply(
                     # 조회 실패(None)는 fail-open으로 통과시킨다 — API 오류를
@@ -8345,11 +8390,21 @@ def render_recommendations():
         # "한 번에 정리된" 결과만 보여주도록 바꾼다.
         if _ai_still_loading:
             _ai_pct = int((_ai_done / _ai_total) * 100) if _ai_total else 0
-            st.info(f"⏳ AI 종합점수를 계산하는 중입니다 ({_ai_done}/{_ai_total}건, {_ai_pct}%). 완료되면 결과가 한 번에 표시됩니다 (잠시만 기다려주세요)...")
+            if _ai_stalled:
+                st.warning(f"⚠️ AI 종합점수 계산이 멈춘 것 같습니다 ({_ai_done}/{_ai_total}건, {_ai_pct}%에서 진행이 없습니다). 네트워크 조회가 지연되고 있을 수 있어요.")
+                if st.button("🔄 새로고침해서 이어서 계산하기", key="reco_ai_stall_refresh"):
+                    st.rerun()
+            else:
+                st.info(f"⏳ AI 종합점수를 계산하는 중입니다 ({_ai_done}/{_ai_total}건, {_ai_pct}%). 완료되면 결과가 한 번에 표시됩니다 (잠시만 기다려주세요)...")
             return
         if _liq_still_loading:
             _liq_pct = int((_liq_done / _liq_total) * 100) if _liq_total else 0
-            st.info(f"⏳ 거래대금을 확인하는 중입니다 ({_liq_done}/{_liq_total}건, {_liq_pct}%). 완료되면 결과가 한 번에 표시됩니다 (잠시만 기다려주세요)...")
+            if _liq_stalled:
+                st.warning(f"⚠️ 거래대금 확인이 멈춘 것 같습니다 ({_liq_done}/{_liq_total}건, {_liq_pct}%에서 진행이 없습니다). 네트워크 조회가 지연되고 있을 수 있어요.")
+                if st.button("🔄 새로고침해서 이어서 계산하기", key="reco_liq_stall_refresh"):
+                    st.rerun()
+            else:
+                st.info(f"⏳ 거래대금을 확인하는 중입니다 ({_liq_done}/{_liq_total}건, {_liq_pct}%). 완료되면 결과가 한 번에 표시됩니다 (잠시만 기다려주세요)...")
             return
 
         # ⚠️ [방어 코드] 위 필터링 과정에서 어떤 이유로든(pandas 버전 이슈 포함)
