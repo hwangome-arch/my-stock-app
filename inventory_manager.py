@@ -633,6 +633,33 @@ def maybe_run_global_poller():
         _global_poll_fragment()
 # ────────────────────────────────────────────────────────────────────────
 
+# ── [스캔 완료 후 AI 점수 자동 일괄 계산 — 페이지 이동과 무관하게 이어짐] ──────
+# 문제: AI 점수 배치 계산 코드(_render_ai_grade_filter_and_score)는 원래
+# render_recommendations() 안에서만 호출된다. 그런데 스캔 직후 사용자는 보통
+# 대시보드에 그대로 머물러 있지, 곧바로 추천 종목 탭을 열지는 않는다. 그
+# 상태로는 배치를 "제출"하는 코드 자체가 한 번도 실행되지 않아서, 스캔이
+# 끝나도 AI 점수 계산은 사용자가 실제로 추천 종목 탭을 열기 전까지 그냥
+# 멈춰있는 것처럼 보인다.
+# 해결: 페이지 디스패치 직후(어느 페이지에 있든) 이 함수를 호출해서, 진행
+# 플래그(_reco_ai_bulk_scan)만 보고 배치 제출/수거를 계속 이어가게 한다.
+# 추천 종목 탭이 열려 있을 때는 render_recommendations() 자신이 이미 이
+# 경로를 처리하므로, 같은 스크립트 실행 안에서 여기서 또 부르면 캐시가
+# 갱신된 직후의 서로 다른 배치가 중복 제출될 수 있어(1회 실행당 최대 2배
+# 네트워크 요청) 호출부에서 "추천 종목 탭이 아닐 때만" 이 함수를 부르도록
+# 가드한다 (_main_impl 참고).
+def maybe_kickoff_ai_bulk_scan():
+    if not st.session_state.get('_reco_ai_bulk_scan'):
+        return
+    _reco_df = load_reco_df()
+    if _reco_df.empty:
+        # 후보 자체가 없어졌으면(스캔 결과 없음 등) 더 계산할 게 없으니 끈다.
+        st.session_state['_reco_ai_bulk_scan'] = False
+        return
+    _, _still_loading, _, _, _ = _render_ai_grade_filter_and_score(_reco_df, _reco_df)
+    if not _still_loading:
+        st.session_state['_reco_ai_bulk_scan'] = False
+# ────────────────────────────────────────────────────────────────────────
+
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_market_index_table():
     """
@@ -3479,6 +3506,15 @@ def run_unified_market_scan_async(job_key="unified_scan", overall_timeout=150):
             reco_df.to_csv(RECO_PATH, index=False, encoding='utf-8-sig')
         except Exception:
             pass
+        # ⚠️ [스캔 완료 시 AI 점수 자동 일괄 계산] 스캔 한 번으로 스크리너+추천
+        # 후보가 갱신될 때, 사용자가 추천 종목 탭에 들어가 "AI 점수 일괄 계산"
+        # 버튼을 따로 또 누르지 않아도 되도록 여기서 플래그만 켜둔다. 실제 계산
+        # 제출/진행은 무거우니 스캔 자체(_unified_scan_worker)에 합쳐 넣지 않고,
+        # 기존에 이미 검증된 배치 계산 경로(_render_ai_grade_filter_and_score →
+        # render_async_multi, 30개씩·정체 감지·디스크 캐시 포함)를 그대로
+        # 재사용한다. 대시보드/스크리너에 계속 머물러 있어도 진행되도록
+        # maybe_kickoff_ai_bulk_scan()이 페이지와 무관하게 이어서 처리한다.
+        st.session_state['_reco_ai_bulk_scan'] = True
     else:
         st.session_state.pop('reco_raw_data', None)
         if os.path.exists(RECO_PATH):
@@ -5952,6 +5988,18 @@ def _main_impl():
     # 멈춤 현상이 완전히 해결됐다고 확신이 들 때까지만 남겨둔다. 로그의 마지막
     # "진입"만 있고 "완료"가 없는 페이지가 바로 멈춘 지점이다.
     print(f"[DEBUG {datetime.datetime.now().strftime('%H:%M:%S')}] 페이지 진입: {selected}", file=sys.stderr, flush=True)
+
+    # ── [AI 점수 일괄 계산 이어가기 — 반드시 페이지 렌더링보다 먼저] ─────────────
+    # 대시보드/종목 스크리너 페이지는 자기 렌더링 함수 안에서 스스로
+    # maybe_run_global_poller()를 호출해 전역 폴링 fragment를 띄운다. 그 호출
+    # 시점에 _bg_jobs가 비어있으면 fragment 자체가 아예 안 뜬다(has_pending=False
+    # 이면 마운트를 건너뜀). 그래서 AI 점수 일괄 계산 job은 각 페이지가 자기
+    # 폴러를 부르기 "전에" 먼저 _bg_jobs에 등록돼 있어야, 그 페이지의 폴러가
+    # 이 job도 함께 보고 fragment를 정상적으로 띄워준다. (스캔 완료 시점에
+    # run_unified_market_scan_async()가 플래그를 켠 직후 st.rerun()으로 다음
+    # 실행으로 넘기므로, 다음 실행의 이 시점엔 플래그가 이미 반영돼 있다.)
+    if selected != "추천 종목":
+        maybe_kickoff_ai_bulk_scan()
 
     # ── [워치독 통합] 개별 arm/cancel은 파일 상단의 영구(repeat=True) 워치독과
     # 충돌하므로 여기서 더 이상 걸지 않는다 (자세한 이유는 파일 상단 주석 참고).
