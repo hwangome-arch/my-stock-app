@@ -7791,7 +7791,12 @@ def _render_liquidity_filter_and_value(display_df, source_df):
 
     value_map = {c: cache.get(c) for c in codes_needed}
     still_loading = any(c not in cache for c in codes_needed)
-    return value_map, still_loading
+    # ⚠️ [진행률 표시 추가] 완료 개수/전체 개수를 함께 돌려준다. cache.get(c)는
+    # "아직 안 끝남"과 "끝났지만 실패(None)"를 구분 못 하므로(둘 다 None), 반드시
+    # "c가 cache 안에 키로 존재하는지"로 완료 여부를 판단해야 한다.
+    done_count = sum(1 for c in codes_needed if c in cache)
+    total_count = len(codes_needed)
+    return value_map, still_loading, done_count, total_count
 
 
 def _render_ai_grade_filter_and_score(display_df, source_df):
@@ -7877,7 +7882,11 @@ def _render_ai_grade_filter_and_score(display_df, source_df):
 
     score_map = {c: cache.get(c) for c in codes_needed}
     still_loading = any(c not in cache for c in codes_needed)
-    return score_map, still_loading
+    # ⚠️ [진행률 표시 추가] 유동성 필터와 동일한 이유로 "cache 안에 키로
+    # 존재하는지"를 완료 기준으로 삼는다 (실패해도 None으로 캐시에 남으므로 완료로 집계).
+    done_count = sum(1 for c in codes_needed if c in cache)
+    total_count = len(codes_needed)
+    return score_map, still_loading, done_count, total_count
 
 
 def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_label):
@@ -8285,6 +8294,7 @@ def render_recommendations():
 
         _ai_score_map = {}
         _ai_still_loading = False
+        _ai_done, _ai_total = 0, 0
         # ⚠️ [버그 수정] display_df가 이미 0행일 때 그 위에 .apply() 기반 필터를
         # 또 적용하면, pandas가 빈 Series의 dtype을 제대로 추론하지 못해 boolean
         # 마스크가 아닌 이상한 타입이 되고, 그걸로 인덱싱하면 행뿐 아니라 컬럼까지
@@ -8303,7 +8313,7 @@ def render_recommendations():
                 "🔥 700~799": (700, 799), "🚀 800~1000": (800, 1000),
             }
             _ai_min_score, _ai_max_score = _ai_score_bands[ai_grade_filter]
-            _ai_score_map, _ai_still_loading = _render_ai_grade_filter_and_score(display_df, _reco_df)
+            _ai_score_map, _ai_still_loading, _ai_done, _ai_total = _render_ai_grade_filter_and_score(display_df, _reco_df)
             display_df = display_df[
                 display_df['종목코드'].apply(
                     lambda c: (lambda v: v is not None and _ai_min_score <= v <= _ai_max_score)(_ai_score_map.get(str(c).zfill(6)))
@@ -8311,8 +8321,9 @@ def render_recommendations():
             ]
 
         _liq_still_loading = False
+        _liq_done, _liq_total = 0, 0
         if min_liquidity_filter and not display_df.empty:
-            _liq_value_map, _liq_still_loading = _render_liquidity_filter_and_value(display_df, _reco_df)
+            _liq_value_map, _liq_still_loading, _liq_done, _liq_total = _render_liquidity_filter_and_value(display_df, _reco_df)
             display_df = display_df[
                 display_df['종목코드'].apply(
                     # 조회 실패(None)는 fail-open으로 통과시킨다 — API 오류를
@@ -8333,10 +8344,12 @@ def render_recommendations():
         # 계산이 완전히 끝나기 전까지는 목록 자체를 그리지 않고, 다 끝난 뒤
         # "한 번에 정리된" 결과만 보여주도록 바꾼다.
         if _ai_still_loading:
-            st.info("⏳ AI 종합점수를 계산하는 중입니다. 완료되면 결과가 한 번에 표시됩니다 (잠시만 기다려주세요)...")
+            _ai_pct = int((_ai_done / _ai_total) * 100) if _ai_total else 0
+            st.info(f"⏳ AI 종합점수를 계산하는 중입니다 ({_ai_done}/{_ai_total}건, {_ai_pct}%). 완료되면 결과가 한 번에 표시됩니다 (잠시만 기다려주세요)...")
             return
         if _liq_still_loading:
-            st.info("⏳ 거래대금을 확인하는 중입니다. 완료되면 결과가 한 번에 표시됩니다 (잠시만 기다려주세요)...")
+            _liq_pct = int((_liq_done / _liq_total) * 100) if _liq_total else 0
+            st.info(f"⏳ 거래대금을 확인하는 중입니다 ({_liq_done}/{_liq_total}건, {_liq_pct}%). 완료되면 결과가 한 번에 표시됩니다 (잠시만 기다려주세요)...")
             return
 
         # ⚠️ [방어 코드] 위 필터링 과정에서 어떤 이유로든(pandas 버전 이슈 포함)
