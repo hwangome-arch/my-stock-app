@@ -3038,12 +3038,11 @@ def _safe_save_screener_df(new_df, path="saved_screener_data.csv"):
 
 def load_screener_df():
     save_path = "saved_screener_data.csv"
-    # ⚠️ [버그 수정] merge_high52(업로드한 52주 고점 데이터를 붙이는 작업)가 예전엔
-    # 세 번째 경로(디스크 CSV를 새로 읽을 때)에만 있고, 앞의 두 경로(세션 상태·메모리
-    # 캐시에서 바로 반환하는 경우)엔 빠져있었다. 스캔을 한 번이라도 돌리고 나면 이
-    # 빠른 캐시 경로들이 먼저 걸리는데, 여긴 52주 고점 데이터가 안 붙은 채로 반환돼서
-    # '분명 업로드했는데도 종목 진단에는 52주 고점대비가 계속 데이터 없음으로 나오는'
-    # 문제가 있었다. 세 경로 모두 반환 직전에 merge_high52를 거치도록 통일했다.
+    # ⚠️ [CSV 업로드 기능 제거] 예전엔 여기서 관리자가 수동 업로드한 KRX 52주 고점
+    # CSV를 merge_high52로 붙여줬는데, 스크리너 스캔 자체가 네이버에서
+    # fieldIds=high52로 52주고점을 이미 직접 받아와 '52주고점' 컬럼에 채워주고
+    # 있어서(중복 데이터) 그 기능은 완전히 제거했다. 이제 세 경로 모두 df를
+    # 그대로 반환하면 된다.
     try:
         _has_session_df = 'shared_screener_df' in st.session_state and not st.session_state['shared_screener_df'].empty
     except Exception:
@@ -3052,19 +3051,18 @@ def load_screener_df():
         df = st.session_state['shared_screener_df']
         df = df.dropna(subset=['종목코드'])
         df = df[~df['종목코드'].astype(str).str.lower().str.contains('nan')]
-        return merge_high52(df)
+        return df
     if _SCREENER_DF_CACHE["df"] is not None and not _SCREENER_DF_CACHE["df"].empty:
         df = _SCREENER_DF_CACHE["df"]
         df = df.dropna(subset=['종목코드'])
         df = df[~df['종목코드'].astype(str).str.lower().str.contains('nan')]
-        return merge_high52(df)
+        return df
     if os.path.exists(save_path):
         try:
             df = pd.read_csv(save_path, dtype={'종목코드': str})
             df = df.dropna(subset=['종목코드'])
             df = df[~df['종목코드'].astype(str).str.lower().str.contains('nan')]
             df['종목코드'] = df['종목코드'].str.replace('.0','', regex=False).str.zfill(6)
-            df = merge_high52(df)  
             _set_shared_screener_df(df)
             return df
         except: return pd.DataFrame()
