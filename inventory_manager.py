@@ -8287,7 +8287,32 @@ def render_recommendations():
         # 거를 수 있게 한다. (자세한 이유는 _render_ai_grade_filter_and_score 참고)
         # ⚠️ [UI] 등급 필터 pills(이모지+한글)와 시각적 통일감을 주기 위해 점수
         # 구간마다 등급처럼 느껴지는 이모지를 하나씩 붙였다(🚀최상~🌱입문).
-        st.markdown("<div style='font-size:13px; font-weight:600; color:#475569; margin:14px 0 6px;'>🤖 AI 종합점수 필터</div>", unsafe_allow_html=True)
+        # ── [AI 점수 일괄 계산 버튼] ────────────────────────────────────────
+        # 문제: 원래는 사용자가 "700~799" 같은 특정 점수 구간 pill을 눌러야만
+        # 그제서야 후보 전체(최대 150종목)의 AI 종합점수 계산이 시작됐다. 이
+        # 계산은 종목당 3번의 외부 호출이 필요한 무거운 배치라서, 사용자
+        # 입장에서는 "필터 하나 눌렀을 뿐인데 몇 분씩 로딩"으로 느껴졌다.
+        # 해결: "스캔 실행"과 별개로, 언제든 미리 눌러서 전체 후보의 AI
+        # 점수를 백그라운드로 미리 계산해둘 수 있는 버튼을 추가한다. 완전히
+        # 새 계산 경로가 아니라 기존 _render_ai_grade_filter_and_score를
+        # 그대로 재사용하되, display_df(현재 필터링된 일부)가 아니라
+        # _reco_df(전체 후보)를 넘겨서 계산 범위를 넓힌 것뿐이다 — 그래서
+        # 한 번 눌러두면 이후 어떤 점수 구간 pill을 눌러도(또는 등급/시장
+        # 필터를 바꿔도) 이미 캐시에 다 있어서 즉시 결과가 나온다.
+        col_ai_label, col_ai_btn = st.columns([4, 1.6])
+        with col_ai_label:
+            st.markdown("<div style='font-size:13px; font-weight:600; color:#475569; margin:14px 0 6px;'>🤖 AI 종합점수 필터</div>", unsafe_allow_html=True)
+        with col_ai_btn:
+            st.markdown("<div style='margin-top:10px;'></div>", unsafe_allow_html=True)
+            _bulk_ai_clicked = st.button(
+                "🤖 AI 점수 일괄 계산",
+                use_container_width=True,
+                key="reco_ai_bulk_scan_btn",
+                help="점수 구간을 고르지 않아도, 지금 보이는 전체 후보 종목의 AI 종합점수를 미리 백그라운드로 계산해둡니다. 계산해두면 이후 점수 구간 필터를 눌렀을 때 바로 결과가 나옵니다.",
+            )
+        if _bulk_ai_clicked:
+            st.session_state['_reco_ai_bulk_scan'] = True
+
         ai_grade_filter = st.pills(
             "AI 등급 필터",
             ["전체보기", "🚀 800~1000", "🔥 700~799", "⭐ 600~699", "✨ 500~599", "🌱 400~499"],
@@ -8351,13 +8376,31 @@ def render_recommendations():
         _ai_still_loading = False
         _ai_done, _ai_total = 0, 0
         _ai_stalled = False
+        # ⚠️ [일괄 계산 버튼과의 연동] "AI 점수 일괄 계산" 버튼을 눌러두면
+        # (_reco_ai_bulk_scan=True), 지금 선택된 점수 구간 pill과 무관하게
+        # display_df(등급/시장 필터링된 일부)가 아니라 _reco_df(전체 후보)를
+        # 넘겨서 계산 범위를 넓힌다. display_df는 항상 _reco_df의 부분집합이라
+        # (8339줄에서 .copy()로 파생됨), 이렇게 넓혀서 계산해둔 캐시는 이후
+        # 어떤 등급/시장/점수 필터 조합을 눌러도 그대로 재사용된다.
+        _bulk_scan_active = st.session_state.get('_reco_ai_bulk_scan', False)
+        _need_ai_calc = (ai_grade_filter != "전체보기") or _bulk_scan_active
         # ⚠️ [버그 수정] display_df가 이미 0행일 때 그 위에 .apply() 기반 필터를
         # 또 적용하면, pandas가 빈 Series의 dtype을 제대로 추론하지 못해 boolean
         # 마스크가 아닌 이상한 타입이 되고, 그걸로 인덱싱하면 행뿐 아니라 컬럼까지
         # 통째로 날아간다(실측: KeyError('고점 / 하락률') at sort_values). AI
         # 필터에서 이미 0건이 된 뒤 유동성 필터까지 체이닝될 때 재현됐다(예:
         # AI 800~1000 구간에 맞는 종목이 하나도 없는 상태에서 유동성 필터까지 켜진 경우).
-        # 그래서 각 필터 전에 "이미 비어있지 않을 때만 적용"하도록 막았다.
+        # 그래서 각 필터 전에 "이미 비어있지 않을 때만 적용"하도록 막았다. 단,
+        # 일괄 계산 버튼은 display_df가 아니라 _reco_df 기준으로 도니까
+        # display_df가 비어도(예: 등급 필터에 걸리는 종목이 하나도 없어도) 막지 않는다.
+        if _need_ai_calc and (_bulk_scan_active or not display_df.empty) and not _reco_df.empty:
+            _ai_calc_target_df = _reco_df if _bulk_scan_active else display_df
+            _ai_score_map, _ai_still_loading, _ai_done, _ai_total, _ai_stalled = _render_ai_grade_filter_and_score(_ai_calc_target_df, _reco_df)
+            if _bulk_scan_active and not _ai_still_loading:
+                # 일괄 계산이 끝났으면 버튼 상태를 꺼서, 다음 rerun부터는 이
+                # 무거운 전체 재계산을 매번 반복하지 않고 캐시만 조회한다.
+                st.session_state['_reco_ai_bulk_scan'] = False
+
         if ai_grade_filter != "전체보기" and not display_df.empty:
             # ⚠️ [배타적 구간으로 변경] 예전엔 ">= min_score"(누적, 상한 없음)라서
             # "600+"를 골라도 700점·800점짜리가 다 같이 나왔다. 지금은 각 pill이
@@ -8369,7 +8412,6 @@ def render_recommendations():
                 "🔥 700~799": (700, 799), "🚀 800~1000": (800, 1000),
             }
             _ai_min_score, _ai_max_score = _ai_score_bands[ai_grade_filter]
-            _ai_score_map, _ai_still_loading, _ai_done, _ai_total, _ai_stalled = _render_ai_grade_filter_and_score(display_df, _reco_df)
             display_df = display_df[
                 display_df['종목코드'].apply(
                     lambda c: (lambda v: v is not None and _ai_min_score <= v <= _ai_max_score)(_ai_score_map.get(str(c).zfill(6)))
@@ -8400,7 +8442,10 @@ def render_recommendations():
         # 안 나왔다, 다른 종목으로 바뀌었다" 하는 것처럼 보여 혼란을 줬다.
         # 계산이 완전히 끝나기 전까지는 목록 자체를 그리지 않고, 다 끝난 뒤
         # "한 번에 정리된" 결과만 보여주도록 바꾼다.
-        if _ai_still_loading:
+        if _ai_still_loading and ai_grade_filter != "전체보기":
+            # 사용자가 실제로 점수 구간(예: 700~799)을 골라서 그 결과를 봐야
+            # 하는 상황이라, 계산이 안 끝나면 목록을 보여줄 수 없다 → 기존처럼
+            # 화면을 막고 진행률만 보여준다.
             _ai_pct = int((_ai_done / _ai_total) * 100) if _ai_total else 0
             if _ai_stalled:
                 st.warning(f"⚠️ AI 종합점수 계산이 멈춘 것 같습니다 ({_ai_done}/{_ai_total}건, {_ai_pct}%에서 진행이 없습니다). 네트워크 조회가 지연되고 있을 수 있어요.")
@@ -8409,6 +8454,18 @@ def render_recommendations():
             else:
                 st.info(f"⏳ AI 종합점수를 계산하는 중입니다 ({_ai_done}/{_ai_total}건, {_ai_pct}%). 완료되면 결과가 한 번에 표시됩니다 (잠시만 기다려주세요)...")
             return
+        elif _ai_still_loading and _bulk_scan_active:
+            # "전체보기" 상태에서 [AI 점수 일괄 계산] 버튼만 눌러둔 경우 —
+            # 지금 화면에는 아직 점수 필터가 안 걸려 있으니 계산이 끝날 때까지
+            # 굳이 목록을 가릴 필요가 없다. 진행률만 살짝 보여주고 아래 목록은
+            # 정상적으로 계속 렌더링한다.
+            _ai_pct = int((_ai_done / _ai_total) * 100) if _ai_total else 0
+            if _ai_stalled:
+                st.warning(f"⚠️ AI 점수 일괄 계산이 멈춘 것 같습니다 ({_ai_done}/{_ai_total}건, {_ai_pct}%에서 진행이 없습니다). 네트워크 조회가 지연되고 있을 수 있어요.")
+                if st.button("🔄 새로고침해서 이어서 계산하기", key="reco_ai_bulk_stall_refresh"):
+                    st.rerun()
+            else:
+                st.caption(f"🤖 AI 점수 일괄 계산 중... ({_ai_done}/{_ai_total}건, {_ai_pct}%) — 계산되는 동안에도 아래 목록은 그대로 보실 수 있어요.")
         if _liq_still_loading:
             _liq_pct = int((_liq_done / _liq_total) * 100) if _liq_total else 0
             if _liq_stalled:
