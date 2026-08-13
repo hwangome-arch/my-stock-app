@@ -7760,8 +7760,16 @@ def _render_liquidity_filter_and_value(display_df, source_df):
     예산(전체 25초) 안에서 다른 스레드들과 스레드풀을 나눠 쓰다 보니 시간 안에
     못 끝나는 스레드가 늘어 "필터와 무관하게 후보 자체가 줄어드는" 회귀를 냈다
     (실측: S급 8개 → 1개). 그래서 AI 등급 필터와 똑같이, 스캔 자체는 건드리지 않고
-    '화면에 실제로 보여줄 후보'에 대해서만 배치로 지연 계산한다."""
-    BATCH_SIZE = 20
+    '화면에 실제로 보여줄 후보'에 대해서만 배치로 지연 계산한다.
+
+    ⚠️ [속도 개선 — 2026-08-13] BATCH_SIZE를 20→30으로 늘려 배치 횟수를 줄이고
+    (150종목 기준 8번→5번), overall_timeout을 15→8초로 줄였다. render_async_multi는
+    배치 안의 futures가 "전부 끝나거나 timeout"이어야만 결과를 회수하는 구조라서
+    (다른 8개 호출부와 공유하는 함수라 그 동작 자체는 안 건드림), 배치 안에
+    유독 느린 종목 하나가 나머지 다 끝난 것까지 붙잡고 있는 시간을 줄이는 게
+    핵심이다. timeout으로 잘린 종목은 still_loading이 유지되어 다음 배치에서
+    자동 재시도되므로 데이터가 유실되지는 않는다."""
+    BATCH_SIZE = 30
 
     _sig = _candidates_signature(source_df)
     if st.session_state.get('_reco_liq_cache_sig') != _sig:
@@ -7804,7 +7812,7 @@ def _render_liquidity_filter_and_value(display_df, source_df):
             collect_fn=_collect_liq_batch,
             default_result={},
             spinner_text=f"거래대금 확인 중 ({len(batch)}건)...",
-            overall_timeout=15,
+            overall_timeout=8,
         )
         if partial:
             cache.update(partial)
@@ -7852,8 +7860,12 @@ def _render_ai_grade_filter_and_score(display_df, source_df):
 
     반환값: (score_map, still_loading)
       score_map     : {종목코드: AI총점 or None(계산 실패)} — 지금까지 확인된 것만
-      still_loading : 아직 계산 안 끝난 종목이 남아있으면 True (안내 문구 표시용)"""
-    BATCH_SIZE = 20
+      still_loading : 아직 계산 안 끝난 종목이 남아있으면 True (안내 문구 표시용)
+
+    ⚠️ [속도 개선 — 2026-08-13] BATCH_SIZE를 20→30으로 늘려 배치 횟수를 줄이고
+    (150종목 기준 8번→5번), overall_timeout을 20→10초로 줄였다. 유동성 필터와
+    동일한 이유(배치 안의 느린 종목 하나가 나머지를 붙잡는 시간 최소화)."""
+    BATCH_SIZE = 30
 
     # ⚠️ [캐시 영속화] id(source_df)는 프로세스가 재시작되면 의미가 없어져서(같은
     # 스캔 결과라도 재시작 후엔 완전히 새 객체) 디스크 캐시와 맞물릴 수 없었다.
@@ -7906,7 +7918,7 @@ def _render_ai_grade_filter_and_score(display_df, source_df):
             collect_fn=_collect_ai_batch,
             default_result={},
             spinner_text=f"AI 종합점수 계산 중 ({len(batch)}건)...",
-            overall_timeout=20,
+            overall_timeout=10,
         )
         if partial:
             cache.update(partial)
