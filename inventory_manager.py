@@ -6812,6 +6812,7 @@ def calc_trend_score(df_price):
 
 def calc_volume_score(df_price, exclude_today=False):
     """📊 거래량 점수 (0~100) = 당일 거래량 스파이크(0~60) + 최근 5일 평균 지속성(0~40)
+       각각에 '같은 기간 주가가 오른 방향이었는지'를 반영한 방향 배수(0.1~1.0)를 곱한다.
 
     ⚠️ [버그 수정 1] 기존에는 ratio < 0.7(오늘 거래량이 20일 평균의 70% 미만)이면
     무조건 0점으로 처리했다. 이 구간이 너무 넓어서(0%~69%가 전부 0점), 실제로는
@@ -6836,33 +6837,73 @@ def calc_volume_score(df_price, exclude_today=False):
     비교하면, 장이 끝나기 전까지는 구조적으로 항상 낮은(심하면 0점) 점수가 나올
     수밖에 없다 — 실제로 거래가 부진해서가 아니라 비교 대상 자체가 불공정한
     것이다(실측: 삼성전자 장중 조회 시 오늘거래량/20일평균 = 11%). exclude_today=True
-    로 호출되면 마지막(당일) 봉을 빼고 확정된 전날까지의 데이터로 계산한다."""
+    로 호출되면 마지막(당일) 봉을 빼고 확정된 전날까지의 데이터로 계산한다.
+
+    ⚠️ [방향성 결합 — NEW] 기존에는 거래량이 '얼마나' 튀었는지만 보고, 그 거래량이
+    주가 상승과 함께 터진 건지 급락과 함께 터진 건지는 전혀 구분하지 않았다. 그
+    결과 하한가를 맞으며 거래량이 폭발한 종목도 상한가를 가며 거래량이 폭발한
+    종목과 동일하게 만점 근처를 받아, 실제로는 나쁜 신호(패닉셀)인데 AI 종합점수를
+    깎기는커녕 오히려 끌어올리는 왜곡이 있었다. calc_breakout_score(저항선 돌파
+    점수)는 이미 '가격 상승 + 거래량'을 같이 봐야 의미 있다는 전제로 설계돼 있었는데,
+    거래량 항목 자체에는 그 전제가 빠져 있었던 것이다. 지금은 스파이크(당일 등락률
+    기준)와 지속성(최근 5일 누적 등락률 기준) 각각에, 같은 기간 주가 방향을 반영한
+    배수(0.1~1.0, _lerp_score로 연속 보간)를 곱한다 — 상승 동반 거래량은 원점수를
+    거의 그대로 인정받고, 하락 동반 거래량은 최대 90%까지 깎인다. 완전히 0으로
+    죽이지 않는 이유는, 방향이 애매하거나(보합) 하락 중이어도 '거래 자체가
+    활발했다'는 유동성 정보에는 최소한의 참고 가치가 있기 때문이다. Close 컬럼이
+    없거나 방향 계산이 실패하면 배수를 1.0(기존과 동일)으로 두고 안전하게
+    원래 로직으로 폴백한다."""
     try:
         if df_price is None or df_price.empty or "Volume" not in df_price.columns:
             return 50.0
-        vol = df_price["Volume"].dropna()
-        if exclude_today and len(vol) >= 6:
-            vol = vol.iloc[:-1]
-        if len(vol) < 5:
+
+        has_close = "Close" in df_price.columns
+        cols = ["Volume", "Close"] if has_close else ["Volume"]
+        data = df_price[cols].copy()
+        data = data.dropna(subset=["Volume"])
+        if exclude_today and len(data) >= 6:
+            data = data.iloc[:-1]
+        if len(data) < 5:
             return 50.0
+
+        vol = data["Volume"]
         avg20 = vol.tail(20).mean() if len(vol) >= 20 else vol.mean()
         if avg20 <= 0:
             return 50.0
 
         recent = vol.iloc[-1]
         spike_ratio = recent / avg20
-        spike = _lerp_score(spike_ratio, [
+        spike_raw = _lerp_score(spike_ratio, [
             (0.0, 0), (0.4, 6), (0.6, 12), (0.8, 18), (1.0, 24),
             (1.2, 30), (1.5, 36), (2.0, 48), (3.0, 60),
         ])
 
         avg5 = vol.tail(5).mean() if len(vol) >= 5 else recent
         sustain_ratio = avg5 / avg20
-        sustain = _lerp_score(sustain_ratio, [
+        sustain_raw = _lerp_score(sustain_ratio, [
             (0.0, 0), (0.5, 8), (0.8, 16), (1.0, 24), (1.3, 32), (1.8, 40),
         ])
 
-        return round(min(100.0, spike + sustain), 1)
+        # ── 방향 배수: 상승 동반 거래량만 원점수를 거의 그대로 인정, 하락 동반은 감쇠 ──
+        spike_mult = 1.0
+        sustain_mult = 1.0
+        if has_close:
+            closes = data["Close"].dropna()
+            if len(closes) >= 2:
+                day_ret = (closes.iloc[-1] / closes.iloc[-2] - 1) * 100
+                spike_mult = _lerp_score(day_ret, [
+                    (-8, 0.1), (-3, 0.35), (0, 0.7), (1.5, 1.0), (8, 1.0),
+                ])
+            if len(closes) >= 6:
+                trend_ret = (closes.iloc[-1] / closes.iloc[-6] - 1) * 100
+                sustain_mult = _lerp_score(trend_ret, [
+                    (-15, 0.1), (-5, 0.35), (0, 0.7), (3, 1.0), (15, 1.0),
+                ])
+
+        spike = spike_raw * spike_mult
+        sustain = sustain_raw * sustain_mult
+
+        return round(max(0.0, min(100.0, spike + sustain)), 1)
     except Exception:
         return 50.0
 
