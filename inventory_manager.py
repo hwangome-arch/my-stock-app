@@ -1948,10 +1948,32 @@ def fetch_fnguide_data(code):
         #    찾아낸 모든 표의 실제 행 이름(index)·컬럼명을 debug에 항상 남긴다.
         #    (이전에는 매칭에 실패하면 표 안에 실제로 뭐가 들어있었는지 전혀 알 수 없어
         #     원인 파악이 불가능했음 — 이 필드로 FnGuide 쪽 표기 변경 여부를 바로 확인)
+        # 🔧 [진단 강화 v2 — 종목별 구조 차이 원인 규명] 기존에는 인덱싱 실패 시
+        # "인덱싱 실패 또는 빈 표"라고만 남겨서, 왜 실패했는지(항목명 열이 다른
+        # 위치에 있는 건지 / 값 형식이 다른 건지 / 진짜로 빈 표인지)를 알 방법이
+        # 없었다. 특히 대부분 종목은 정상 조회되는데 특정 종목(예: 086280)만
+        # 실패하는 경우, 문제는 사이트 전체 구조 변경이 아니라 그 종목 페이지만의
+        # 표 레이아웃 차이일 가능성이 높은데도 그걸 확인할 로그가 없었다.
+        # 지금은 _indexed()가 실패한 표에 한해 원본(raw, 인덱싱 전) dfs[_ti]의
+        # 컬럼명과 앞부분 몇 행을 그대로 첨부한다 — 이러면 다음 실패 시 "표 자체가
+        # 정말 비어있었는지" 아니면 "항목명 열이 예상 밖 위치/형식이었는지"를
+        # 바로 구분할 수 있다.
         debug["all_tables_preview"] = []
         for _ti, _d in enumerate(indexed_dfs):
             if _d is None or _d.empty:
-                debug["all_tables_preview"].append({"table_idx": _ti, "note": "인덱싱 실패 또는 빈 표"})
+                _raw = dfs[_ti]
+                try:
+                    _raw_cols = [str(c) for c in _raw.columns.tolist()][:10]
+                    _raw_head = _raw.head(6).astype(str).values.tolist()
+                except Exception:
+                    _raw_cols, _raw_head = None, None
+                debug["all_tables_preview"].append({
+                    "table_idx": _ti,
+                    "note": "인덱싱 실패 또는 빈 표 (원본 raw 표 미리보기 첨부)",
+                    "raw_shape": list(_raw.shape),
+                    "raw_columns": _raw_cols,
+                    "raw_head": _raw_head,
+                })
                 continue
             debug["all_tables_preview"].append({
                 "table_idx": _ti,
