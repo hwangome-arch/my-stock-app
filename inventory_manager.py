@@ -9507,7 +9507,7 @@ def render_fnguide():
                 st.session_state[k] = f"{int(digits):,}" if digits else ""
 
             st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
-            _ct1, _ct2 = st.columns([1, 2.3])
+            _ct1, _ct2, _ct3 = st.columns([1, 0.5, 1.8])
             with _ct1:
                 st.text_input(
                     "🎯 원하는 목표가로 직접 확률 확인 (원)",
@@ -9516,9 +9516,18 @@ def render_fnguide():
                     placeholder="예: 600,000",
                 )
             with _ct2:
+                st.markdown("<div style='padding-top:28px;'>", unsafe_allow_html=True)
+                # 엔터/포커스아웃 없이도 입력값을 바로 반영하고 싶은 경우를 위한 버튼.
+                # on_change와 하는 일은 같다(둘 다 같은 포맷 함수를 호출) — 엔터 치기
+                # 애매한 상황(모바일 등)을 위한 명시적인 트리거일 뿐이다.
+                _custom_tgt_btn = st.button("확인", key=f"fnguide_custom_target_btn_{code}", use_container_width=True)
+                st.markdown("</div>", unsafe_allow_html=True)
+                if _custom_tgt_btn:
+                    _fmt_custom_target()
+            with _ct3:
                 st.markdown(
                     "<div style='padding-top:28px; font-size:11px; color:#94A3B8;'>"
-                    "원하는 가격을 입력하면 그 가격까지의 30·90·180일 도달 확률을 바로 계산해 보여줍니다."
+                    "원하는 가격을 입력하고 엔터 또는 '확인'을 누르면 30·90·180일 도달 확률을 바로 계산해 보여줍니다."
                     "</div>",
                     unsafe_allow_html=True,
                 )
