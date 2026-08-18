@@ -7937,37 +7937,63 @@ def _score_one_for_ai_batch(code, per, pbr, roe, debt, drop_pct, div):
 AI_SCORE_CACHE_PATH = "saved_ai_score_cache.json"
 LIQ_VALUE_CACHE_PATH = "saved_liq_value_cache.json"
 
+# ⚠️ [캐시 전략 변경 2026-08-18: 스캔 서명 단위 → 종목코드+TTL 단위] ─────────────
+# 문제: 예전에는 캐시가 "이번 스캔 후보 300종목 조합 전체"를 md5로 묶은 서명
+# (_candidates_signature) 단위로 저장/조회됐다. 그래서 새로 스캔을 돌려 후보가
+# 단 1종목만 바뀌어도 서명 전체가 달라지고, 이전 스캔과 실제로는 280~290개가
+# 겹치는데도 그 겹치는 종목의 점수까지 전부 버리고 처음부터 다시 계산해야 했다.
+# 이게 "추천 종목 탭에서 스캔할 때마다 AI 점수 계산이 몇 분씩 걸리고 자꾸 멈춘
+# 것처럼 보인다"는 문제의 가장 큰 원인이었다.
+# 해결: 캐시를 종목코드를 키로 직접 저장하고, 각 항목에 계산 시각(ts)을 같이
+# 남긴다. 새 스캔이 몇 번을 돌든, TTL(AI_SCORE_CACHE_TTL) 이내에 이미 계산해둔
+# 종목이면 그대로 재사용한다. TTL은 점수 계산에 들어가는 하위 데이터(가격이력
+# 30분/재무 1시간/수급 30분 캐시)와 보조를 맞춰, 원본 데이터가 갱신될 때쯤엔
+# 점수도 자연스럽게 다시 계산되도록 30분으로 잡았다.
+AI_SCORE_CACHE_TTL = 1800  # 30분
 
-def _candidates_signature(df):
-    """후보 목록(종목코드 집합)의 내용 기반 서명. id()는 프로세스가 재시작되면
-    의미가 없어지므로(재시작 후엔 완전히 새 객체가 만들어짐) 쓸 수 없다 — 대신
-    '어떤 종목들이 후보인가'라는 내용 자체로 서명을 만들어서, 같은 스캔 결과를
-    다시 불러온 것이면(재시작 후에도) 이전 캐시를 그대로 재사용할 수 있게 한다."""
-    codes = sorted(str(c).zfill(6) for c in df['종목코드'])
-    return hashlib.md5(",".join(codes).encode()).hexdigest()
 
-
-def _load_disk_cache(path, expected_sig):
-    """서명이 일치할 때만 디스크 캐시를 불러온다. 종목 구성이 다른(=다른 스캔의)
-    캐시를 잘못 재사용하는 일을 막기 위함이다."""
+def _load_ai_score_disk_cache(path=AI_SCORE_CACHE_PATH):
+    """{종목코드: {"score":.., "ts":..}} 형태의 디스크 캐시를 그대로 불러온다.
+    예전 형식({"sig":.., "scores": {종목코드: 점수(숫자)}})이 파일에 남아있어도,
+    값이 dict가 아니므로 자동으로 걸러져(=신선하지 않은 것으로 간주) 새로
+    계산된다 — 별도 마이그레이션 없이 안전하게 자연 교체된다."""
     try:
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
                 payload = json.load(f)
-            if payload.get("sig") == expected_sig:
-                return dict(payload.get("scores", {}))
+            raw = payload.get("scores", {}) if isinstance(payload, dict) else {}
+            return {c: v for c, v in raw.items() if isinstance(v, dict) and "score" in v and "ts" in v}
     except Exception:
         pass
     return {}
 
 
-def _save_disk_cache(path, sig, cache_dict):
-    """계산 배치가 끝날 때마다 호출해 그때그때 저장한다(스캔 끝날 때 한 번에 몰아
-    저장하지 않는 이유: 배치 계산은 여러 rerun에 걸쳐 점진적으로 끝나는데, 그 중간에
-    세션이 끊기거나 앱이 재시작될 수 있어 "끝난 만큼은 최대한 잃지 않는" 쪽을 택했다)."""
+def _save_ai_score_disk_cache(cache_dict, path=AI_SCORE_CACHE_PATH):
     try:
         with open(path, "w", encoding="utf-8") as f:
-            json.dump({"sig": sig, "scores": cache_dict}, f, ensure_ascii=False)
+            json.dump({"scores": cache_dict}, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _ai_cache_entry_fresh(entry, ttl=AI_SCORE_CACHE_TTL):
+    """캐시 항목이 존재하고 TTL 이내에 계산된 것인지."""
+    return isinstance(entry, dict) and "ts" in entry and (time.time() - entry["ts"]) < ttl
+
+
+def _flush_ai_score_partial(scores):
+    """지금까지 새로 계산된 부분 결과를 디스크 캐시에 병합 저장한다(기존에 남아있는
+    신선한 항목은 그대로 두고, 새로 계산된 것만 갱신). 배치 계산 도중(청크마다)
+    호출해서, 세션이 끊기거나 계산이 중간에 멈춰도 그때까지 계산해둔 만큼은
+    잃지 않게 한다. 파일 I/O만 하고 st.* API는 전혀 쓰지 않으므로 백그라운드
+    스레드 안에서 직접 호출해도 안전하다(스크리너 스캔의 _safe_save_screener_df와
+    동일한 이유)."""
+    try:
+        existing = _load_ai_score_disk_cache()
+        now = time.time()
+        for code, score in scores.items():
+            existing[code] = {"score": score, "ts": now}
+        _save_ai_score_disk_cache(existing)
     except Exception:
         pass
 
@@ -7996,6 +8022,124 @@ def _track_batch_progress_stall(tracker_key, done_count, stall_threshold=25):
 
 
 
+def _ai_bulk_score_worker(job_id, items):
+    """AI 종합점수 배치를 하나의 지속적인 백그라운드 스레드 안에서 끝까지 이어서
+    계산한다 — 종목 스크리너 스캔(_unified_scan_worker)과 동일한 패턴.
+
+    ⚠️ [구조 변경 2026-08-18: 배치+전체rerun → 연속 job] 예전 방식은 30종목씩
+    배치를 끊어서 "배치 하나 끝남(최대 18초) → 페이지 전체 재실행(st.rerun()) →
+    다음 배치 제출"을 10번 가까이 반복해야 했다. 이 전체 재실행 의존성 때문에
+    배치 사이마다 지연이 생기고, 웹소켓이 잠깐 끊기거나 브라우저 탭이 백그라운드로
+    밀려 재실행 자체가 늦어지면 진행률이 그대로 멈춘 것처럼 보였다(사용자가
+    "새로고침"을 직접 눌러줘야 했던 이유). 지금은 이 함수 하나가 스레드 안에서
+    전체 종목을 계속 처리하며 _SCAN_JOB_STATE에 자기 진행률을 스스로 기록하므로,
+    페이지가 재실행되지 않아도 전역 폴러(0.4초 간격)가 실시간으로 %를 보여줄 수
+    있다.
+
+    items: [{"code", "per", "pbr", "roe", "debt", "drop", "div"}, ...]
+    """
+    state = _SCAN_JOB_STATE[job_id]
+    total = len(items)
+    state.update({"total": total, "done": 0, "scores": {},
+                   "text": "AI 종합점수 계산 준비 중...", "pct": 0})
+
+    CHUNK = 30  # 공유 스레드풀(32개)을 한 job이 통째로 오래 독점하지 않도록 청크로 나눠 제출
+    executor = get_shared_executor()
+    for i in range(0, total, CHUNK):
+        chunk = items[i:i + CHUNK]
+        futures = {
+            submit_with_ctx(
+                executor, _score_one_for_ai_batch, it["code"], it["per"], it["pbr"],
+                it["roe"], it["debt"], it["drop"], it["div"],
+            ): it["code"]
+            for it in chunk
+        }
+        pending = set(futures.keys())
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=20):
+                code = futures[future]
+                pending.discard(future)
+                try:
+                    state["scores"][code] = future.result(timeout=1)
+                except Exception:
+                    state["scores"][code] = None
+                state["done"] += 1
+                state["pct"] = int(state["done"] / total * 100) if total else 100
+                state["text"] = f"AI 종합점수 계산 중 ({state['done']}/{total}건)"
+        except concurrent.futures.TimeoutError:
+            pass
+        # 이 청크에서 20초 안에 못 끝난 종목은 건너뛴다(다음 전체 계산 때 디스크
+        # 캐시에 없으므로 자연히 다시 시도됨). 큐 대기중이었다면 자리를 비워준다.
+        for f in pending:
+            f.cancel()
+        # 청크가 끝날 때마다 디스크에도 반영 — 세션이 끊기거나 계산이 중간에
+        # 멈춰도 그때까지 계산해둔 만큼은 잃지 않는다.
+        _flush_ai_score_partial(state["scores"])
+
+    state["text"] = "✅ AI 종합점수 계산 완료"
+    state["pct"] = 100
+
+
+def run_ai_bulk_score_async(job_key, items, overall_timeout=600, stall_threshold=45):
+    """AI 종합점수 배치의 논블로킹 버전. run_unified_market_scan_async와 완전히
+    같은 패턴(같은 _scan_jobs / _SCAN_JOB_STATE 저장소를 그대로 재사용) — 백그라운드
+    에서 계속 진행되고, 메인 스크립트는 절대 멈추지 않는다. 같은 job_key로 다시
+    호출하면 새 job을 또 만들지 않고 이미 진행 중인 job에 합류한다.
+
+    반환값: (scores, ready, stalled)
+      scores  : 지금까지 끝난 만큼(또는 최종)의 부분 결과 {종목코드: 점수 or None}
+      ready   : True면 이 job은 이제 없음(완료/시간초과/정체로 종료됨). 남은 대상이
+                있으면 호출부가 다음 호출에서 새 job으로 이어서 계산한다.
+      stalled : 진행률이 stall_threshold초 이상 전혀 안 바뀌어 강제 종료됐는지 여부
+                (호출부가 "계산이 멈춘 것 같다"는 경고 문구를 보여줄 때 사용)."""
+    jobs = st.session_state.setdefault("_scan_jobs", {})
+    job = jobs.get(job_key)
+
+    if job is None:
+        if not items:
+            return {}, True, False
+        job_id = f"{job_key}_{time.time()}"
+        _SCAN_JOB_STATE[job_id] = {"text": "AI 종합점수 계산 준비 중...", "pct": 0,
+                                     "done": 0, "total": len(items), "scores": {}}
+        future = submit_with_ctx(get_orchestration_executor(), _ai_bulk_score_worker, job_id, items)
+        job = {"job_id": job_id, "future": future, "started_at": time.time(), "overall_timeout": overall_timeout}
+        jobs[job_key] = job
+
+    job_id = job["job_id"]
+    future = job["future"]
+    state = _SCAN_JOB_STATE.get(job_id, {})
+    partial = dict(state.get("scores", {}))
+
+    now = time.time()
+    timed_out = (now - job["started_at"]) > job.get("overall_timeout", overall_timeout)
+
+    # ── [정체 감지] 스캔과 동일한 방식 — done 개수가 stall_threshold초 이상
+    # 전혀 안 바뀌면(예: 남은 종목들이 전부 네트워크 응답 없이 걸려있는 상태)
+    # 무작정 overall_timeout까지 기다리지 않고 조기에 포기한다.
+    last_done = state.get("done", 0)
+    if state.get("_last_done_seen") != last_done:
+        state["_last_done_seen"] = last_done
+        state["_last_done_change_at"] = now
+    job["_last_pct_change_at"] = state.get("_last_done_change_at", job["started_at"])
+    stalled = (now - state.get("_last_done_change_at", job["started_at"])) > stall_threshold
+
+    if not future.done() and not timed_out and not stalled:
+        return partial, False, False
+
+    jobs.pop(job_key, None)
+    force_stopped = stalled and not future.done()
+    if force_stopped:
+        # 좀비 스레드가 공유 풀에 쌓여있을 수 있으니(자세한 이유는 파일 상단
+        # get_shared_executor 주석 참고) 다음 재시도가 깨끗한 풀에서 시작하도록 교체.
+        try:
+            _get_shared_executor_raw.clear()
+        except Exception:
+            pass
+        future.cancel()
+    _SCAN_JOB_STATE.pop(job_id, None)
+    return partial, True, force_stopped
+
+
 def _render_ai_grade_filter_and_score(display_df, source_df):
     """[AI 등급 필터] 저평가 등급(S~D) 필터와 완전히 독립된 두 번째 축으로 AI
     종합점수 등급을 추가한다. AND 조건으로 나란히 적용되며, 어느 한쪽 때문에
@@ -8003,107 +8147,64 @@ def _render_ai_grade_filter_and_score(display_df, source_df):
 
     ⚠️ [설계 배경] AI 종합점수 하나 계산하려면 종목당 df_price(야후)·수급(네이버)·
     재무(크롤링) 이렇게 최소 3번의 외부 호출이 필요하다. 저평가 등급 필터처럼
-    이미 받아온 데이터로 즉석 계산할 수 있는 게 아니라서, 후보 전체(많으면 150개
+    이미 받아온 데이터로 즉석 계산할 수 있는 게 아니라서, 후보 전체(많으면 300개
     안팎)에 한 번에 다 걸면 스캔 자체보다 훨씬 무거운 부하가 생긴다. 그래서
     "S/A/B만 먼저 거르고 그 안에서 AI 점수"가 아니라, 두 필터를 나란히 두되
-    AI 점수는 세션 캐시에 종목코드별로 한 번만 계산해 재사용하고, 아직 캐시에
-    없는 종목은 render_async_multi로 화면 뒤에서 배치(BATCH_SIZE개씩) 계산하며
-    점진적으로 채운다 — 이미 워치리스트 프리페치(_wl_bg_jobs)·대시보드 비동기
-    로딩에서 쓰던 것과 동일한 패턴이다.
+    AI 점수는 종목코드별로 디스크 캐시(TTL 30분)에 한 번만 계산해 재사용하고,
+    아직 신선한 캐시가 없는 종목만 백그라운드 job(run_ai_bulk_score_async)으로
+    점진적으로 채운다.
 
-    source_df : load_reco_df()가 반환한 '필터링 전' 원본 DataFrame. display_df는
-    매 rerun마다 .copy()+필터링으로 새로 만들어져 id()가 매번 바뀌므로, "새 스캔이
-    돌았는지"는 반드시 이 원본의 종목코드 구성(내용) 기준으로 판단해야 한다.
+    ⚠️ [캐시 전략 변경 2026-08-18] 예전엔 "이번 스캔 후보 조합 전체"를 서명으로
+    묶어 캐시를 통째로 재사용/폐기했다. 지금은 종목코드 단위 TTL 캐시(자세한 이유는
+    _load_ai_score_disk_cache 주석 참고)를 쓰므로, 이 함수는 더 이상 source_df로
+    "새 스캔인지"를 판별할 필요가 없다. source_df는 인터페이스 호환을 위해 인자로
+    남겨뒀다(현재는 내부에서 쓰지 않음).
 
-    반환값: (score_map, still_loading)
+    반환값: (score_map, still_loading, done_count, total_count, stalled)
       score_map     : {종목코드: AI총점 or None(계산 실패)} — 지금까지 확인된 것만
       still_loading : 아직 계산 안 끝난 종목이 남아있으면 True (안내 문구 표시용)
-
-    ⚠️ [속도 개선 — 2026-08-13] BATCH_SIZE를 20→30으로 늘려 배치 횟수를 줄이고
-    (150종목 기준 8번→5번), overall_timeout을 20→10초로 줄였다. 유동성 필터와
-    동일한 이유(배치 안의 느린 종목 하나가 나머지를 붙잡는 시간 최소화)."""
-    BATCH_SIZE = 30
-
-    # ⚠️ [캐시 영속화] id(source_df)는 프로세스가 재시작되면 의미가 없어져서(같은
-    # 스캔 결과라도 재시작 후엔 완전히 새 객체) 디스크 캐시와 맞물릴 수 없었다.
-    # 대신 후보 종목코드 구성 자체로 서명을 만들어, 세션이 끊겼다 다시 열려도
-    # '같은 스캔 결과'라면 디스크에 저장해둔 점수를 그대로 재사용한다.
-    _sig = _candidates_signature(source_df)
-    if st.session_state.get('_reco_ai_cache_sig') != _sig:
-        st.session_state['_reco_ai_cache_sig'] = _sig
-        st.session_state['_reco_ai_score_cache'] = _load_disk_cache(AI_SCORE_CACHE_PATH, _sig)
-
-    cache = st.session_state.setdefault('_reco_ai_score_cache', {})
-
+      stalled       : 계산이 정체돼 강제 종료됐으면 True (경고 문구 표시용)"""
     codes_needed = [str(c).zfill(6) for c in display_df['종목코드']]
-    unscored_rows = [row for _, row in display_df.iterrows()
-                      if str(row['종목코드']).zfill(6) not in cache]
-
-    if unscored_rows:
-        batch = unscored_rows[:BATCH_SIZE]
-        batch_codes = [str(r['종목코드']).zfill(6) for r in batch]
-
-        def _submit_ai_batch():
-            executor = get_shared_executor()
-            futures = {}
-            for r in batch:
-                c = str(r['종목코드']).zfill(6)
-                futures[c] = submit_with_ctx(
-                    executor, _score_one_for_ai_batch, c,
-                    r['PER'], r['PBR'], r['ROE'], r['부채비율'],
-                    r['고점 / 하락률'], r.get('배당수익률', 0.0),
-                )
-            return futures
-
-        def _collect_ai_batch(futures):
-            out = {}
-            for c, f in futures.items():
-                if f.done():
-                    try:
-                        out[c] = f.result(timeout=0.1)
-                    except Exception:
-                        out[c] = None
-            return out
-
-        # ready 여부와 무관하게 지금까지 끝난 만큼만 받아 캐시에 반영한다(완전히
-        # 끝날 때까지 화면 전체를 막지 않는다). 아직 안 끝난 건 다음 rerun에서
-        # maybe_run_global_poller()가 자동으로 다시 폴링해준다(render_async_multi가
-        # _bg_jobs에 등록해두므로).
-        # ⚠️ [타임아웃 상향 — 2026-08-18] calc_ai_scores_detailed 내부 4호출을
-        # 병렬화(get_ai_score_inner_executor)하면서 종목 1개당 최대 대기가
-        # 이론상 12초(개별 result timeout)까지 걸릴 수 있게 됐다. 예전 10초
-        # 그대로 두면 병렬화 효과를 보기도 전에 배치가 잘려나가는 경우가
-        # 늘어날 수 있어, 배치 전체 상한을 그보다 넉넉하게 18초로 올렸다.
-        partial, _ready = render_async_multi(
-            job_key=f"reco_ai_batch_{'-'.join(batch_codes)}",
-            submit_fn=_submit_ai_batch,
-            collect_fn=_collect_ai_batch,
-            default_result={},
-            spinner_text=f"AI 종합점수 계산 중 ({len(batch)}건)...",
-            overall_timeout=18,
-        )
-        if partial:
-            cache.update(partial)
-            _save_disk_cache(AI_SCORE_CACHE_PATH, _sig, cache)
-
-    score_map = {c: cache.get(c) for c in codes_needed}
-    still_loading = any(c not in cache for c in codes_needed)
-    # ⚠️ [진행률 표시 추가] 유동성 필터와 동일한 이유로 "cache 안에 키로
-    # 존재하는지"를 완료 기준으로 삼는다 (실패해도 None으로 캐시에 남으므로 완료로 집계).
-    done_count = sum(1 for c in codes_needed if c in cache)
     total_count = len(codes_needed)
+    if total_count == 0:
+        return {}, False, 0, 0, False
+
+    disk_cache = _load_ai_score_disk_cache()
+    score_map = {}
+    stale_rows = []
+    for _, row in display_df.iterrows():
+        c = str(row['종목코드']).zfill(6)
+        entry = disk_cache.get(c)
+        if _ai_cache_entry_fresh(entry):
+            score_map[c] = entry["score"]
+        else:
+            stale_rows.append(row)
+
+    if not stale_rows:
+        return score_map, False, total_count, total_count, False
+
+    items = [
+        {
+            "code": str(r['종목코드']).zfill(6), "per": r['PER'], "pbr": r['PBR'],
+            "roe": r['ROE'], "debt": r['부채비율'], "drop": r['고점 / 하락률'],
+            "div": r.get('배당수익률', 0.0),
+        }
+        for r in stale_rows
+    ]
+
+    job_scores, ready, job_stalled = run_ai_bulk_score_async("ai_bulk_score", items)
+    score_map.update(job_scores)
+
+    done_count = len(score_map)
+    still_loading = done_count < total_count
 
     # ── [진단 로그] 전체 스캔의 [DEBUG SCAN ...]과 동일한 취지 — 배치 계산이
     # 왜/언제 멈췄는지 다음에 로그만 보고도 재구성할 수 있게 남긴다.
     print(f"[DEBUG AI배치 {datetime.datetime.now().strftime('%H:%M:%S')}] "
-          f"sig={_sig[:8]} done={done_count}/{total_count} still_loading={still_loading}",
-          file=sys.stderr, flush=True)
+          f"done={done_count}/{total_count} still_loading={still_loading} "
+          f"ready={ready} stalled={job_stalled}", file=sys.stderr, flush=True)
 
-    stalled = False
-    if still_loading:
-        stalled = _track_batch_progress_stall(f"ai_{_sig}", done_count)
-
-    return score_map, still_loading, done_count, total_count, stalled
+    return score_map, still_loading, done_count, total_count, job_stalled
 
 
 def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_label):
