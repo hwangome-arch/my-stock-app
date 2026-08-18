@@ -330,6 +330,28 @@ def call_with_timeout(fn, timeout=10):
         future.cancel()
         return None
 # ────────────────────────────────────────────────────────────────────────
+
+# ── [AI 종합점수 내부 호출 병렬화 전용 풀 — 2026-08-18] ─────────────────────
+# 문제: calc_ai_scores_detailed()는 종목 1개당 가격이력·코스피 스파크라인·재무·
+# 수급, 이렇게 4번의 네트워크 호출이 필요하다. 이 함수 자체가 이미
+# get_shared_executor()의 워커 스레드 안(=AI 점수 배치, _score_one_for_ai_batch)
+# 에서 돌고 있으므로, 예전에 이 4개를 병렬화하려고 다시 get_shared_executor()에
+# 던졌더니 워커가 서로를 기다리는 순환대기(교착)가 발생해 순차 호출로 되돌렸었다
+# (아래 calc_ai_scores_detailed 주석 참고). 그 결과 종목 1개 계산 시간이 4개
+# 호출의 "합"이 되어(각각 몇 초씩만 걸려도 금방 10초를 넘김), AI 점수 일괄
+# 계산/점수 구간 필터가 눈에 띄게 느려지는 근본 원인이 됐다(실측: 배치당
+# overall_timeout 10초 안에 거의 매번 0~소수건만 완료되고 나머지는 버려진 뒤
+# 다음 배치에서 처음부터 다시 시도되는 낭비가 반복됨).
+# 해결: get_yf_safety_executor()와 똑같은 이유로 공유 풀과 완전히 무관한
+# 별도 풀을 새로 둔다. 배치당 최대 30종목 × 4호출 = 최대 120개까지 동시에
+# 밀려들 수 있어서, yf_safety(16개, 다른 용도로도 쓰임)를 같이 쓰면 그쪽이
+# 병목이 될 수 있어 이 용도 전용으로 더 넉넉하게(40개) 분리했다.
+@st.cache_resource(show_spinner=False)
+def _get_ai_score_inner_executor_raw():
+    return concurrent.futures.ThreadPoolExecutor(max_workers=40)
+
+def get_ai_score_inner_executor():
+    return _get_or_heal_executor(_get_ai_score_inner_executor_raw, "AI점수내부", 40)
 # ────────────────────────────────────────────────────────────────────────
 
 # ── "겉 함수" 병렬 오케스트레이션 전용 풀 ──────────────────────────────────
@@ -7474,33 +7496,49 @@ def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=
 
     df_annual을 미리 전달하면(재무 데이터를 이미 조회한 경우) 재조회를 생략한다.
 
-    ⚠️ [되돌림: 내부 호출 병렬화 롤백 — 2026-08-12] 한때 df_price/스파크라인/재무/
-    수급을 get_orchestration_executor()로 동시에 던져서 병렬화했었는데, 실제
-    배포 환경 로그에서 "'공유' 풀/'오케스트레이션' 풀이 25초 이상 완전히 막혀있어
-    새 풀로 교체함"이 반복적으로 찍히며 대시보드 페이지가 몇십 초씩 응답을
-    못 하는 현상이 실측됐다. 원인은 순환 대기(circular wait) 교착상태였다:
-    전체 스캔(_unified_scan_worker)은 get_orchestration_executor()에서 돌면서
-    내부적으로 get_shared_executor()의 작업들을 기다리는데, 반대로 AI 점수
-    배치(_score_one_for_ai_batch)는 get_shared_executor()에서 돌면서 이 함수가
-    get_orchestration_executor()의 작업을 기다리고 있었다 — 두 풀이 서로를
-    기다리며 아무도 못 움직이는 상황. 순수 순차 호출로 되돌린다. 처음 계산
-    시(캐시 미스) 조금 느리더라도, 세션이 통째로 멈추는 것보다는 훨씬 낫다."""
+    ⚠️ [내부 호출 재병렬화 — 2026-08-18] 2026-08-12에는 이 4개 네트워크 호출
+    (가격이력·스파크라인·재무·수급)을 get_orchestration_executor()로 동시에
+    던졌다가, 그 풀이 다시 get_shared_executor()를 기다리고 AI 점수 배치
+    (_score_one_for_ai_batch)는 get_shared_executor() 안에서 이 함수를 기다리는
+    순환 대기(circular wait) 교착상태가 나서 순수 순차 호출로 되돌렸었다.
+    하지만 순차 호출로 되돌린 대가로 종목 1개 계산 시간이 "4개 호출의 합"이
+    되어(배치당 overall_timeout 10초를 거의 매번 넘겨버림), AI 종합점수
+    일괄계산/점수구간 필터가 몇 분씩 걸리는 근본 원인이 됐다(실측 로그로 확인:
+    같은 배치가 몇 번이고 처음부터 재시도되면서 done_count가 몇십 초씩 안 늘어남).
+    이번엔 get_ai_score_inner_executor() — 공유 풀·오케스트레이션 풀과 완전히
+    무관한 별도 풀 — 에 던진다. 이 풀은 그 어느 쪽도 기다리지 않으므로 예전과
+    같은 순환 대기가 구조적으로 발생할 수 없다. 종목 1개 소요 시간이 (4개 호출의
+    합) → (4개 중 가장 느린 것 하나)로 줄어든다.
+    (수급 점수는 df_price로 평균거래량을 보정해 정확도를 살짝 높이던 부분을
+    병렬화를 위해 포기했다 — 순매수 일수·규모 기반 본점수는 그대로고, 강도
+    보정값만 약간 덜 정밀해진다.)"""
     code = normalize_kr_code(code)
 
+    _ai_ex = get_ai_score_inner_executor()
+    _f_price = _ai_ex.submit(fetch_price_history_for_score, code)
+    _f_kospi = _ai_ex.submit(lambda: fetch_sparkline_data().get("kospi"))
+    _f_flow = _ai_ex.submit(calc_flow_score, code, 20, None)
+    _f_annual = _ai_ex.submit(fetch_financial_data, code) if df_annual is None else None
+
     try:
-        df_price = fetch_price_history_for_score(code)
+        df_price = _f_price.result(timeout=12)
     except Exception:
         df_price = pd.DataFrame()
 
     kospi_closes = None
     try:
-        kospi_closes = fetch_sparkline_data().get("kospi")
+        kospi_closes = _f_kospi.result(timeout=12)
     except Exception:
         pass
 
-    if df_annual is None:
+    try:
+        flow = _f_flow.result(timeout=12)
+    except Exception:
+        flow = 100.0
+
+    if _f_annual is not None:
         try:
-            df_annual, _, _ = fetch_financial_data(code)
+            df_annual, _, _ = _f_annual.result(timeout=12)
         except Exception:
             df_annual = None
 
@@ -7511,7 +7549,6 @@ def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=
     momentum   = calc_momentum_score(df_price, kospi_closes)
     pattern    = calc_pattern_score(df_price, volume)
     risk       = calc_risk_score(df_price, debt, drop_pct)
-    flow       = calc_flow_score(code, df_price=df_price)
     financial  = calc_financial_score_detailed(df_annual, roe, debt)
     valuation  = calc_valuation_score_detailed(per, pbr, roe, div)
 
@@ -7976,13 +8013,18 @@ def _render_ai_grade_filter_and_score(display_df, source_df):
         # 끝날 때까지 화면 전체를 막지 않는다). 아직 안 끝난 건 다음 rerun에서
         # maybe_run_global_poller()가 자동으로 다시 폴링해준다(render_async_multi가
         # _bg_jobs에 등록해두므로).
+        # ⚠️ [타임아웃 상향 — 2026-08-18] calc_ai_scores_detailed 내부 4호출을
+        # 병렬화(get_ai_score_inner_executor)하면서 종목 1개당 최대 대기가
+        # 이론상 12초(개별 result timeout)까지 걸릴 수 있게 됐다. 예전 10초
+        # 그대로 두면 병렬화 효과를 보기도 전에 배치가 잘려나가는 경우가
+        # 늘어날 수 있어, 배치 전체 상한을 그보다 넉넉하게 18초로 올렸다.
         partial, _ready = render_async_multi(
             job_key=f"reco_ai_batch_{'-'.join(batch_codes)}",
             submit_fn=_submit_ai_batch,
             collect_fn=_collect_ai_batch,
             default_result={},
             spinner_text=f"AI 종합점수 계산 중 ({len(batch)}건)...",
-            overall_timeout=10,
+            overall_timeout=18,
         )
         if partial:
             cache.update(partial)
