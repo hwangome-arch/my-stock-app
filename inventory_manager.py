@@ -599,6 +599,17 @@ def _bg_job_owners(key):
     return None
 
 
+def _bg_job_key_is_dynamic(key):
+    """job_key가 _BG_JOB_OWNER_PREFIXES(예: reco_ai_batch_)로 매칭되는
+    '동적 키'인지 여부. 동적 키는 매 배치(종목 조합)마다 값이 달라지므로,
+    한 번 제출된 job은 그 정확한 조합이 다시 필요해지지 않는 한 같은 페이지
+    안에서도 두 번 다시 같은 key로 조회되지 않을 수 있다(예: AI 등급 필터를
+    "전체보기"↔"700점대"로 바꾸면 매번 다른 종목 조합=다른 key가 만들어짐).
+    반면 _BG_JOB_OWNER_PAGES의 고정 키(dashboard_main_data 등)는 그 페이지가
+    열려 있는 한 매 rerun마다 항상 '같은' key로 다시 조회되도록 설계돼 있다."""
+    return any(key.startswith(prefix) for prefix in _BG_JOB_OWNER_PREFIXES)
+
+
 def _purge_orphaned_jobs():
     current = st.session_state.get("current_page")
 
@@ -606,8 +617,25 @@ def _purge_orphaned_jobs():
     if bg_jobs:
         for key in list(bg_jobs.keys()):
             owners = _bg_job_owners(key)
-            if owners is None or current in owners:
-                continue  # 소유 페이지를 모르거나(안전하게 보존) 지금 그 페이지에 있으면 건드리지 않음
+            if owners is None:
+                continue  # 소유 페이지를 모름 → 안전하게 보존
+            # ⚠️ [버그 수정 2026-08-18] 동적 키(reco_ai_batch_* 등)는 소유 페이지가
+            # 지금 열려 있어도 정리 대상이다. render_async_multi()는 매 rerun마다
+            # "지금 필요한 종목 조합"으로 job_key를 새로 계산하기 때문에, 필터가
+            # 바뀌는 순간 이전 배치의 key는 그 페이지 안에서도 두 번 다시 조회되지
+            # 않는다. 그 결과 이미 완료된(all futures done) 이전 배치 job이
+            # _bg_jobs에 영원히 남아, _all_jobs_settled()가 계속 "settled=True"로
+            # 오판 → _global_poll_fragment가 0.4초마다 무한 st.rerun()을 던져
+            # 화면이 계속 깜빡였다(로그: done=300/300 still_loading=False인데도
+            # rerun이 초당 반복). 이 시점에 남아있는 동적 키 job은, 같은 회차의
+            # render_async_multi 호출이 이미 자기 몫은 알아서 수거(pop)한 뒤이므로,
+            # 남아있다는 것 자체가 곧 아무도 다시 찾지 않는 orphan이라는 뜻이라
+            # 소유 페이지 여부와 무관하게 지워도 안전하다.
+            # 고정 키(대시보드/관심종목 등) job은 기존대로 소유 페이지가 지금
+            # 열려있으면 건드리지 않는다 — 그 페이지 코드가 다음 rerun에 같은
+            # key로 다시 찾아와 정상 수거할 것이기 때문이다.
+            if not _bg_job_key_is_dynamic(key) and current in owners:
+                continue
             futures = bg_jobs[key].get("futures", {})
             if futures and all(f.done() for f in futures.values()):
                 bg_jobs.pop(key, None)
