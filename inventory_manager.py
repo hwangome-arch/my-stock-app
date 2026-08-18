@@ -169,6 +169,16 @@ DEBUG_DISABLE_DASHBOARD_SCAN = False
 def normalize_kr_code(code):
     return re.sub(r"\D", "", str(code)).zfill(6)[:6]
 
+# ── [버그 수정: 빈/NaN 종목코드가 "000000"으로 변환되며 발생하는 불필요한 API 호출] ──
+# 종목코드가 비어있거나 NaN인 행이 normalize_kr_code()를 거치면 숫자가 하나도
+# 없어 zfill(6)로 "000000"이 된다. 이 값은 실제로 존재하지 않는 종목코드라서
+# yfinance/네이버/FnGuide에 매번 요청을 보내봤자 항상 404/빈 응답으로 실패한다
+# (로그에 반복적으로 찍히던 "$000000.KS: No data found" / "HTTP Error 404"가
+# 이 케이스다). 아래 헬퍼로 각 fetch 함수 진입 시점에 조기 차단해 헛된 네트워크
+# 왕복을 없앤다.
+def _is_invalid_kr_code(code):
+    return code == "000000"
+
 # ── 앱 전역 공유 스레드풀 ──────────────────────────────────────────────────
 # 문제: 기존에는 대시보드/관심종목/스크리너 등에서 병렬조회가 필요할 때마다 매번
 # 새 ThreadPoolExecutor를 만들고 shutdown(wait=False)로 버렸다. shutdown(wait=False)는
@@ -1898,6 +1908,8 @@ def _fn_build_dividend_table(income_df, valuation_df):
 def fetch_fnguide_data(code):
     code = normalize_kr_code(code)
     df_annual, df_quarter, df_dividend = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    if _is_invalid_kr_code(code):
+        return df_annual, df_quarter, df_dividend
 
     debug = {
         "code": code, "status": None, "resp_len": None,
@@ -2251,6 +2263,8 @@ def fetch_naver_wisereport_data(code):
     """
     code = normalize_kr_code(code)
     df_annual, df_quarter, df_dividend = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    if _is_invalid_kr_code(code):
+        return df_annual, df_quarter, df_dividend
     debug = {"code": code, "step": None}
 
     try:
@@ -6726,6 +6740,8 @@ def fetch_price_history_for_score(code, period="1y"):
     """추세/거래량/모멘텀/패턴/리스크 점수 계산용 일봉 OHLCV(종가·거래량·고가).
     코스피(.KS) 우선 조회 후 실패하면 코스닥(.KQ)으로 폴백. 실패 시 빈 DataFrame."""
     code = normalize_kr_code(code)
+    if _is_invalid_kr_code(code):
+        return pd.DataFrame()
     try:
         import yfinance as yf
         df = call_with_timeout(
@@ -8682,7 +8698,39 @@ def render_recommendations():
                         """, unsafe_allow_html=True)
                 
                     with st.expander(f"{name} · AI 진단 · 재무분석"):
-                        render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_label)
+                        # ── [버그 수정: 메인 렌더 스레드가 네트워크 호출로 최대 20~30초씩
+                        # 멈추던 문제] st.expander 안의 코드는 접혀있어도(펼치지 않아도)
+                        # 매 rerun마다 그대로 실행된다. 그런데 render_ai_diagnosis →
+                        # calc_ai_scores_detailed → fetch_financial_data는 캐시가
+                        # 비어있으면(@st.cache_data 미스) 네이버/FnGuide에 동기(requests.get,
+                        # 최대 10초×여러 번)로 직접 접속한다. 리스트에 표시되는 종목 수만큼
+                        # 이게 반복되면 "추천 종목" 페이지 전체가 그 시간만큼 멈춰버렸다
+                        # (실측: 워치독 로그에서 메인 스레드가 fetch_naver_wisereport_data
+                        # 내부 requests.get에 멈춰있는 게 확인됨).
+                        #
+                        # 내부적으로 다시 병렬화하는 건 이미 한 번 시도했다가 orchestration
+                        # 풀↔shared 풀 순환 대기로 데드락이 나서 되돌린 이력이 있으므로
+                        # (calc_ai_scores_detailed 문서 참고) 여기서도 병렬화 대신, 이미
+                        # 이 파일의 배당 탭에서 쓰던 것과 동일한 패턴 — "명시적 클릭 전에는
+                        # 무거운 네트워크 호출을 시작하지 않는다" — 을 그대로 적용한다.
+                        #
+                        # AI 종합점수 배치(_render_ai_grade_filter_and_score)가 백그라운드
+                        # 스레드풀에서 이미 이 종목을 계산해뒀다면(=st.session_state의
+                        # _reco_ai_score_cache에 존재) fetch_financial_data가 이미
+                        # @st.cache_data에 데워져 있어 즉시(네트워크 왕복 없이) 렌더링되므로
+                        # 클릭 없이 바로 보여준다. 아직 배치가 이 종목까지 못 왔다면, 버튼을
+                        # 눌러야만 그 순간 딱 이 종목 하나에 대해서만 네트워크 호출이 발생한다.
+                        _diag_ready_key = f"reco_diag_ready_{code}"
+                        _ai_cache_now = st.session_state.get('_reco_ai_score_cache', {})
+                        _diag_is_warm = (code in _ai_cache_now) or st.session_state.get(_diag_ready_key, False)
+
+                        if _diag_is_warm:
+                            render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_label)
+                        else:
+                            st.info("⏳ 아직 AI 재무 데이터가 준비되지 않았습니다. 배치 계산이 끝날 때까지 기다리시거나, 아래 버튼으로 이 종목만 지금 바로 불러올 수 있어요 (몇 초 소요될 수 있습니다).")
+                            if st.button(f"⚡ {name} AI 진단 지금 불러오기", key=f"reco_diag_load_{code}"):
+                                st.session_state[_diag_ready_key] = True
+                                st.rerun()
                         st.markdown("<hr style='margin:16px 0 12px 0; border-color:#E5E7EB;'>", unsafe_allow_html=True)
 
                         btn_key = f"reco_fn_{code}"
