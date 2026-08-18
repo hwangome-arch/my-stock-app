@@ -8418,6 +8418,9 @@ def render_recommendations():
             )
         if _bulk_ai_clicked:
             st.session_state['_reco_ai_bulk_scan'] = True
+            # 새 일괄 계산을 시작하니, 이전 완료 표시는 지금 상황과 맞지 않게
+            # 되므로 지운다(끝나면 아래에서 새로 채워짐).
+            st.session_state.pop('_reco_ai_bulk_scan_done_info', None)
 
         ai_grade_filter = st.pills(
             "AI 등급 필터",
@@ -8500,6 +8503,15 @@ def render_recommendations():
                 # 일괄 계산이 끝났으면 버튼 상태를 꺼서, 다음 rerun부터는 이
                 # 무거운 전체 재계산을 매번 반복하지 않고 캐시만 조회한다.
                 st.session_state['_reco_ai_bulk_scan'] = False
+                # ⚠️ [완료 표시 추가] 예전엔 계산이 끝나는 순간 진행률 캡션이
+                # 그냥 사라져서, 사용자가 "끝난 건지 그냥 멈춘 건지" 알 수 없었다
+                # (실측: 80% 근처에서 화면이 안 바뀌는 걸 보고 아직도 도는 중인
+                # 줄 알았는데 실제론 이미 끝나 있었던 사례). 완료된 시점의 건수·
+                # 시각을 세션에 남겨서, 아래에서 "완료됨" 표시를 계속 보여준다.
+                st.session_state['_reco_ai_bulk_scan_done_info'] = {
+                    'count': _ai_total,
+                    'ts': time.time(),
+                }
 
         if ai_grade_filter != "전체보기" and not display_df.empty:
             # ⚠️ [배타적 구간으로 변경] 예전엔 ">= min_score"(누적, 상한 없음)라서
@@ -8553,6 +8565,14 @@ def render_recommendations():
                     st.rerun()
             else:
                 st.caption(f"🤖 AI 점수 일괄 계산 중... ({_ai_done}/{_ai_total}건, {_ai_pct}%) — 계산되는 동안에도 아래 목록은 그대로 보실 수 있어요.")
+        elif st.session_state.get('_reco_ai_bulk_scan_done_info'):
+            # ⚠️ [완료 표시] 계산이 끝난 뒤에도 (다음 스캔을 새로 누르기 전까지)
+            # 계속 남아있는 안내 — "조용히 사라짐" 대신 "확실히 끝났다"는 걸
+            # 알려준다.
+            _done_info = st.session_state['_reco_ai_bulk_scan_done_info']
+            _mins_ago = int((time.time() - _done_info['ts']) / 60)
+            _time_str = "방금 전" if _mins_ago < 1 else f"{_mins_ago}분 전"
+            st.caption(f"✅ AI 점수 일괄 계산 완료 ({_done_info['count']}건, {_time_str}) — 모든 점수 구간 필터를 바로 확인하실 수 있어요.")
 
         # ⚠️ [방어 코드] 위 필터링 과정에서 어떤 이유로든(pandas 버전 이슈 포함)
         # display_df가 컬럼까지 잃어버린 채로 넘어오는 상황을 대비해, sort_values를
