@@ -9476,6 +9476,44 @@ def render_fnguide():
             if _prob_html2:
                 st.markdown(_prob_html2, unsafe_allow_html=True)
 
+            # ── [신규] 원하는 목표가를 직접 입력해서 도달 확률 확인 ──────────────────
+            # 위 배지는 PER15×/PBR1.3×/컨센서스 등으로 "자동 계산된" 목표가 하나만
+            # 보여준다. 하지만 "이 종목이 60만원 갈 확률은?"처럼 원하는 가격을 직접
+            # 넣어보고 싶을 수 있다(예: 삼성SDI 현재가 49.5만원인데 60만원 도달 확률이
+            # 궁금한 경우). 관심종목 탭에 이미 있는 "목표가 직접 입력" 패턴을 그대로
+            # 가져와서, 여기 상세 분석 화면에서도 같은 방식으로 쓸 수 있게 한다.
+            _custom_tgt_key = f"fnguide_custom_target_{code}"
+            if _custom_tgt_key not in st.session_state:
+                st.session_state[_custom_tgt_key] = ""
+
+            def _fmt_custom_target(k=_custom_tgt_key):
+                digits = re.sub(r"[^\d]", "", str(st.session_state.get(k, "")))
+                st.session_state[k] = f"{int(digits):,}" if digits else ""
+
+            st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
+            _ct1, _ct2 = st.columns([1, 2.3])
+            with _ct1:
+                st.text_input(
+                    "🎯 원하는 목표가로 직접 확률 확인 (원)",
+                    key=_custom_tgt_key,
+                    on_change=_fmt_custom_target,
+                    placeholder="예: 600,000",
+                )
+            with _ct2:
+                st.markdown(
+                    "<div style='padding-top:28px; font-size:11px; color:#94A3B8;'>"
+                    "원하는 가격을 입력하면 그 가격까지의 30·90·180일 도달 확률을 바로 계산해 보여줍니다."
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+
+            _custom_digits = re.sub(r"[^\d]", "", str(st.session_state.get(_custom_tgt_key, "")))
+            _custom_target = int(_custom_digits) if _custom_digits else 0
+            if _custom_target > 0:
+                _prob_html_custom = render_hit_probability_badge(code, None, _custom_target, "직접 입력")
+                if _prob_html_custom:
+                    st.markdown(_prob_html_custom, unsafe_allow_html=True)
+
 
 def render_dividend():
     st.header(
