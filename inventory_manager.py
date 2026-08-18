@@ -8595,7 +8595,20 @@ def render_recommendations():
         if display_df.empty:
             st.info(f"현재 설정된 필터({market_filter}, {selected_grade}, AI {ai_grade_filter})에 부합하는 종목이 없습니다. 조건을 완화해보세요.")
         else:
-            display_df = display_df.sort_values('고점 / 하락률', ascending=True).reset_index(drop=True)
+            # ── [정렬 기준: AI 점수 구간 선택 시 점수 내림차순] ──────────────────
+            # 기존에는 AI 점수 구간(예: 700~799)을 골라도 항상 '고점 / 하락률' 오름차순
+            # 으로만 정렬되어, 같은 구간 안에서 점수가 높은 종목이 먼저 보인다는 보장이
+            # 없었다. AI 점수는 위 필터링 단계(_ai_score_map)에서 이미 계산이 끝난
+            # 상태라 여기서는 추가 API 호출·재계산 없이 그 값으로 정렬만 바꾸면 되므로
+            # 속도에는 영향이 없다. 점수 구간을 고르지 않은 '전체보기'일 때는 기존과
+            # 동일하게 하락률 기준 정렬을 유지한다(원래 화면 흐름 유지).
+            if ai_grade_filter != "전체보기":
+                display_df['_ai_score_sort'] = display_df['종목코드'].apply(
+                    lambda c: _ai_score_map.get(str(c).zfill(6), -1)
+                )
+                display_df = display_df.sort_values('_ai_score_sort', ascending=False).drop(columns=['_ai_score_sort']).reset_index(drop=True)
+            else:
+                display_df = display_df.sort_values('고점 / 하락률', ascending=True).reset_index(drop=True)
             PAGE_SIZE = 15
             total_n = len(display_df)
             # ⚠️ total_n을 시그니처에 넣지 않는다 — AI 등급 필터가 점진적으로 채워지는
