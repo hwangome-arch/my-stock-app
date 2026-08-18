@@ -9274,7 +9274,23 @@ def render_fnguide():
 
         budget_won_from_shares = _total_invest
 
-        if calc_btn and entry1_input > 0:
+        # ── [버그 수정: 목표가 직접 입력 시 계산 카드 전체가 사라지던 문제] ──────────
+        # st.button()은 "클릭된 바로 그 rerun"에서만 True이고, 그 다음 rerun(예: 아래
+        # '목표가 직접 입력' 필드에 값을 넣고 엔터/포커스아웃 하는 순간)부터는 다시
+        # False로 돌아간다. 그런데 계산 카드 전체가 `if calc_btn and ...`에만 기대고
+        # 있었어서, 계산 결과를 본 뒤 목표가를 입력하면(=새 rerun 발생) 카드 자체가
+        # 통째로 사라지는 것처럼 보였다(실제로는 아직 계산도 안 끝났는데 사라진 게
+        # 아니라, 카드를 그리는 조건 자체가 다시 False가 된 것).
+        # 해결: "계산 버튼을 눌렀었는지"를 세션 상태에 종목별로 기억해두고, 이후
+        # rerun에서는 그 기억을 기준으로 카드를 계속 그린다. 진입가를 바꿔서 다시
+        # 계산하고 싶으면 버튼을 다시 누르면 되고(그때 값이 최신 entry1_input으로
+        # 갱신됨), 목표가 직접입력처럼 카드와 무관한 값을 바꾸는 것만으로는 카드가
+        # 사라지지 않는다.
+        _calc_shown_key = f"calc_shown_{code}"
+        if calc_btn:
+            st.session_state[_calc_shown_key] = True
+
+        if st.session_state.get(_calc_shown_key) and entry1_input > 0:
             _per_ai      = cached['per_ai']
             _pbr_ai      = cached['pbr_ai']
             _roe_ai      = cached['roe_ai']
