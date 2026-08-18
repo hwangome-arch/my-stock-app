@@ -9325,22 +9325,11 @@ def render_ai_probability():
         st.warning("현재가를 조회하지 못했습니다. 종목코드를 다시 확인해주세요.")
         return
 
-    # ── AI 종합점수 (기업 재무 분석 탭과 동일한 카드 UI 재사용) ────────────
-    st.markdown("<h4 style='font-size:16px; margin-bottom:4px;'>🤖 AI 종합점수</h4>", unsafe_allow_html=True)
-    st.markdown(f"<div style='color:#64748B; font-size:13px; margin-bottom:8px;'>현재가 {int(current_price):,}원 기준</div>", unsafe_allow_html=True)
-    render_ai_diagnosis(
-        cached['name'], code,
-        cached['per_ai'], cached['pbr_ai'], cached['roe_ai'], cached['debt_ai'],
-        cached['drop_pct_ai'], cached['div_ai'], ""
-    )
-
-    st.markdown("<hr style='margin:20px 0 16px 0; border-color:#E5E7EB;'>", unsafe_allow_html=True)
-
-    # ── 목표가 도달 확률 (통계 기반) ──────────────────────────────────
+    # ── 목표가 도달 확률 (통계 기반) — 이 탭의 메인 지표라 상단에 배치 ──────
     st.markdown("<h4 style='font-size:16px; margin-bottom:4px;'>🎲 목표가 도달 확률 (통계 기반)</h4>", unsafe_allow_html=True)
     st.markdown(
         "<p style='font-size:12px; color:#64748B; margin-bottom:12px;'>"
-        "최근 1년 변동성을 이용한 몬테카를로 시뮬레이션입니다. 위 AI 종합점수와는 "
+        "최근 1년 변동성을 이용한 몬테카를로 시뮬레이션입니다. 아래 AI 종합점수와는 "
         "별개로 계산되며, 방향성(상승/하락)을 예단하지 않습니다.</p>",
         unsafe_allow_html=True
     )
@@ -9351,14 +9340,24 @@ def render_ai_probability():
     # 종목 값 그대로 남아있었다. key에 종목코드를 포함시키면 종목이 바뀔 때
     # 자동으로 새 위젯(=새 기본값)으로 취급되어 매번 그 종목에 맞는 기본
     # 목표가로 리셋된다.
-    target_input = st.text_input(
+    # 💬 [자동 콤마 포맷] 값을 바꿀 때(on_change)마다 숫자만 추출해 다시
+    # "1,234" 형태로 저장한다. 관심종목 탭의 목표가 입력란과 동일한 패턴.
+    _tgt_key = f"aiprob_target_input_{code}"
+    if _tgt_key not in st.session_state:
+        st.session_state[_tgt_key] = f"{default_target:,.0f}"
+
+    def _fmt_aiprob_target(k=_tgt_key):
+        digits = re.sub(r"[^\d]", "", str(st.session_state.get(k, "")))
+        st.session_state[k] = f"{int(digits):,}" if digits else ""
+
+    st.text_input(
         "목표가 직접 입력 (원)",
-        value=f"{default_target:,.0f}",
-        key=f"aiprob_target_input_{code}",
+        key=_tgt_key,
+        on_change=_fmt_aiprob_target,
         placeholder="예: 300,000"
     )
     try:
-        target_price = int(re.sub(r"[^\d]", "", target_input))
+        target_price = int(re.sub(r"[^\d]", "", st.session_state.get(_tgt_key, "")))
     except Exception:
         target_price = default_target
 
@@ -9372,6 +9371,17 @@ def render_ai_probability():
 
     # TODO(다음 단계): AI 종합점수를 드리프트 보정치로 반영해 "AI가 종합적으로
     # 판단한 확률" 하나로 합치기 — 캘리브레이션·백테스트 설계 후 진행.
+
+    st.markdown("<hr style='margin:20px 0 16px 0; border-color:#E5E7EB;'>", unsafe_allow_html=True)
+
+    # ── AI 종합점수 (기업 재무 분석 탭과 동일한 카드 UI 재사용) ────────────
+    st.markdown("<h4 style='font-size:16px; margin-bottom:4px;'>🤖 AI 종합점수</h4>", unsafe_allow_html=True)
+    st.markdown(f"<div style='color:#64748B; font-size:13px; margin-bottom:8px;'>현재가 {int(current_price):,}원 기준</div>", unsafe_allow_html=True)
+    render_ai_diagnosis(
+        cached['name'], code,
+        cached['per_ai'], cached['pbr_ai'], cached['roe_ai'], cached['debt_ai'],
+        cached['drop_pct_ai'], cached['div_ai'], ""
+    )
 
 
 def render_fnguide():
