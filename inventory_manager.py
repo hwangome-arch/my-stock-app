@@ -9235,7 +9235,9 @@ def render_fnguide():
                 value=st.session_state.get(_entry1_key, 0),
                 step=100,
                 key=_entry1_key,
-                help="실시간 현재가가 자동으로 입력됩니다. 직접 수정도 가능합니다.",
+                help="실시간 현재가가 자동으로 입력됩니다. 이 값이 곧 '현재가' 기준으로 쓰여서, "
+                     "직접 원하는 가격(예: 20만원 → 40만원)으로 바꾼 뒤 '전략 계산'을 누르면 "
+                     "목표가·2/3차 진입가·손절가가 전부 그 값 기준으로 다시 계산됩니다.",
                 format="%d",
             )
         with _c2:
@@ -9287,8 +9289,18 @@ def render_fnguide():
             except Exception:
                 _target_price = 0
 
-            _cur_price = _fetch_cur_price_for_fill(code)
+            # ── [버그 수정: "1차 진입가"를 사용자가 바꿔도 PBR 기반 계산에는 반영 안 되던 문제] ──
+            # PER 기반 목표가(target_price = e1 × 15/PER)는 이미 entry1_input(e1)을 그대로
+            # 쓰고 있어서 사용자가 진입가를 20만→40만으로 바꾸면 즉시 반영됐다. 그런데
+            # PBR 기반 경로(2·3차 진입가의 펀더멘털 근거, PBR 목표가, PBR 손절가, BPS 표시)는
+            # 이 입력값 대신 _fetch_cur_price_for_fill()로 매번 새로 "실시간" 현재가를 다시
+            # 가져와서 썼다. 그래서 PBR 방식으로 목표가가 뜨는 종목에서는 사용자가 "1차
+            # 진입가"를 바꿔도 그 아래 계산들이 바뀌지 않는 것처럼 보였다.
+            # 해결: e1(=entry1_input, 사용자가 직접 수정 가능한 값)을 "현재가" 기준으로
+            # 통일해서 쓴다. 이러면 20만원을 40만원으로 바꿔 계산 버튼을 누르면, PER/PBR
+            # 어느 경로든 그 값 기준으로 목표가·진입가·손절가가 전부 재계산된다.
             e1 = entry1_input
+            _cur_price = e1
 
             e2_fixed = round(e1 * 0.92)
             e3_fixed = round(e1 * 0.83)
