@@ -3702,7 +3702,13 @@ def _format_probability_fun_card(result, target_price, target_src="목표가"):
     ⚠️ 다른 탭(관심종목·전략계산)에서 쓰는 _format_hit_probability_badge와는 별개다
     (그쪽은 여러 종목이 한 화면에 쭉 나열되는 목록형이라 지금처럼 큰 카드를 쓰면
     화면이 너무 길어진다 — 이 탭은 종목 하나만 크게 보여주는 상세 페이지라서
-    카드를 키워도 괜찮다)."""
+    카드를 키워도 괜찮다).
+
+    ⚠️ [버그 수정] 이전 버전은 f-string을 여러 줄로 들여써서 만들었는데, 그
+    결과 각 줄 앞에 공백 8~10칸이 섞여 들어갔다. st.markdown이 쓰는 마크다운
+    파서는 줄 앞 공백 4칸 이상을 "코드 블록"으로 해석해서, HTML이 렌더링되지
+    않고 태그가 그대로 화면에 텍스트로 찍혔다. 모든 조각을 줄바꿈/들여쓰기
+    없이 이어붙이는 방식으로 고쳤다."""
     if not result or not target_price or target_price <= 0:
         return ""
     probs = result["probs"]
@@ -3712,26 +3718,26 @@ def _format_probability_fun_card(result, target_price, target_src="목표가"):
     for h in (30, 90, 180):
         pct = probs.get(h, 0)
         color, emoji, label = _probability_tier(pct)
-        rows_html += f"""
-        <div style='margin-bottom:16px;'>
-          <div style='display:flex; justify-content:space-between; align-items:baseline; margin-bottom:5px;'>
-            <span style='font-size:13px; color:#475569; font-weight:600;'>{horizon_labels[h]}</span>
-            <span style='font-size:24px; font-weight:800; color:{color};'>{pct:.0f}%</span>
-          </div>
-          <div style='background:#F1F5F9; border-radius:8px; height:14px; overflow:hidden;'>
-            <div style='width:{pct}%; height:100%; background:linear-gradient(90deg, {color}99, {color}); border-radius:8px;'></div>
-          </div>
-          <div style='font-size:11px; color:{color}; margin-top:4px; font-weight:700;'>{emoji} {label}</div>
-        </div>
-        """
+        rows_html += (
+            '<div style="margin-bottom:16px;">'
+            '<div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:5px;">'
+            f'<span style="font-size:13px; color:#475569; font-weight:600;">{horizon_labels[h]}</span>'
+            f'<span style="font-size:24px; font-weight:800; color:{color};">{pct:.0f}%</span>'
+            '</div>'
+            '<div style="background:#F1F5F9; border-radius:8px; height:14px; overflow:hidden;">'
+            f'<div style="width:{pct}%; height:100%; background:linear-gradient(90deg, {color}99, {color}); border-radius:8px;"></div>'
+            '</div>'
+            f'<div style="font-size:11px; color:{color}; margin-top:4px; font-weight:700;">{emoji} {label}</div>'
+            '</div>'
+        )
 
     return (
-        f"<div style='margin-top:8px; padding:16px 18px; background:linear-gradient(135deg,#F5F3FF,#FDF4FF); "
-        f"border:1px solid #DDD6FE; border-radius:14px;'>"
-        f"<div style='font-size:13px; color:#6D28D9; font-weight:700; margin-bottom:14px;'>"
-        f"🎲 {target_price:,.0f}원({target_src}) 도달 확률 · 종가 기준 통계 추정</div>"
-        f"{rows_html}"
-        f"</div>"
+        '<div style="margin-top:8px; padding:16px 18px; background:linear-gradient(135deg,#F5F3FF,#FDF4FF); '
+        'border:1px solid #DDD6FE; border-radius:14px;">'
+        f'<div style="font-size:13px; color:#6D28D9; font-weight:700; margin-bottom:14px;">'
+        f'🎲 {target_price:,.0f}원({target_src}) 도달 확률 · 종가 기준 통계 추정</div>'
+        f'{rows_html}'
+        '</div>'
     )
 
 def render_hit_probability_badge(stock_code, market_hint, target_price, target_src="목표가"):
@@ -9205,11 +9211,13 @@ def render_ai_probability():
     목표: 특정 목표가에 도달할 확률을 "딥하게" 보여주는 탭. 기존에 흩어져 있던
     두 엔진을 재사용해서 나란히 보여주는 걸 1단계로 잡았다:
 
-      1) calc_ai_scores_detailed — 이미 있는 0~1000점 AI 종합점수 엔진.
-         PER/PBR/ROE/부채비율/52주 고점대비 낙폭/배당/거래량/수급/추세/모멘텀/
-         패턴을 전부 반영한다. (기업 재무 분석 탭에서 쓰는 것과 동일 엔진)
+      1) render_ai_diagnosis — 기업 재무 분석 탭에서 쓰는 것과 완전히 동일한
+         AI 종합점수 카드(0~1000점, 8개 항목 막대그래프+툴팁, 강점/약점 배지,
+         AI 코멘트). PER/PBR/ROE/부채비율/52주 고점대비 낙폭/배당/거래량/수급/
+         추세/모멘텀/패턴을 전부 반영한다.
       2) estimate_target_hit_probability — 이미 있는 변동성 기반 몬테카를로
-         확률(재무와 무관, 순수 통계).
+         확률(재무와 무관, 순수 통계). 이 탭에서는 게이지 바 + 감성 라벨을
+         붙인 _format_probability_fun_card로 좀 더 눈에 띄게 표시한다.
 
     ⚠️ [의도적 미구현 — 다음 단계 TODO] 지금은 이 두 숫자를 "나란히" 보여줄
     뿐, 하나로 합치지 않는다. AI 종합점수가 높다고 그 방향(상승)에 가중치를
@@ -9290,10 +9298,15 @@ def render_ai_probability():
     if search_btn or cache_key not in st.session_state:
         def _do_aiprob_fetch():
             _price_info = fetch_current_price_info(code)
+            _info = fetch_company_info_fnguide(code)
             _df_annual, _, _ = fetch_financial_data(code)
             _per_ai, _pbr_ai, _roe_ai, _debt_ai, _drop_pct_ai, _div_ai = get_ai_diagnosis_inputs(code, _df_annual)
-            _scores = calc_ai_scores_detailed(code, _per_ai, _pbr_ai, _roe_ai, _debt_ai, _drop_pct_ai, _div_ai, df_annual=_df_annual)
-            return {"price_info": _price_info, "scores": _scores}
+            return {
+                "price_info": _price_info,
+                "name": _info.get('name') or code,
+                "per_ai": _per_ai, "pbr_ai": _pbr_ai, "roe_ai": _roe_ai,
+                "debt_ai": _debt_ai, "drop_pct_ai": _drop_pct_ai, "div_ai": _div_ai,
+            }
 
         with st.spinner("AI 종합점수를 계산하는 중입니다..."):
             _result = call_with_timeout(_do_aiprob_fetch, timeout=25)
@@ -9306,47 +9319,20 @@ def render_ai_probability():
 
     cached = st.session_state[cache_key]
     price_info = cached['price_info']
-    scores = cached['scores']
     current_price = price_info.get('price')
 
     if not current_price:
         st.warning("현재가를 조회하지 못했습니다. 종목코드를 다시 확인해주세요.")
         return
 
-    # ── AI 종합점수 요약 ──────────────────────────────────────────────
+    # ── AI 종합점수 (기업 재무 분석 탭과 동일한 카드 UI 재사용) ────────────
     st.markdown("<h4 style='font-size:16px; margin-bottom:4px;'>🤖 AI 종합점수</h4>", unsafe_allow_html=True)
-    total = scores["total"]
-    total_color = _ai_score_color(total)
-    col_a, col_b = st.columns([1, 2.5])
-    with col_a:
-        st.markdown(
-            f"<div style='font-size:32px; font-weight:800; color:{total_color};'>{total}<span style='font-size:14px; color:#94A3B8;'> / 1000</span></div>",
-            unsafe_allow_html=True
-        )
-    with col_b:
-        st.markdown(f"<div style='padding-top:10px; color:#64748B; font-size:13px;'>현재가 {int(current_price):,}원 기준</div>", unsafe_allow_html=True)
-
-    with st.expander("점수 구성 항목 펼쳐보기 (8개 항목 배점)", expanded=True):
-        # 항목별로 간단한 막대 그래프(st.progress)로 표시. 리스크는 감점 항목이라
-        # (0 ~ -80) 방향이 반대라서, "감점을 얼마나 썼는지" 비율로 따로 계산한다.
-        _score_rows = [
-            ("추세", scores["trend"], scores["trend_max"]),
-            ("수급", scores["flow"], scores["flow_max"]),
-            ("거래량", scores["volume"], scores["volume_max"]),
-            ("재무", scores["financial"], scores["financial_max"]),
-            ("밸류", scores["valuation"], scores["valuation_max"]),
-            ("모멘텀", scores["momentum"], scores["momentum_max"]),
-            ("AI패턴", scores["pattern"], scores["pattern_max"]),
-        ]
-        for _label, _val, _max in _score_rows:
-            _ratio = max(0.0, min(1.0, _val / _max)) if _max else 0.0
-            _emoji = "🟢" if _ratio >= 0.7 else ("🟡" if _ratio >= 0.4 else "🔴")
-            st.progress(_ratio, text=f"{_emoji} {_label}  {_val:.0f} / {_max:.0f}")
-
-        _risk_val, _risk_min = scores["risk"], scores["risk_min"]
-        _risk_ratio = max(0.0, min(1.0, _risk_val / _risk_min)) if _risk_min else 0.0
-        _risk_emoji = "🟢" if _risk_ratio <= 0.3 else ("🟡" if _risk_ratio <= 0.6 else "🔴")
-        st.progress(_risk_ratio, text=f"{_risk_emoji} 리스크 감점  {_risk_val:.0f} / {_risk_min:.0f}")
+    st.markdown(f"<div style='color:#64748B; font-size:13px; margin-bottom:8px;'>현재가 {int(current_price):,}원 기준</div>", unsafe_allow_html=True)
+    render_ai_diagnosis(
+        cached['name'], code,
+        cached['per_ai'], cached['pbr_ai'], cached['roe_ai'], cached['debt_ai'],
+        cached['drop_pct_ai'], cached['div_ai'], ""
+    )
 
     st.markdown("<hr style='margin:20px 0 16px 0; border-color:#E5E7EB;'>", unsafe_allow_html=True)
 
