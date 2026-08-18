@@ -3697,9 +3697,15 @@ def _probability_tier(pct):
     else:
         return "#64748B", "🥶", "희박해요"
 
-def _format_probability_fun_card(result, target_price, target_src="목표가"):
+def _format_probability_fun_card(result, target_price, target_src="목표가", current_price=None):
     """AI 확률분석 탭 전용 — 30/90/180일 도달확률을 밝은 배경의 카드 3개로
     나란히 보여주는 디자인. (재미 요소 — 투자 조언 아님)
+
+    🔧 [2026-08-19] current_price를 옵션으로 받아 헤더에 "현재가 → 목표가
+    (등락률)" 형태로 같이 보여준다. 목표가 하나만 덩그러니 있으면 "지금 얼마인데
+    몇 % 움직여야 하는 목표인지"를 알 수 없어서, 나중에 컨센서스 목표가를 자동
+    반영하게 되더라도(사용자 의도) 항상 현재가 대비 맥락을 함께 볼 수 있게 한다.
+    호출부가 안 넘겨주면(None) 기존처럼 목표가만 표시 — 하위 호환 유지.
 
     ⚠️ 다른 탭(관심종목·전략계산)에서 쓰는 _format_hit_probability_badge와는 별개다
     (그쪽은 여러 종목이 한 화면에 쭉 나열되는 목록형이라 지금처럼 큰 카드를 쓰면
@@ -3744,11 +3750,25 @@ def _format_probability_fun_card(result, target_price, target_src="목표가"):
             '</div>'
         )
 
+    if current_price and current_price > 0:
+        _diff_pct = (target_price - current_price) / current_price * 100
+        _diff_sign = "+" if _diff_pct >= 0 else ""
+        _diff_color = "#DC2626" if _diff_pct >= 0 else "#2563EB"
+        header_html = (
+            f'<span style="color:#0F172A; font-weight:700;">{current_price:,.0f}원</span>'
+            f'<span style="color:#CBD5E1; margin:0 6px;">→</span>'
+            f'<span style="color:#0F172A; font-weight:700;">{target_price:,.0f}원</span>'
+            f'<span style="color:#94A3B8;">({target_src})</span>'
+            f'<span style="color:{_diff_color}; font-weight:700; margin-left:6px;">{_diff_sign}{_diff_pct:.1f}%</span>'
+        )
+    else:
+        header_html = f'{target_price:,.0f}원({target_src})'
+
     return (
         '<div style="margin-top:8px; padding:14px 16px; background:#F8FAFC; '
         'border:1px solid #E2E8F0; border-radius:14px;">'
         f'<div style="font-size:12.5px; color:#64748B; font-weight:700; margin-bottom:10px;">'
-        f'🎲 {target_price:,.0f}원({target_src}) 도달 확률 · 종가 기준 통계 추정</div>'
+        f'🎲 {header_html} 도달 확률 · 종가 기준 통계 추정</div>'
         f'<div style="display:flex; gap:10px;">{cards_html}</div>'
         '</div>'
     )
@@ -9455,6 +9475,30 @@ def render_ai_probability():
         unsafe_allow_html=True
     )
 
+    # 💡 [현재가 표시 — 2026-08-19] 목표가 입력란 바로 위에 지금 현재가가 얼마인지
+    # (전일대비 등락 포함) 보여준다. 목표가만 덩그러니 있으면 "지금 얼마인데 이
+    # 목표가를 잡은 건지" 감이 안 와서, 나중에 목표가 기본값을 컨센서스로 자동
+    # 채우게 되더라도 항상 현재가를 같이 보고 판단할 수 있게 한다.
+    _diff = price_info.get('diff')
+    _diff_pct = price_info.get('diff_pct')
+    if _diff is not None and _diff_pct is not None:
+        _status = price_info.get('status', 'neutral')
+        _p_color = {"up": "#DC2626", "down": "#2563EB", "neutral": "#64748B"}[_status]
+        _p_arrow = {"up": "▲", "down": "▼", "neutral": "-"}[_status]
+        _p_sign = "+" if _diff >= 0 else ""
+        _price_line = (
+            f"<span style='font-size:20px; font-weight:800; color:#0F172A;'>{int(current_price):,}원</span> "
+            f"<span style='font-size:13px; font-weight:700; color:{_p_color};'>{_p_arrow} {_p_sign}{_diff:,.0f} ({_p_sign}{_diff_pct:.2f}%)</span>"
+        )
+    else:
+        _price_line = f"<span style='font-size:20px; font-weight:800; color:#0F172A;'>{int(current_price):,}원</span>"
+    st.markdown(
+        f"<div style='margin-bottom:10px;'>"
+        f"<span style='font-size:12px; color:#94A3B8; display:block; margin-bottom:2px;'>현재가</span>"
+        f"{_price_line}</div>",
+        unsafe_allow_html=True
+    )
+
     default_target, target_src = estimate_simple_target_price(current_price)
     # 🐛 [버그 수정] key가 고정값(aiprob_target_input_field)이면, 종목을 바꿔도
     # Streamlit이 이전 위젯 상태를 그대로 재사용해서 목표가 입력란이 이전
@@ -9484,7 +9528,7 @@ def render_ai_probability():
 
     if target_price and target_price > 0:
         result = estimate_target_hit_probability(code, None, target_price)
-        badge_html = _format_probability_fun_card(result, target_price, target_src="목표가")
+        badge_html = _format_probability_fun_card(result, target_price, target_src="목표가", current_price=current_price)
         if badge_html:
             st.markdown(badge_html, unsafe_allow_html=True)
         else:
