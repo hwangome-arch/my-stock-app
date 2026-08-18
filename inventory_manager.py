@@ -3698,55 +3698,56 @@ def _probability_tier(pct):
         return "#64748B", "🥶", "희박해요"
 
 def _format_probability_fun_card(result, target_price, target_src="목표가"):
-    """AI 확률분석 탭 전용 — 30/90/180일 도달확률을 큰 숫자의 다크 카드 3개로
-    나란히 보여주는 '임팩트 강화형' 디자인. (재미 요소 — 투자 조언 아님)
+    """AI 확률분석 탭 전용 — 30/90/180일 도달확률을 밝은 배경의 카드 3개로
+    나란히 보여주는 디자인. (재미 요소 — 투자 조언 아님)
 
     ⚠️ 다른 탭(관심종목·전략계산)에서 쓰는 _format_hit_probability_badge와는 별개다
     (그쪽은 여러 종목이 한 화면에 쭉 나열되는 목록형이라 지금처럼 큰 카드를 쓰면
     화면이 너무 길어진다 — 이 탭은 종목 하나만 크게 보여주는 상세 페이지라서
     카드를 키워도 괜찮다).
 
-    🎨 [2026-08-18 디자인 변경] 기존 세로 막대바 3줄 대신, 기간별로 큰 숫자를
-    강조한 다크 카드 3개를 가로로 배치. 60% 이상 구간은 은은한 펄스 애니메이션
-    (@keyframes)으로 시선을 끈다 — 애니메이션은 카드마다 고유한 이름(wl-pulse-{h})을
-    써서, 같은 페이지에 여러 종목 카드가 동시에 떠도 keyframes 이름이 충돌하지 않는다.
+    🎨 [2026-08-19 디자인 변경] 진한 다크 그라디언트 카드는 색이 너무 강하다는
+    피드백을 받아, 흰 배경 카드 + 셋 중 확률이 가장 높은 구간만 컬러 테두리·
+    컬러 텍스트로 강조하고 나머지 둘은 무채색(회색)으로 눌러주는 방식으로 바꿨다
+    (참고 이미지: 매수 타점 카드에서 1차 진입만 보라색으로 강조하고 2·3차는 회색인
+    패턴과 동일한 아이디어). 강조 대상은 셋 중 가장 확률이 높은 기간(best_h) —
+    "이 종목은 어느 기간을 노리는 게 그나마 승산이 높은지"를 한눈에 보여준다.
 
-    ⚠️ [버그 수정 이력] 이전 버전은 f-string을 여러 줄로 들여써서 만들었는데, 그
-    결과 각 줄 앞에 공백 8~10칸이 섞여 들어갔다. st.markdown이 쓰는 마크다운
-    파서는 줄 앞 공백 4칸 이상을 "코드 블록"으로 해석해서, HTML이 렌더링되지
-    않고 태그가 그대로 화면에 텍스트로 찍혔다. 모든 조각을 줄바꿈/들여쓰기
-    없이 이어붙이는 방식을 그대로 유지한다.
+    ⚠️ [버그 수정 이력] f-string은 반드시 줄 앞 들여쓰기 없이 이어붙인다.
+    st.markdown의 마크다운 파서가 줄 앞 공백 4칸 이상을 "코드 블록"으로 해석해서
+    HTML이 렌더링되지 않고 태그가 그대로 텍스트로 찍히는 문제가 있었기 때문.
     """
     if not result or not target_price or target_price <= 0:
         return ""
     probs = result["probs"]
-    horizon_labels = {30: "30일", 90: "90일", 180: "180일"}
+    horizon_labels = {30: "30일 후", 90: "90일 후", 180: "180일 후"}
+    horizons = (30, 90, 180)
+    best_h = max(horizons, key=lambda h: probs.get(h, 0))
 
     cards_html = ""
-    for h in (30, 90, 180):
+    for h in horizons:
         pct = probs.get(h, 0)
         color, emoji, label = _probability_tier(pct)
-        pulse_style = f"animation: wl-pulse-{h} 1.6s ease-in-out infinite;" if pct >= 60 else ""
-        keyframe = (
-            f"@keyframes wl-pulse-{h} {{0%,100%{{transform:scale(1);}} 50%{{transform:scale(1.04);}}}}"
-            if pct >= 60 else ""
-        )
+        is_best = (h == best_h)
+        border = f"1.5px solid {color}" if is_best else "1px solid #E2E8F0"
+        bg = f"{color}0D" if is_best else "#FFFFFF"
+        label_color = color if is_best else "#94A3B8"
+        value_color = color if is_best else "#0F172A"
+        sub_color = color if is_best else "#94A3B8"
         cards_html += (
-            f'<style>{keyframe}</style>'
-            f'<div style="flex:1; text-align:center; padding:14px 8px; background:#0F172A; '
-            f'border-radius:12px; {pulse_style}">'
-            f'<div style="font-size:11px; color:#94A3B8; font-weight:700; letter-spacing:0.5px; '
-            f'margin-bottom:6px;">{horizon_labels[h]} 후</div>'
-            f'<div style="font-size:34px; font-weight:900; color:{color}; line-height:1;">'
-            f'{pct:.0f}<span style="font-size:16px;">%</span></div>'
-            f'<div style="font-size:12px; color:{color}; font-weight:700; margin-top:6px;">{emoji} {label}</div>'
+            f'<div style="flex:1; text-align:center; padding:16px 10px; background:{bg}; '
+            f'border:{border}; border-radius:12px;">'
+            f'<div style="font-size:11.5px; color:{label_color}; font-weight:700; margin-bottom:6px;">'
+            f'{horizon_labels[h]}</div>'
+            f'<div style="font-size:24px; font-weight:800; color:{value_color};">{pct:.0f}%</div>'
+            f'<div style="font-size:11px; color:{sub_color}; margin-top:6px; font-weight:600;">{emoji} {label}</div>'
             '</div>'
         )
 
     return (
-        '<div style="margin-top:8px; padding:16px 18px; background:linear-gradient(135deg,#1E1B4B,#312E81); '
-        'border-radius:14px;">'
-        f'<div style="font-size:13px; color:#C7D2FE; font-weight:700; margin-bottom:12px;">'
+        '<div style="margin-top:8px; padding:14px 16px; background:#F8FAFC; '
+        'border:1px solid #E2E8F0; border-radius:14px;">'
+        f'<div style="font-size:12.5px; color:#64748B; font-weight:700; margin-bottom:10px;">'
         f'🎲 {target_price:,.0f}원({target_src}) 도달 확률 · 종가 기준 통계 추정</div>'
         f'<div style="display:flex; gap:10px;">{cards_html}</div>'
         '</div>'
@@ -9356,16 +9357,23 @@ def render_ai_probability():
     st.markdown("<hr style='margin: 10px 0 25px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
 
     # ── 종목 검색 (기업 재무 분석 탭과 동일 패턴) ──────────────────────────
-    col1, col2, col3 = st.columns([1.6, 1, 3.4])
-    with col1:
-        query = st.text_input(
-            "종목코드 또는 종목명 입력",
-            placeholder="예: 005930, 삼성전자",
-            label_visibility="collapsed",
-            key="aiprob_query_input"
-        )
-    with col2:
-        search_btn = st.button("🔍 조회", use_container_width=True, key="aiprob_search_btn")
+    # 🔧 [엔터 검색 지원 — 2026-08-19] 예전에는 st.text_input + st.button을 그냥
+    # 나란히 뒀는데, 이 조합은 Streamlit이 "버튼 클릭"만 제출로 인식해서 검색창에
+    # 값을 입력하고 Enter를 쳐도 아무 반응이 없었다(포커스만 벗어날 뿐 재실행은
+    # 되지만 search_btn은 여전히 False). st.form으로 감싸면 그 안의 텍스트 입력에서
+    # Enter를 눌러도 폼 전체가 제출된 것으로 처리되어(=form_submit_button을 누른 것과
+    # 동일하게 취급), 버튼을 직접 클릭하지 않아도 검색이 실행된다.
+    with st.form("aiprob_search_form", clear_on_submit=False, border=False):
+        col1, col2, col3 = st.columns([1.6, 1, 3.4])
+        with col1:
+            query = st.text_input(
+                "종목코드 또는 종목명 입력",
+                placeholder="예: 005930, 삼성전자",
+                label_visibility="collapsed",
+                key="aiprob_query_input"
+            )
+        with col2:
+            search_btn = st.form_submit_button("🔍 조회", use_container_width=True)
 
     if search_btn and query:
         resolved_code, resolved_name, candidates = resolve_stock_query(query)
@@ -9504,16 +9512,20 @@ def render_fnguide():
     )
     st.markdown("<hr style='margin: 10px 0 25px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
 
-    col1, col2, col3 = st.columns([1.6, 1, 3.4])
-    with col1:
-        query = st.text_input(
-            "종목코드 또는 종목명 입력",
-            placeholder="예: 005930, 삼성전자",
-            label_visibility="collapsed",
-            key="fnguide_query_input"
-        )
-    with col2:
-        search_btn = st.button("🔍 조회", use_container_width=True)
+    # 🔧 [엔터 검색 지원 — 2026-08-19] st.form으로 감싸면 안의 텍스트 입력에서
+    # Enter를 눌러도 폼 제출(=버튼 클릭과 동일)로 처리된다. 자세한 이유는
+    # render_ai_probability()의 동일 패턴 주석 참고.
+    with st.form("fnguide_search_form", clear_on_submit=False, border=False):
+        col1, col2, col3 = st.columns([1.6, 1, 3.4])
+        with col1:
+            query = st.text_input(
+                "종목코드 또는 종목명 입력",
+                placeholder="예: 005930, 삼성전자",
+                label_visibility="collapsed",
+                key="fnguide_query_input"
+            )
+        with col2:
+            search_btn = st.form_submit_button("🔍 조회", use_container_width=True)
 
     if search_btn and query:
         resolved_code, resolved_name, candidates = resolve_stock_query(query)
