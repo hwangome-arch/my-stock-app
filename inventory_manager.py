@@ -9517,13 +9517,21 @@ def render_fnguide():
                 )
             with _ct2:
                 st.markdown("<div style='padding-top:28px;'>", unsafe_allow_html=True)
-                # 엔터/포커스아웃 없이도 입력값을 바로 반영하고 싶은 경우를 위한 버튼.
-                # on_change와 하는 일은 같다(둘 다 같은 포맷 함수를 호출) — 엔터 치기
-                # 애매한 상황(모바일 등)을 위한 명시적인 트리거일 뿐이다.
-                _custom_tgt_btn = st.button("확인", key=f"fnguide_custom_target_btn_{code}", use_container_width=True)
+                # ⚠️ [버그 수정: StreamlitAPIException] on_change처럼 위젯 생성 "이전"에
+                # 실행되는 콜백이 아니라, 버튼 클릭 후 본문 코드에서 `_fmt_custom_target()`을
+                # 직접 호출했더니 — 이미 위쪽에서 text_input(key=_custom_tgt_key)이 그 rerun에
+                # 그려진 뒤라서 "위젯 생성 후에는 같은 키의 session_state를 직접 수정할 수
+                # 없다"는 Streamlit 규칙에 걸려 예외가 났다(엔터=on_change는 위젯 재생성
+                # 전에 실행되어 허용되지만, 버튼 클릭 후 본문에서의 수동 호출은 허용되지
+                # 않음). on_click도 on_change와 동일하게 "위젯 재생성 전" 단계에서 실행되므로,
+                # 버튼에 on_click으로 넘겨 같은 방식으로 처리하도록 수정.
+                st.button(
+                    "확인",
+                    key=f"fnguide_custom_target_btn_{code}",
+                    use_container_width=True,
+                    on_click=_fmt_custom_target,
+                )
                 st.markdown("</div>", unsafe_allow_html=True)
-                if _custom_tgt_btn:
-                    _fmt_custom_target()
             with _ct3:
                 st.markdown(
                     "<div style='padding-top:28px; font-size:11px; color:#94A3B8;'>"
