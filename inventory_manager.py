@@ -3686,6 +3686,54 @@ def _format_hit_probability_badge(result, target_price, target_src="목표가"):
         f"</div>"
     )
 
+def _probability_tier(pct):
+    """확률 구간별로 색상·이모지·감성 라벨을 매핑. (재미 요소 — 투자 조언 아님)"""
+    if pct >= 60:
+        return "#DC2626", "🔥", "꽤 유력해요"
+    elif pct >= 35:
+        return "#D97706", "⚡", "해볼 만해요"
+    elif pct >= 15:
+        return "#2563EB", "🤔", "쉽지 않아요"
+    else:
+        return "#64748B", "🥶", "희박해요"
+
+def _format_probability_fun_card(result, target_price, target_src="목표가"):
+    """AI 확률분석 탭 전용 — 게이지 바 + 감성 라벨을 넣은 좀 더 눈에 띄는 카드.
+    ⚠️ 다른 탭(관심종목·전략계산)에서 쓰는 _format_hit_probability_badge와는 별개다
+    (그쪽은 여러 종목이 한 화면에 쭉 나열되는 목록형이라 지금처럼 큰 카드를 쓰면
+    화면이 너무 길어진다 — 이 탭은 종목 하나만 크게 보여주는 상세 페이지라서
+    카드를 키워도 괜찮다)."""
+    if not result or not target_price or target_price <= 0:
+        return ""
+    probs = result["probs"]
+    horizon_labels = {30: "30일 후", 90: "90일 후", 180: "180일 후"}
+
+    rows_html = ""
+    for h in (30, 90, 180):
+        pct = probs.get(h, 0)
+        color, emoji, label = _probability_tier(pct)
+        rows_html += f"""
+        <div style='margin-bottom:16px;'>
+          <div style='display:flex; justify-content:space-between; align-items:baseline; margin-bottom:5px;'>
+            <span style='font-size:13px; color:#475569; font-weight:600;'>{horizon_labels[h]}</span>
+            <span style='font-size:24px; font-weight:800; color:{color};'>{pct:.0f}%</span>
+          </div>
+          <div style='background:#F1F5F9; border-radius:8px; height:14px; overflow:hidden;'>
+            <div style='width:{pct}%; height:100%; background:linear-gradient(90deg, {color}99, {color}); border-radius:8px;'></div>
+          </div>
+          <div style='font-size:11px; color:{color}; margin-top:4px; font-weight:700;'>{emoji} {label}</div>
+        </div>
+        """
+
+    return (
+        f"<div style='margin-top:8px; padding:16px 18px; background:linear-gradient(135deg,#F5F3FF,#FDF4FF); "
+        f"border:1px solid #DDD6FE; border-radius:14px;'>"
+        f"<div style='font-size:13px; color:#6D28D9; font-weight:700; margin-bottom:14px;'>"
+        f"🎲 {target_price:,.0f}원({target_src}) 도달 확률 · 종가 기준 통계 추정</div>"
+        f"{rows_html}"
+        f"</div>"
+    )
+
 def render_hit_probability_badge(stock_code, market_hint, target_price, target_src="목표가"):
     """estimate_target_hit_probability 결과를 카드용 인라인 HTML 배지로 렌더링.
     ⚠️ 이 함수는 그 자리에서 바로 네트워크 호출(call_with_timeout)을 하므로, 여러 종목을
@@ -9206,8 +9254,6 @@ def render_ai_probability():
         elif resolved_code:
             st.session_state['aiprob_code'] = resolved_code
             st.session_state.pop('aiprob_candidates', None)
-            # 종목이 바뀌면 이전 목표가 입력은 새로 잡아야 하므로 초기화
-            st.session_state.pop('aiprob_target_input', None)
         else:
             st.session_state.pop('aiprob_candidates', None)
             st.session_state['aiprob_not_found'] = query
@@ -9229,7 +9275,6 @@ def render_ai_probability():
                 picked_idx = options.index(picked)
                 st.session_state['aiprob_code'] = candidates[picked_idx]['code']
                 st.session_state.pop('aiprob_candidates', None)
-                st.session_state.pop('aiprob_target_input', None)
                 st.rerun()
 
     if st.session_state.get('aiprob_not_found'):
@@ -9281,7 +9326,9 @@ def render_ai_probability():
     with col_b:
         st.markdown(f"<div style='padding-top:10px; color:#64748B; font-size:13px;'>현재가 {int(current_price):,}원 기준</div>", unsafe_allow_html=True)
 
-    with st.expander("점수 구성 항목 펼쳐보기 (8개 항목 배점)"):
+    with st.expander("점수 구성 항목 펼쳐보기 (8개 항목 배점)", expanded=True):
+        # 항목별로 간단한 막대 그래프(st.progress)로 표시. 리스크는 감점 항목이라
+        # (0 ~ -80) 방향이 반대라서, "감점을 얼마나 썼는지" 비율로 따로 계산한다.
         _score_rows = [
             ("추세", scores["trend"], scores["trend_max"]),
             ("수급", scores["flow"], scores["flow_max"]),
@@ -9290,10 +9337,16 @@ def render_ai_probability():
             ("밸류", scores["valuation"], scores["valuation_max"]),
             ("모멘텀", scores["momentum"], scores["momentum_max"]),
             ("AI패턴", scores["pattern"], scores["pattern_max"]),
-            ("리스크", scores["risk"], scores["risk_min"]),
         ]
         for _label, _val, _max in _score_rows:
-            st.markdown(f"- **{_label}**: {_val:.0f} / {_max}")
+            _ratio = max(0.0, min(1.0, _val / _max)) if _max else 0.0
+            _emoji = "🟢" if _ratio >= 0.7 else ("🟡" if _ratio >= 0.4 else "🔴")
+            st.progress(_ratio, text=f"{_emoji} {_label}  {_val:.0f} / {_max:.0f}")
+
+        _risk_val, _risk_min = scores["risk"], scores["risk_min"]
+        _risk_ratio = max(0.0, min(1.0, _risk_val / _risk_min)) if _risk_min else 0.0
+        _risk_emoji = "🟢" if _risk_ratio <= 0.3 else ("🟡" if _risk_ratio <= 0.6 else "🔴")
+        st.progress(_risk_ratio, text=f"{_risk_emoji} 리스크 감점  {_risk_val:.0f} / {_risk_min:.0f}")
 
     st.markdown("<hr style='margin:20px 0 16px 0; border-color:#E5E7EB;'>", unsafe_allow_html=True)
 
@@ -9307,10 +9360,15 @@ def render_ai_probability():
     )
 
     default_target, target_src = estimate_simple_target_price(current_price)
+    # 🐛 [버그 수정] key가 고정값(aiprob_target_input_field)이면, 종목을 바꿔도
+    # Streamlit이 이전 위젯 상태를 그대로 재사용해서 목표가 입력란이 이전
+    # 종목 값 그대로 남아있었다. key에 종목코드를 포함시키면 종목이 바뀔 때
+    # 자동으로 새 위젯(=새 기본값)으로 취급되어 매번 그 종목에 맞는 기본
+    # 목표가로 리셋된다.
     target_input = st.text_input(
         "목표가 직접 입력 (원)",
-        value=st.session_state.get('aiprob_target_input', f"{default_target:,.0f}"),
-        key="aiprob_target_input_field",
+        value=f"{default_target:,.0f}",
+        key=f"aiprob_target_input_{code}",
         placeholder="예: 300,000"
     )
     try:
@@ -9320,7 +9378,7 @@ def render_ai_probability():
 
     if target_price and target_price > 0:
         result = estimate_target_hit_probability(code, None, target_price)
-        badge_html = _format_hit_probability_badge(result, target_price, target_src="목표가")
+        badge_html = _format_probability_fun_card(result, target_price, target_src="목표가")
         if badge_html:
             st.markdown(badge_html, unsafe_allow_html=True)
         else:
