@@ -5957,6 +5957,7 @@ def _main_impl():
         ]),
         ("DEEP ANALYSIS", [
             ("기업 재무 분석", ":material/bar_chart:"),
+            ("AI 확률분석", ":material/percent:"),
             ("실시간 배당 순위", ":material/payments:"),
         ]),
         ("MY PAGE", [
@@ -6089,6 +6090,7 @@ def _main_impl():
     elif selected == "추천 종목":        render_recommendations()
     elif selected == "종목 스크리너":    render_screener()
     elif selected == "기업 재무 분석":   render_fnguide()
+    elif selected == "AI 확률분석":      render_ai_probability()
     elif selected == "실시간 배당 순위": render_dividend()
     elif selected == "관심종목":         render_watchlist()
     elif selected == "비밀번호 변경":     render_change_password()
@@ -9148,6 +9150,185 @@ def resolve_stock_query(query):
         return None, None, live_candidates
 
     return None, None, []
+
+def render_ai_probability():
+    """[신규 탭 뼈대 — 2026-08-18] "AI 확률분석"
+
+    목표: 특정 목표가에 도달할 확률을 "딥하게" 보여주는 탭. 기존에 흩어져 있던
+    두 엔진을 재사용해서 나란히 보여주는 걸 1단계로 잡았다:
+
+      1) calc_ai_scores_detailed — 이미 있는 0~1000점 AI 종합점수 엔진.
+         PER/PBR/ROE/부채비율/52주 고점대비 낙폭/배당/거래량/수급/추세/모멘텀/
+         패턴을 전부 반영한다. (기업 재무 분석 탭에서 쓰는 것과 동일 엔진)
+      2) estimate_target_hit_probability — 이미 있는 변동성 기반 몬테카를로
+         확률(재무와 무관, 순수 통계).
+
+    ⚠️ [의도적 미구현 — 다음 단계 TODO] 지금은 이 두 숫자를 "나란히" 보여줄
+    뿐, 하나로 합치지 않는다. AI 종합점수가 높다고 그 방향(상승)에 가중치를
+    주는 건 매력적이지만, 근거 없이 임의로 섞으면 "정교해 보이는데 실제로는
+    감으로 만든 숫자"가 된다(사용자와 상의한 내용). 나중에 실제로 합치려면:
+      - AI 점수 → 드리프트(방향성) 보정치로 변환하는 공식에 대한 근거가 있어야
+        하고 (예: 점수 구간별로 과거 N개월 후 실제 수익률 분포를 집계해서
+        캘리브레이션)
+      - 그 보정이 실제로 맞았는지 백테스트로 검증하는 절차가 필요하다.
+    이 두 가지가 준비되기 전까지는 "각자 다른 근거로 계산된 두 참고 지표"로
+    분리해서 보여주는 게 사용자를 오도하지 않는 방법이다.
+    """
+    st.header(
+        "AI 확률분석",
+        help="""💡 **[AI 확률분석 안내]**\n\n특정 목표가에 도달할 가능성을 두 가지 서로 다른 방식으로 참고할 수 있게 보여줍니다.\n\n1) AI 종합점수 (0~1000점) — PER·PBR·ROE·부채비율·거래량·수급·추세·모멘텀 등 펀더멘털/기술적 지표를 종합한 점수\n2) 통계적 도달확률 — 최근 1년 변동성을 이용한 몬테카를로 시뮬레이션 (재무 내용과는 무관한 순수 통계치)\n\n⚠️ 두 지표는 아직 하나로 합쳐지지 않은 별도의 참고 정보이며, 투자 조언이나 수익을 보장하지 않습니다."""
+    )
+    st.markdown(
+        "<p style='font-size:12px; color:#94A3B8; margin-top:-8px;'>"
+        "🎲 통계적 도달확률은 재무제표·실적을 반영하지 않은, 순수 변동성 기반 참고치입니다. "
+        "투자 판단은 본인 책임하에 신중히 결정해주세요.</p>",
+        unsafe_allow_html=True
+    )
+    st.markdown("<hr style='margin: 10px 0 25px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
+
+    # ── 종목 검색 (기업 재무 분석 탭과 동일 패턴) ──────────────────────────
+    col1, col2, col3 = st.columns([1.6, 1, 3.4])
+    with col1:
+        query = st.text_input(
+            "종목코드 또는 종목명 입력",
+            placeholder="예: 005930, 삼성전자",
+            label_visibility="collapsed",
+            key="aiprob_query_input"
+        )
+    with col2:
+        search_btn = st.button("🔍 조회", use_container_width=True, key="aiprob_search_btn")
+
+    if search_btn and query:
+        resolved_code, resolved_name, candidates = resolve_stock_query(query)
+        st.session_state.pop('aiprob_not_found', None)
+        if candidates:
+            st.session_state['aiprob_candidates'] = candidates
+        elif resolved_code:
+            st.session_state['aiprob_code'] = resolved_code
+            st.session_state.pop('aiprob_candidates', None)
+            # 종목이 바뀌면 이전 목표가 입력은 새로 잡아야 하므로 초기화
+            st.session_state.pop('aiprob_target_input', None)
+        else:
+            st.session_state.pop('aiprob_candidates', None)
+            st.session_state['aiprob_not_found'] = query
+
+    if st.session_state.get('aiprob_candidates'):
+        candidates = st.session_state['aiprob_candidates']
+        options = [f"{c['name']} ({c['code']}) · {c['market']}" for c in candidates]
+        col_pick, col_pick_btn, _ = st.columns([2.6, 1, 3.4])
+        with col_pick:
+            picked = st.selectbox(
+                "검색 결과가 여러 건입니다. 종목을 선택해주세요.",
+                options,
+                label_visibility="visible",
+                key="aiprob_pick_select"
+            )
+        with col_pick_btn:
+            st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
+            if st.button("이 종목 조회", use_container_width=True, key="aiprob_pick_confirm"):
+                picked_idx = options.index(picked)
+                st.session_state['aiprob_code'] = candidates[picked_idx]['code']
+                st.session_state.pop('aiprob_candidates', None)
+                st.session_state.pop('aiprob_target_input', None)
+                st.rerun()
+
+    if st.session_state.get('aiprob_not_found'):
+        st.warning(f"'{st.session_state['aiprob_not_found']}'에 해당하는 종목을 찾을 수 없습니다. 정확한 종목명 또는 6자리 종목코드로 다시 검색해주세요.")
+
+    active_code = st.session_state.get('aiprob_code', '')
+    if not active_code:
+        return
+
+    code = active_code
+    cache_key = f'aiprob_result_{code}'
+
+    if search_btn or cache_key not in st.session_state:
+        def _do_aiprob_fetch():
+            _price_info = fetch_current_price_info(code)
+            _df_annual, _, _ = fetch_financial_data(code)
+            _per_ai, _pbr_ai, _roe_ai, _debt_ai, _drop_pct_ai, _div_ai = get_ai_diagnosis_inputs(code, _df_annual)
+            _scores = calc_ai_scores_detailed(code, _per_ai, _pbr_ai, _roe_ai, _debt_ai, _drop_pct_ai, _div_ai, df_annual=_df_annual)
+            return {"price_info": _price_info, "scores": _scores}
+
+        with st.spinner("AI 종합점수를 계산하는 중입니다..."):
+            _result = call_with_timeout(_do_aiprob_fetch, timeout=25)
+
+        if _result is None:
+            st.error("⏱️ 데이터 조회가 너무 오래 걸려 중단했습니다. 잠시 후 다시 시도해주세요.")
+            st.stop()
+
+        st.session_state[cache_key] = _result
+
+    cached = st.session_state[cache_key]
+    price_info = cached['price_info']
+    scores = cached['scores']
+    current_price = price_info.get('price')
+
+    if not current_price:
+        st.warning("현재가를 조회하지 못했습니다. 종목코드를 다시 확인해주세요.")
+        return
+
+    # ── AI 종합점수 요약 ──────────────────────────────────────────────
+    st.markdown("<h4 style='font-size:16px; margin-bottom:4px;'>🤖 AI 종합점수</h4>", unsafe_allow_html=True)
+    total = scores["total"]
+    total_color = _ai_score_color(total)
+    col_a, col_b = st.columns([1, 2.5])
+    with col_a:
+        st.markdown(
+            f"<div style='font-size:32px; font-weight:800; color:{total_color};'>{total}<span style='font-size:14px; color:#94A3B8;'> / 1000</span></div>",
+            unsafe_allow_html=True
+        )
+    with col_b:
+        st.markdown(f"<div style='padding-top:10px; color:#64748B; font-size:13px;'>현재가 {int(current_price):,}원 기준</div>", unsafe_allow_html=True)
+
+    with st.expander("점수 구성 항목 펼쳐보기 (8개 항목 배점)"):
+        _score_rows = [
+            ("추세", scores["trend"], scores["trend_max"]),
+            ("수급", scores["flow"], scores["flow_max"]),
+            ("거래량", scores["volume"], scores["volume_max"]),
+            ("재무", scores["financial"], scores["financial_max"]),
+            ("밸류", scores["valuation"], scores["valuation_max"]),
+            ("모멘텀", scores["momentum"], scores["momentum_max"]),
+            ("AI패턴", scores["pattern"], scores["pattern_max"]),
+            ("리스크", scores["risk"], scores["risk_min"]),
+        ]
+        for _label, _val, _max in _score_rows:
+            st.markdown(f"- **{_label}**: {_val:.0f} / {_max}")
+
+    st.markdown("<hr style='margin:20px 0 16px 0; border-color:#E5E7EB;'>", unsafe_allow_html=True)
+
+    # ── 목표가 도달 확률 (통계 기반) ──────────────────────────────────
+    st.markdown("<h4 style='font-size:16px; margin-bottom:4px;'>🎲 목표가 도달 확률 (통계 기반)</h4>", unsafe_allow_html=True)
+    st.markdown(
+        "<p style='font-size:12px; color:#64748B; margin-bottom:12px;'>"
+        "최근 1년 변동성을 이용한 몬테카를로 시뮬레이션입니다. 위 AI 종합점수와는 "
+        "별개로 계산되며, 방향성(상승/하락)을 예단하지 않습니다.</p>",
+        unsafe_allow_html=True
+    )
+
+    default_target, target_src = estimate_simple_target_price(current_price)
+    target_input = st.text_input(
+        "목표가 직접 입력 (원)",
+        value=st.session_state.get('aiprob_target_input', f"{default_target:,.0f}"),
+        key="aiprob_target_input_field",
+        placeholder="예: 300,000"
+    )
+    try:
+        target_price = int(re.sub(r"[^\d]", "", target_input))
+    except Exception:
+        target_price = default_target
+
+    if target_price and target_price > 0:
+        result = estimate_target_hit_probability(code, None, target_price)
+        badge_html = _format_hit_probability_badge(result, target_price, target_src="목표가")
+        if badge_html:
+            st.markdown(badge_html, unsafe_allow_html=True)
+        else:
+            st.info("확률 계산에 필요한 가격 데이터가 부족합니다 (상장 1년 미만 종목 등).")
+
+    # TODO(다음 단계): AI 종합점수를 드리프트 보정치로 반영해 "AI가 종합적으로
+    # 판단한 확률" 하나로 합치기 — 캘리브레이션·백테스트 설계 후 진행.
+
 
 def render_fnguide():
     st.header(
