@@ -3698,45 +3698,57 @@ def _probability_tier(pct):
         return "#64748B", "🥶", "희박해요"
 
 def _format_probability_fun_card(result, target_price, target_src="목표가"):
-    """AI 확률분석 탭 전용 — 게이지 바 + 감성 라벨을 넣은 좀 더 눈에 띄는 카드.
+    """AI 확률분석 탭 전용 — 30/90/180일 도달확률을 큰 숫자의 다크 카드 3개로
+    나란히 보여주는 '임팩트 강화형' 디자인. (재미 요소 — 투자 조언 아님)
+
     ⚠️ 다른 탭(관심종목·전략계산)에서 쓰는 _format_hit_probability_badge와는 별개다
     (그쪽은 여러 종목이 한 화면에 쭉 나열되는 목록형이라 지금처럼 큰 카드를 쓰면
     화면이 너무 길어진다 — 이 탭은 종목 하나만 크게 보여주는 상세 페이지라서
     카드를 키워도 괜찮다).
 
-    ⚠️ [버그 수정] 이전 버전은 f-string을 여러 줄로 들여써서 만들었는데, 그
+    🎨 [2026-08-18 디자인 변경] 기존 세로 막대바 3줄 대신, 기간별로 큰 숫자를
+    강조한 다크 카드 3개를 가로로 배치. 60% 이상 구간은 은은한 펄스 애니메이션
+    (@keyframes)으로 시선을 끈다 — 애니메이션은 카드마다 고유한 이름(wl-pulse-{h})을
+    써서, 같은 페이지에 여러 종목 카드가 동시에 떠도 keyframes 이름이 충돌하지 않는다.
+
+    ⚠️ [버그 수정 이력] 이전 버전은 f-string을 여러 줄로 들여써서 만들었는데, 그
     결과 각 줄 앞에 공백 8~10칸이 섞여 들어갔다. st.markdown이 쓰는 마크다운
     파서는 줄 앞 공백 4칸 이상을 "코드 블록"으로 해석해서, HTML이 렌더링되지
     않고 태그가 그대로 화면에 텍스트로 찍혔다. 모든 조각을 줄바꿈/들여쓰기
-    없이 이어붙이는 방식으로 고쳤다."""
+    없이 이어붙이는 방식을 그대로 유지한다.
+    """
     if not result or not target_price or target_price <= 0:
         return ""
     probs = result["probs"]
-    horizon_labels = {30: "30일 후", 90: "90일 후", 180: "180일 후"}
+    horizon_labels = {30: "30일", 90: "90일", 180: "180일"}
 
-    rows_html = ""
+    cards_html = ""
     for h in (30, 90, 180):
         pct = probs.get(h, 0)
         color, emoji, label = _probability_tier(pct)
-        rows_html += (
-            '<div style="margin-bottom:16px;">'
-            '<div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:5px;">'
-            f'<span style="font-size:13px; color:#475569; font-weight:600;">{horizon_labels[h]}</span>'
-            f'<span style="font-size:24px; font-weight:800; color:{color};">{pct:.0f}%</span>'
-            '</div>'
-            '<div style="background:#F1F5F9; border-radius:8px; height:14px; overflow:hidden;">'
-            f'<div style="width:{pct}%; height:100%; background:linear-gradient(90deg, {color}99, {color}); border-radius:8px;"></div>'
-            '</div>'
-            f'<div style="font-size:11px; color:{color}; margin-top:4px; font-weight:700;">{emoji} {label}</div>'
+        pulse_style = f"animation: wl-pulse-{h} 1.6s ease-in-out infinite;" if pct >= 60 else ""
+        keyframe = (
+            f"@keyframes wl-pulse-{h} {{0%,100%{{transform:scale(1);}} 50%{{transform:scale(1.04);}}}}"
+            if pct >= 60 else ""
+        )
+        cards_html += (
+            f'<style>{keyframe}</style>'
+            f'<div style="flex:1; text-align:center; padding:14px 8px; background:#0F172A; '
+            f'border-radius:12px; {pulse_style}">'
+            f'<div style="font-size:11px; color:#94A3B8; font-weight:700; letter-spacing:0.5px; '
+            f'margin-bottom:6px;">{horizon_labels[h]} 후</div>'
+            f'<div style="font-size:34px; font-weight:900; color:{color}; line-height:1;">'
+            f'{pct:.0f}<span style="font-size:16px;">%</span></div>'
+            f'<div style="font-size:12px; color:{color}; font-weight:700; margin-top:6px;">{emoji} {label}</div>'
             '</div>'
         )
 
     return (
-        '<div style="margin-top:8px; padding:16px 18px; background:linear-gradient(135deg,#F5F3FF,#FDF4FF); '
-        'border:1px solid #DDD6FE; border-radius:14px;">'
-        f'<div style="font-size:13px; color:#6D28D9; font-weight:700; margin-bottom:14px;">'
+        '<div style="margin-top:8px; padding:16px 18px; background:linear-gradient(135deg,#1E1B4B,#312E81); '
+        'border-radius:14px;">'
+        f'<div style="font-size:13px; color:#C7D2FE; font-weight:700; margin-bottom:12px;">'
         f'🎲 {target_price:,.0f}원({target_src}) 도달 확률 · 종가 기준 통계 추정</div>'
-        f'{rows_html}'
+        f'<div style="display:flex; gap:10px;">{cards_html}</div>'
         '</div>'
     )
 
