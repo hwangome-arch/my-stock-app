@@ -3355,7 +3355,16 @@ def _unified_scan_worker(job_id):
         state["warning"] = "현재 시장 데이터 기준, 최소 요건(D급)을 통과한 종목조차 없습니다. 추천 종목 후보 산출은 건너뜁니다."
         return
 
-    val_df = val_df.sort_values('ROE', ascending=False).head(150)
+    # ⚠️ [후보 확대: 150 → 300] ROE 상위 150개까지만 후보로 넘기다 보니, 1단계
+    # 재무 조건(PER≤40, PBR≤4.0, ROE≥0, 부채비율≤300)은 통과했는데도 ROE 순위가
+    # 151~300위 사이라는 이유만으로 삼성전자 같은 대형 우량주가 통째로 걸러지는
+    # 경우가 있었다. 300개로 넓혀서 이런 종목들도 2단계(52주 고점 매칭) 이후
+    # 추천 종목 탭에서 AI 점수로 다시 경쟁할 기회를 준다.
+    # ⚠️ 트레이드오프: 2단계에서 네이버 API로 개별 조회해야 하는 종목 수가 2배로
+    # 늘어나는데, 전체 시간 예산(25초, concurrent.futures.as_completed의 timeout)은
+    # 그대로라서 스캔이 몰리는 시간대엔 일부 종목이 이번 스캔에서 타임아웃으로
+    # 누락될 수 있다(다음 스캔에서 다시 시도되면 잡힘).
+    val_df = val_df.sort_values('ROE', ascending=False).head(300)
     rows = []
     dict_records = val_df.to_dict('records')
     total = len(dict_records)
