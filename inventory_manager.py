@@ -8618,7 +8618,17 @@ def render_recommendations():
                 display_df = display_df.sort_values('_ai_score_sort', ascending=False).drop(columns=['_ai_score_sort']).reset_index(drop=True)
             else:
                 display_df = display_df.sort_values('고점 / 하락률', ascending=True).reset_index(drop=True)
-            PAGE_SIZE = 15
+            # ── [페이지네이션 제거: 한 번에 전체 표시] ────────────────────────
+            # 기존에는 "결과 보기"를 누른 뒤에도 PAGE_SIZE(15)개씩 "더 보기"를 눌러야
+            # 다음 종목들이 나오는 구조였다. 그런데 이 시점(정렬 이후)에는 AI 점수
+            # 계산·거래대금 필터·정렬이 이미 다 끝난 상태라, "더 보기"를 눌러도 추가
+            # 계산이나 조회가 발생하는 게 아니라 이미 준비된 데이터를 몇 개 더 그릴지
+            # 결정만 할 뿐이었다. 그런데도 매번 st.rerun()이 발생해 화면이 깜빡였고,
+            # 이미 내림차순(AI 점수) 정렬이 되어 있어 사용자 입장에서는 상위 종목이
+            # 잘려 보이다 말다 하는 것도 어색했다. "결과 보기" 클릭 게이트(최초
+            # 렌더링 부하 방지)는 그대로 유지하되, 클릭한 뒤에는 더 보기 없이 전체를
+            # 한 번에 그린다.
+            PAGE_SIZE = None
             total_n = len(display_df)
             # ⚠️ total_n을 시그니처에 넣지 않는다 — AI 등급 필터가 점진적으로 채워지는
             # 동안(백그라운드 계산이 끝날 때마다) total_n이 계속 바뀌는데, 그때마다
@@ -8629,7 +8639,6 @@ def render_recommendations():
             if st.session_state.get('_reco_filter_sig') != _reco_filter_sig:
                 st.session_state['_reco_filter_sig'] = _reco_filter_sig
                 st.session_state['_reco_shown'] = False
-                st.session_state['_reco_page_count'] = 1
 
             if not st.session_state.get('_reco_shown', False):
                 # [클릭 게이트] 탭 진입/필터 변경 즉시 종목 카드를 전부 그리면(많을 때는
@@ -8643,11 +8652,11 @@ def render_recommendations():
                     st.session_state['_reco_shown'] = False
                     st.rerun()
 
-                # [페이지네이션] 결과 보기를 눌렀어도 한 번에 다 쏟아내지 않고
-                # PAGE_SIZE(15)개씩 나눠서 그린다 — 조건에 맞는 종목이 많을 때의
-                # 렌더링 부하를 완화한다.
-                page_count = st.session_state.get('_reco_page_count', 1)
-                n_show = min(page_count * PAGE_SIZE, total_n)
+                # [전체 표시] 결과 보기를 누르면 페이지 단위로 끊지 않고 전체(total_n)를
+                # 한 번에 그린다. 위에서 이미 정렬(AI 점수 구간 선택 시 점수 내림차순,
+                # 전체보기 시 하락률 오름차순)이 끝난 상태라, 상위 종목부터 순서대로
+                # 그대로 다 보여주면 된다.
+                n_show = total_n
                 page_df = display_df.iloc[:n_show]
 
                 # ⚠️ [되돌림 — 2026-08-12] "AI 필터가 꺼져있어도 화면에 보이는
@@ -8786,10 +8795,8 @@ def render_recommendations():
                             draw_fnguide_details(code)
 
 
-                if n_show < total_n:
-                    if st.button(f"➕ 더 보기 ({n_show}/{total_n}건 표시 중)", use_container_width=True, key="reco_more_btn"):
-                        st.session_state['_reco_page_count'] = page_count + 1
-                        st.rerun()
+                # ⚠️ "더 보기" 버튼 제거됨 — 위에서 이미 n_show = total_n으로 전체를
+                # 한 번에 그리므로 더 불러올 필요가 없다.
 
 SCREENER_PRESETS = {
     "1단계 · 배당형 저평가": {
