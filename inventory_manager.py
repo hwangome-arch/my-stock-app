@@ -14,6 +14,7 @@ import html as html_lib
 import hashlib
 import hmac
 import base64
+import secrets
 import difflib
 import numpy as np
 import faulthandler
@@ -2924,28 +2925,39 @@ def fetch_screener_data_generator():
         yield f"⚠️ {len(failed_pages)}개 페이지 재시도 중... ({retry_round + 1}/3 라운드, {backoff_seconds[retry_round]}초 대기)", 82 + retry_round * 3
         time.sleep(backoff_seconds[retry_round])
         still_failed = []
-        _retry_processed = set()
         _retry_executor = get_shared_executor()
-        future_to_url = {_retry_executor.submit(fetch_page_data, s, p, headers, cookies): (s, p) for s, p in failed_pages}
-        try:
-            for future in concurrent.futures.as_completed(future_to_url, timeout=18):
-                s, p = future_to_url[future]
-                _retry_processed.add((s, p))
-                try:
-                    df = future.result(timeout=8)
-                except Exception:
-                    df = None
-                if df is not None and not df.empty:
-                    all_data.append(df)
-                else:
-                    still_failed.append((s, p))
-        except concurrent.futures.TimeoutError:
-            for s, p in failed_pages:
-                if (s, p) not in _retry_processed:
-                    still_failed.append((s, p))
-        finally:
-            for f in future_to_url:
-                f.cancel()
+        # ⚠️ [버그 수정 2026-08-18] retry_workers([2,1,1])를 선언만 해두고 실제로는
+        # 안 써서, 재시도 라운드마다 failed_pages 전체를 한꺼번에 다시 던졌었다.
+        # 그러면 "네이버 레이트리밋 때문에 실패한 페이지들"을 재시도할 때 똑같이
+        # 동시에 몰아서 요청하게 되어, 레이트리밋을 다시 유발해 재시도가 재시도를
+        # 반복해서 부르는 상황이 나올 수 있었다. 라운드마다 retry_workers[round]개씩
+        # 청크로 나눠서 순차적으로 처리(청크 안에서만 동시 실행)하도록 고쳤다 —
+        # 라운드가 진행될수록(2→1→1) 동시 요청 수가 점점 줄어드는 게 원래 의도였다.
+        _chunk_size = retry_workers[retry_round]
+        _failed_list = list(failed_pages)
+        for _i in range(0, len(_failed_list), _chunk_size):
+            _chunk = _failed_list[_i:_i + _chunk_size]
+            _retry_processed = set()
+            future_to_url = {_retry_executor.submit(fetch_page_data, s, p, headers, cookies): (s, p) for s, p in _chunk}
+            try:
+                for future in concurrent.futures.as_completed(future_to_url, timeout=18):
+                    s, p = future_to_url[future]
+                    _retry_processed.add((s, p))
+                    try:
+                        df = future.result(timeout=8)
+                    except Exception:
+                        df = None
+                    if df is not None and not df.empty:
+                        all_data.append(df)
+                    else:
+                        still_failed.append((s, p))
+            except concurrent.futures.TimeoutError:
+                for s, p in _chunk:
+                    if (s, p) not in _retry_processed:
+                        still_failed.append((s, p))
+            finally:
+                for f in future_to_url:
+                    f.cancel()
         failed_pages = still_failed
         retry_round += 1
 
@@ -4194,11 +4206,29 @@ def authenticate_user(username, password):
 # ── F5 새로고침에도 로그인이 풀리지 않도록: 서명된 세션 토큰을 URL에 저장 ──
 # (Streamlit은 브라우저를 새로고침하면 session_state가 초기화되므로,
 #  URL의 쿼리파라미터에 위변조 불가능한 토큰을 넣어두고 새로고침 시 이를 검증해 로그인 상태를 복원한다.)
+# ⚠️ [보안 수정 2026-08-18] SESSION_SECRET 미설정 시 하드코딩된 고정 문자열
+# ("insecure-default-please-set-SESSION_SECRET")을 그대로 서명 키로 써왔다.
+# 이 문자열은 소스코드에 그대로 노출돼 있으므로, 배포 시 SESSION_SECRET을
+# 설정하지 않으면 누구나 그 문자열로 make_session_token()과 똑같은 HMAC을
+# 직접 계산해서 임의의 아이디에 대한 로그인 토큰을 위조할 수 있었다(=인증
+# 우회). 해결: 설정이 없으면 앱 프로세스당 한 번만 무작위 시크릿을 생성해
+# st.cache_resource로 캐싱해서 쓴다. 위조는 막히지만, 그 대가로 앱이
+# 재시작될 때마다(예: 배포 재시작) 발급됐던 세션 토큰은 전부 무효화되어
+# 사용자가 다시 로그인해야 한다 — 위조 가능한 상태보다는 훨씬 안전한
+# 트레이드오프라 이렇게 처리한다. 근본 해결은 배포 환경에 SESSION_SECRET을
+# 직접 설정하는 것이며, 이 폴백은 그걸 깜빡했을 때의 안전망일 뿐이다.
+@st.cache_resource(show_spinner=False)
+def _get_process_random_session_secret():
+    return secrets.token_hex(32)
+
 def _get_session_secret():
     try:
         return str(st.secrets["SESSION_SECRET"])
     except Exception:
-        return os.environ.get("SESSION_SECRET", "insecure-default-please-set-SESSION_SECRET")
+        env_secret = os.environ.get("SESSION_SECRET")
+        if env_secret:
+            return env_secret
+        return _get_process_random_session_secret()
 
 def make_session_token(username, ttl_days=7):
     """로그인 성공 시 호출: username과 만료시각을 HMAC으로 서명한 토큰 문자열을 생성."""
