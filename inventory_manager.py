@@ -919,12 +919,12 @@ def fetch_global_market_pulse():
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def generate_ai_market_briefing(headlines, global_snapshot):
-    """국내 헤드라인 + 글로벌 지표를 Claude(Sonnet)에게 넘겨 '오늘의 핫 토픽' 3~5개 +
-    미증시 영향 코멘트를 JSON으로 요약받는다. API 키가 없거나 호출이 실패하면
-    None을 반환하고, 호출부(render_market_pulse)에서 "AI 요약 사용 불가" 안내로
-    대체한다 — 이 탭의 나머지(헤드라인 목록/글로벌 지표)는 AI 없이도 정상 동작해야
-    하므로, 여기서 예외를 던지지 않고 항상 조용히 실패한다."""
-    api_key = get_anthropic_api_key()
+    """국내 헤드라인 + 글로벌 지표를 Google Gemini(Flash, 무료 티어 대상)에게 넘겨
+    '오늘의 핫 토픽' 3~5개 + 미증시 영향 코멘트를 JSON으로 요약받는다. API 키가
+    없거나 호출이 실패하면 None을 반환하고, 호출부(render_market_pulse)에서
+    "AI 요약 사용 불가" 안내로 대체한다 — 이 탭의 나머지(헤드라인 목록/글로벌 지표)는
+    AI 없이도 정상 동작해야 하므로, 여기서 예외를 던지지 않고 항상 조용히 실패한다."""
+    api_key = get_gemini_api_key()
     if not api_key or not headlines:
         return None
 
@@ -945,31 +945,51 @@ def generate_ai_market_briefing(headlines, global_snapshot):
 이 내용을 바탕으로 오늘의 핵심 토픽 3~5개를 뽑아라. 각 토픽마다:
 - topic: 토픽 제목 (10자 내외)
 - summary: 한 줄 요약 (40자 내외, 존댓말 아닌 개조식)
-- impact: 코스피/코스닥에 미칠 영향 방향 한 단어 ("긍정", "부정", "중립" 중 하나)
+- impact: 코스피/코스닥에 미칠 영향 방향 한 단어 ("긍정", "부정", "중립" 중 하나)"""
 
-반드시 아래 JSON 형식으로만 응답하고, 그 외 설명/전문/코드블록 표시는 절대 붙이지 마라:
-{{"topics": [{{"topic": "...", "summary": "...", "impact": "긍정|부정|중립"}}]}}"""
+    # ── Gemini의 responseMimeType/responseSchema로 JSON 형식을 강제한다 ──────────
+    # Anthropic 버전에서는 프롬프트로만 "JSON만 출력해" 라고 요청하고 코드블록(```json)을
+    # 방어적으로 벗겨내는 방식이었는데, Gemini는 생성 설정(generationConfig)에서
+    # 아예 스키마를 강제할 수 있어 더 안정적이다. 그래도 혹시 모를 형식 이탈에
+    # 대비해 파싱은 여전히 try/except로 감싼다.
+    request_body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "OBJECT",
+                "properties": {
+                    "topics": {
+                        "type": "ARRAY",
+                        "items": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "topic": {"type": "STRING"},
+                                "summary": {"type": "STRING"},
+                                "impact": {"type": "STRING", "enum": ["긍정", "부정", "중립"]},
+                            },
+                            "required": ["topic", "summary", "impact"],
+                        },
+                    }
+                },
+                "required": ["topics"],
+            },
+        },
+    }
 
     try:
         res = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-6",
-                "max_tokens": 700,
-                "messages": [{"role": "user", "content": prompt}],
-            },
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}",
+            headers={"content-type": "application/json"},
+            json=request_body,
             timeout=20,
         )
         data = res.json()
-        text = "".join(block.get("text", "") for block in data.get("content", []) if block.get("type") == "text")
-        text = text.strip()
-        # 혹시 모델이 코드블록으로 감싸 응답하는 경우를 대비한 방어적 클린업
-        text = re.sub(r"^```json\s*|^```\s*|```$", "", text.strip(), flags=re.M).strip()
+        candidates = data.get("candidates", [])
+        if not candidates:
+            return None
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text = "".join(p.get("text", "") for p in parts).strip()
         parsed = json.loads(text)
         topics = parsed.get("topics", [])
         return topics if topics else None
@@ -2571,13 +2591,13 @@ def get_dart_api_key():
         return os.environ.get("DART_API_KEY", "")
 
 
-def get_anthropic_api_key():
-    """secrets.toml 또는 환경변수에서 Anthropic API 키를 가져온다.
-    (오늘의 마켓 브리핑 탭의 AI 한줄요약 기능에 사용)"""
+def get_gemini_api_key():
+    """secrets.toml 또는 환경변수에서 Google Gemini API 키를 가져온다.
+    (오늘의 마켓 브리핑 탭의 AI 한줄요약 기능에 사용 — Gemini Flash 무료 티어 대상)"""
     try:
-        return st.secrets["ANTHROPIC_API_KEY"]
+        return st.secrets["GEMINI_API_KEY"]
     except Exception:
-        return os.environ.get("ANTHROPIC_API_KEY", "")
+        return os.environ.get("GEMINI_API_KEY", "")
 
 
 # ── ⚠️ [임시 우회] Streamlit Cloud → opendart.fss.or.kr 직접 연결 차단 우회용 프록시 ──
@@ -10457,8 +10477,8 @@ def render_market_pulse():
 
     # ── AI 핫 토픽 요약 ──────────────────────────────────────────────
     st.subheader("🤖 AI 핫 토픽 요약")
-    if not get_anthropic_api_key():
-        st.info("ℹ️ AI 요약을 사용하려면 `.streamlit/secrets.toml`에 `ANTHROPIC_API_KEY`를 추가해주세요. (헤드라인·글로벌 지표는 아래에서 계속 확인 가능)")
+    if not get_gemini_api_key():
+        st.info("ℹ️ AI 요약을 사용하려면 `.streamlit/secrets.toml`에 `GEMINI_API_KEY`를 추가해주세요. (Google AI Studio에서 무료 발급 가능 · 헤드라인·글로벌 지표는 아래에서 계속 확인 가능)")
     elif not headlines:
         st.warning("⚠️ 국내 뉴스 헤드라인을 불러오지 못해 AI 요약을 생성할 수 없습니다. 네이버 금융 서버 통신이 지연되고 있을 수 있습니다.")
     else:
