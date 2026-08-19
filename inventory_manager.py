@@ -3686,26 +3686,14 @@ def _format_hit_probability_badge(result, target_price, target_src="목표가"):
         f"</div>"
     )
 
-def _probability_tier(pct):
-    """확률 구간별로 색상·이모지·감성 라벨을 매핑. (재미 요소 — 투자 조언 아님)"""
-    if pct >= 60:
-        return "#DC2626", "🔥", "꽤 유력해요"
-    elif pct >= 35:
-        return "#D97706", "⚡", "해볼 만해요"
-    elif pct >= 15:
-        return "#2563EB", "🤔", "쉽지 않아요"
-    else:
-        return "#64748B", "🥶", "희박해요"
-
 # ── [재미 요소] 확률 구간별 "이 정도면 대충 이런 확률" 비유 ──────────────────
 # 몬테카를로로 나온 %가 정수 하나하나 딱 떨어지지도 않고, 1~100 낱개로 다 만들면
-# 코드만 길어지고 관리도 번거로워서 기존 _probability_tier(4단계)와 같은 방식으로
-# 구간(bucket)만 조금 더 세분화(11단계)해서 리스트 하나로 관리한다.
-# 각 구간마다 문구를 여러 개씩 넣어두고 매번 랜덤으로 하나를 골라 보여준다 —
-# 같은 확률대라도 볼 때마다 다른 비유가 나와서 덜 지루하다. (하한, [문구들])
-# 튜플을 확률 내림차순으로 정렬해두고, pct보다 작거나 같은 첫 하한을 찾으면
-# 그게 해당 구간. 투자 조언이 아닌 순수 재미용 문구이므로 실제 통계와 정확히
-# 일치할 필요는 없다 — 어디까지나 "체감"을 돕는 용도.
+# 코드만 길어지고 관리도 번거로워서 구간(bucket)을 11단계로 나눠 리스트 하나로
+# 관리한다. 각 구간마다 문구를 여러 개씩 넣어두고 매번 랜덤으로 하나를 골라
+# 보여준다 — 같은 확률대라도 볼 때마다 다른 비유가 나와서 덜 지루하다.
+# (하한, [문구들]) 튜플을 확률 내림차순으로 정렬해두고, pct보다 작거나 같은
+# 첫 하한을 찾으면 그게 해당 구간. 투자 조언이 아닌 순수 재미용 문구이므로
+# 실제 통계와 정확히 일치할 필요는 없다 — 어디까지나 "체감"을 돕는 용도.
 _PROBABILITY_FUN_COMPARISONS = [
     (85, [
         "😴 침대에 누우면 잠이 올 확률",
@@ -3836,25 +3824,24 @@ def _format_probability_fun_card(result, target_price, target_src="목표가", c
 
     cards_html = ""
     _used_fun_phrases = set()
+    _BEST_ACCENT = "#5A4EE5"  # 강조 색상: 감성 라벨(tier) 없이 브랜드 컬러로 고정
     for h in horizons:
         pct = probs.get(h, 0)
-        color, emoji, label = _probability_tier(pct)
         fun_phrase = _probability_fun_comparison(pct, exclude=_used_fun_phrases)
         _used_fun_phrases.add(fun_phrase)
         is_best = (h == best_h)
-        border = f"1.5px solid {color}" if is_best else "1px solid #E2E8F0"
-        bg = f"{color}0D" if is_best else "#FFFFFF"
-        label_color = color if is_best else "#94A3B8"
-        value_color = color if is_best else "#0F172A"
-        sub_color = color if is_best else "#94A3B8"
+        border = f"1.5px solid {_BEST_ACCENT}" if is_best else "1px solid #E2E8F0"
+        bg = f"{_BEST_ACCENT}0D" if is_best else "#FFFFFF"
+        label_color = _BEST_ACCENT if is_best else "#94A3B8"
+        value_color = _BEST_ACCENT if is_best else "#0F172A"
+        sub_color = _BEST_ACCENT if is_best else "#94A3B8"
         cards_html += (
             f'<div style="flex:1; text-align:center; padding:16px 10px; background:{bg}; '
             f'border:{border}; border-radius:12px;">'
             f'<div style="font-size:11.5px; color:{label_color}; font-weight:700; margin-bottom:6px;">'
             f'{horizon_labels[h]}</div>'
             f'<div style="font-size:24px; font-weight:800; color:{value_color};">{pct:.0f}%</div>'
-            f'<div style="font-size:11px; color:{sub_color}; margin-top:6px; font-weight:600;">{emoji} {label}</div>'
-            f'<div style="font-size:12px; color:#64748B; margin-top:5px; line-height:1.4;">{fun_phrase}</div>'
+            f'<div style="font-size:14px; color:{sub_color}; font-weight:700; margin-top:5px; line-height:1.4;">{fun_phrase}</div>'
             '</div>'
         )
 
