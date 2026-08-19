@@ -3787,12 +3787,19 @@ _PROBABILITY_FUN_COMPARISONS = [
     ]),
 ]
 
-def _probability_fun_comparison(pct):
-    """확률(%)에 맞는 재미 비유 문구 한 줄을 구간 내에서 랜덤으로 골라 반환. (투자 조언 아님)"""
+def _probability_fun_comparison(pct, exclude=None):
+    """확률(%)에 맞는 재미 비유 문구 한 줄을 구간 내에서 랜덤으로 골라 반환. (투자 조언 아님)
+    exclude: 이미 다른 카드에서 쓴 문구 집합(set). 같은 구간에 후보가 더 있으면
+    그중에서 안 겹치는 걸 우선 고르고, 후보가 다 떨어지면(구간 후보가 2개뿐인데
+    3장 카드가 같은 구간인 경우 등) 어쩔 수 없이 겹치는 것도 허용한다."""
+    exclude = exclude or set()
     for threshold, phrases in _PROBABILITY_FUN_COMPARISONS:
         if pct >= threshold:
-            return random.choice(phrases)
-    return random.choice(_PROBABILITY_FUN_COMPARISONS[-1][1])
+            candidates = [p for p in phrases if p not in exclude]
+            return random.choice(candidates) if candidates else random.choice(phrases)
+    fallback_phrases = _PROBABILITY_FUN_COMPARISONS[-1][1]
+    candidates = [p for p in fallback_phrases if p not in exclude]
+    return random.choice(candidates) if candidates else random.choice(fallback_phrases)
 
 def _format_probability_fun_card(result, target_price, target_src="목표가", current_price=None):
     """AI 확률분석 탭 전용 — 30/90/180일 도달확률을 밝은 배경의 카드 3개로
@@ -3828,10 +3835,12 @@ def _format_probability_fun_card(result, target_price, target_src="목표가", c
     best_h = max(horizons, key=lambda h: probs.get(h, 0))
 
     cards_html = ""
+    _used_fun_phrases = set()
     for h in horizons:
         pct = probs.get(h, 0)
         color, emoji, label = _probability_tier(pct)
-        fun_phrase = _probability_fun_comparison(pct)
+        fun_phrase = _probability_fun_comparison(pct, exclude=_used_fun_phrases)
+        _used_fun_phrases.add(fun_phrase)
         is_best = (h == best_h)
         border = f"1.5px solid {color}" if is_best else "1px solid #E2E8F0"
         bg = f"{color}0D" if is_best else "#FFFFFF"
