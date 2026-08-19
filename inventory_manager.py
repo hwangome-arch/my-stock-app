@@ -9434,6 +9434,21 @@ def render_ai_probability():
         return
 
     code = active_code
+
+    # 🐛 [버그 수정: 코스닥 종목이 "가격 데이터 부족"으로 잘못 표시되던 문제]
+    # estimate_target_hit_probability에 market_hint를 안 넘기면(=None) 내부적으로
+    # 코스피(.KS) 접미사부터 시도한다. 코스닥 종목(예: 파이오링크)은 이 첫 시도가
+    # 항상 실패하고 두 번째 시도(.KQ)로 넘어가는데, 그 사이 지연·야후 쪽 일시적
+    # 실패가 겹치면 실제로는 데이터가 있는데도 "가격 데이터가 부족합니다"로
+    # 잘못 뜬다. 관심종목 탭(4851번 줄 부근)과 동일하게 screener_df에서
+    # 종목코드→시장 매핑을 만들어 넘겨줘서, 코스닥 종목은 처음부터 .KQ를
+    # 먼저 시도하도록 고친다.
+    _aiprob_screener_df = load_screener_df()
+    if _aiprob_screener_df is not None and not _aiprob_screener_df.empty and '시장' in _aiprob_screener_df.columns:
+        _aiprob_market_map = dict(zip(_aiprob_screener_df['종목코드'], _aiprob_screener_df['시장']))
+    else:
+        _aiprob_market_map = {}
+    market_hint = _aiprob_market_map.get(code)
     cache_key = f'aiprob_result_{code}'
 
     if search_btn or cache_key not in st.session_state:
@@ -9527,7 +9542,7 @@ def render_ai_probability():
         target_price = default_target
 
     if target_price and target_price > 0:
-        result = estimate_target_hit_probability(code, None, target_price)
+        result = estimate_target_hit_probability(code, market_hint, target_price)
         badge_html = _format_probability_fun_card(result, target_price, target_src="목표가", current_price=current_price)
         if badge_html:
             st.markdown(badge_html, unsafe_allow_html=True)
@@ -9609,6 +9624,21 @@ def render_fnguide():
 
     if active_code:
         code = active_code
+
+        # 🐛 [버그 수정: 코스닥 종목 목표가 도달 확률이 "데이터 부족"으로 잘못 표시되던 문제]
+        # 아래쪽 render_hit_probability_badge(code, None, ...) 호출들이 market_hint를
+        # 항상 None으로 넘겨서, 코스닥 종목은 estimate_target_hit_probability 내부에서
+        # 코스피(.KS) 접미사부터 헛시도한 뒤에야 코스닥(.KQ)으로 재시도한다. 이 지연·
+        # 일시적 실패가 겹치면 실제로는 데이터가 있는데도 "가격 데이터가 부족합니다"로
+        # 잘못 뜬다. screener_df에서 종목코드→시장 매핑을 만들어 넘겨줘서 처음부터
+        # 맞는 접미사로 시도하도록 고친다. (render_ai_probability의 동일 수정 참고)
+        _fnguide_screener_df = load_screener_df()
+        if _fnguide_screener_df is not None and not _fnguide_screener_df.empty and '시장' in _fnguide_screener_df.columns:
+            _fnguide_market_map = dict(zip(_fnguide_screener_df['종목코드'], _fnguide_screener_df['시장']))
+        else:
+            _fnguide_market_map = {}
+        market_hint = _fnguide_market_map.get(code)
+
         cache_key = f'fnguide_result_{code}'
 
         if search_btn or cache_key not in st.session_state:
@@ -9977,7 +10007,7 @@ def render_fnguide():
             </div>
             """, unsafe_allow_html=True)
 
-            _prob_html2 = render_hit_probability_badge(code, None, target_price, target_src)
+            _prob_html2 = render_hit_probability_badge(code, market_hint, target_price, target_src)
             if _prob_html2:
                 st.markdown(_prob_html2, unsafe_allow_html=True)
 
@@ -10032,7 +10062,7 @@ def render_fnguide():
             _custom_digits = re.sub(r"[^\d]", "", str(st.session_state.get(_custom_tgt_key, "")))
             _custom_target = int(_custom_digits) if _custom_digits else 0
             if _custom_target > 0:
-                _prob_html_custom = render_hit_probability_badge(code, None, _custom_target, "직접 입력")
+                _prob_html_custom = render_hit_probability_badge(code, market_hint, _custom_target, "직접 입력")
                 if _prob_html_custom:
                     st.markdown(_prob_html_custom, unsafe_allow_html=True)
 
