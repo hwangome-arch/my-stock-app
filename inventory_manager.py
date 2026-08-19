@@ -3886,11 +3886,13 @@ def _format_probability_fun_card(result, target_price, target_src="목표가", c
 
     # ── [신규] 4번째 카드: 확률이 가장 높아지는 시점(최대 1년) ─────────────────
     # estimate_target_hit_probability에서 이미 계산해둔 peak_day/peak_prob를
-    # 그대로 받아 카드로 렌더링만 한다(추가 계산 없음). 다른 3개 카드와 나란히
-    # 4등분으로 좁게 넣으면 문구가 잘려 보여서, 아래에 가로로 넓은 별도 줄로
-    # 뺐다 — 개념적으로도 "특정 기간의 확률"이 아니라 "가장 유리한 시점"이라는
-    # 독립적인 지표라 따로 강조하는 게 자연스럽다. 색상도 위 3개 카드(브랜드
-    # 보라색)와 겹치지 않도록 호박색 계열을 썼다.
+    # 그대로 받아 카드로 렌더링만 한다(추가 계산 없음).
+    # 🎨 [2026-08-19 배치 변경] 처음엔 아래에 가로로 넓은 별도 줄로 뺐는데, 실제로
+    # 보니 3개 카드 아래에 툭 떨어진 느낌이 어색하다는 피드백을 받아, 180일 카드
+    # 오른쪽에 4번째 칸으로 나란히 넣는 원래 형태로 되돌렸다. 4등분이라 카드 폭이
+    # 좁아지므로 문구는 다른 3개 카드와 동일한 세로 스택(라벨→값→부가정보) 구조를
+    # 그대로 따르되, 값 줄만 "일수"와 "개월 환산"을 두 줄로 나눠 좁은 폭에서도
+    # 안 잘리게 했다. 색상은 위 3개 카드(브랜드 보라)와 안 겹치도록 호박색 계열.
     _PEAK_ACCENT = "#D97706"
     peak_day = result.get("peak_day")
     peak_prob = result.get("peak_prob")
@@ -3898,22 +3900,26 @@ def _format_probability_fun_card(result, target_price, target_src="목표가", c
         _peak_fun_phrase = _probability_fun_comparison(peak_prob, exclude=_used_fun_phrases)
         _used_fun_phrases.add(_peak_fun_phrase)
         _peak_months = peak_day / 30.4
-        peak_value_html = f'{peak_day}일 후 <span style="font-size:12px; font-weight:600;">(약 {_peak_months:.1f}개월)</span>'
-        peak_sub_html = f'그 시점 확률 {peak_prob:.0f}% · {_peak_fun_phrase}'
+        peak_value_html = f'{peak_day}일 후'
+        peak_months_html = f'약 {_peak_months:.1f}개월'
+        peak_sub_html = f'확률 {peak_prob:.0f}% · {_peak_fun_phrase}'
     else:
-        peak_value_html = '1년 내 정점 없음'
-        peak_sub_html = '1년 안에서는 확률이 계속 오르는 추세예요'
+        peak_value_html = '정점 없음'
+        peak_months_html = ''
+        peak_sub_html = '1년 내 계속 오름세'
 
-    peak_card_html = (
-        f'<div style="margin-top:10px; display:flex; align-items:center; gap:14px; '
-        f'padding:14px 16px; background:{_PEAK_ACCENT}0D; border:1.5px solid {_PEAK_ACCENT}; border-radius:12px;">'
-        f'<div style="flex-shrink:0; font-size:11.5px; color:{_PEAK_ACCENT}; font-weight:700; '
-        f'white-space:nowrap;">🏔️ 확률 가장<br>높은 시점</div>'
-        f'<div style="width:1px; align-self:stretch; background:{_PEAK_ACCENT}33;"></div>'
-        f'<div style="flex:1;">'
-        f'<div style="font-size:20px; font-weight:800; color:{_PEAK_ACCENT}; line-height:1.3;">{peak_value_html}</div>'
-        f'<div style="font-size:13px; color:{_PEAK_ACCENT}; font-weight:700; margin-top:3px; line-height:1.4;">{peak_sub_html}</div>'
-        '</div>'
+    _peak_months_row = (
+        f'<div style="font-size:10.5px; color:{_PEAK_ACCENT}; font-weight:600; margin-top:1px;">{peak_months_html}</div>'
+        if peak_months_html else ''
+    )
+    cards_html += (
+        f'<div style="flex:1; text-align:center; padding:16px 10px; background:{_PEAK_ACCENT}0D; '
+        f'border:1.5px solid {_PEAK_ACCENT}; border-radius:12px;">'
+        f'<div style="font-size:11.5px; color:{_PEAK_ACCENT}; font-weight:700; margin-bottom:6px;">'
+        f'🏔️ 확률 최고 시점</div>'
+        f'<div style="font-size:22px; font-weight:800; color:{_PEAK_ACCENT};">{peak_value_html}</div>'
+        f'{_peak_months_row}'
+        f'<div style="font-size:12px; color:{_PEAK_ACCENT}; margin-top:6px; font-weight:600; line-height:1.4;">{peak_sub_html}</div>'
         '</div>'
     )
 
@@ -3937,7 +3943,6 @@ def _format_probability_fun_card(result, target_price, target_src="목표가", c
         f'<div style="font-size:12.5px; color:#64748B; font-weight:700; margin-bottom:10px;">'
         f'🎲 {header_html} 도달 확률 · 종가 기준 통계 추정</div>'
         f'<div style="display:flex; gap:10px;">{cards_html}</div>'
-        f'{peak_card_html}'
         '</div>'
     )
 
