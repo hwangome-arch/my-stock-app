@@ -7,3 +7,4 @@ lxml>=5.0
 gspread
 google-auth
 psutil
+google-genai

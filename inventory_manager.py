@@ -920,13 +920,33 @@ def fetch_global_market_pulse():
 @st.cache_data(ttl=1800, show_spinner=False)
 def generate_ai_market_briefing(headlines, global_snapshot):
     """국내 헤드라인 + 글로벌 지표를 Google Gemini(Flash, 무료 티어 대상)에게 넘겨
-    '오늘의 핫 토픽' 3~5개 + 미증시 영향 코멘트를 JSON으로 요약받는다. API 키가
-    없거나 호출이 실패하면 None을 반환하고, 호출부(render_market_pulse)에서
-    "AI 요약 사용 불가" 안내로 대체한다 — 이 탭의 나머지(헤드라인 목록/글로벌 지표)는
-    AI 없이도 정상 동작해야 하므로, 여기서 예외를 던지지 않고 항상 조용히 실패한다."""
+    '오늘의 핫 토픽' 3~5개 + 미증시 영향 코멘트를 JSON으로 요약받는다.
+
+    반환값: (topics 리스트 또는 None, 에러 메시지 문자열 또는 None)
+    성공하면 (topics, None), 실패하면 (None, "원인 문자열")을 돌려준다 — 예전에는
+    실패 시 그냥 None만 반환해서 왜 안 되는지 알 길이 없었는데, 2026년 6월경부터
+    구글이 새로 발급하는 API 키 형식이 "AQ."로 바뀌면서 REST/공식 SDK 양쪽 다
+    401 ACCESS_TOKEN_TYPE_UNSUPPORTED로 거부되는 사례가 구글 개발자 포럼에 다수
+    보고되어 있다 (2026-08 기준 구글 측 미해결 이슈). 원인 파악을 돕기 위해
+    호출부(render_market_pulse)에서 실제 에러 메시지를 그대로 보여줄 수 있게 한다.
+    """
     api_key = get_gemini_api_key()
-    if not api_key or not headlines:
-        return None
+    if not api_key:
+        return None, "GEMINI_API_KEY가 설정되지 않았습니다."
+    if not headlines:
+        return None, "국내 뉴스 헤드라인을 불러오지 못해 요약할 재료가 없습니다."
+
+    # ── 공식 google-genai SDK 사용 (REST 직접 호출 대신) ──────────────────────
+    # requests로 REST 엔드포인트를 직접 호출하던 이전 방식에서, 최근 구글이 발급하는
+    # "AQ." 형식 키가 REST 쪽에서 401로 거부되는 사례가 많아 공식 SDK로 전환했다.
+    # 다만 포럼 보고에 따르면 SDK를 써도 같은 계정이면 동일하게 막히는 경우가 있어
+    # (구글 측 계정/키 발급 단의 버그로 추정), 이 함수는 실패 원인을 최대한 그대로
+    # 노출해서 REST 문제인지 SDK로도 안 되는 문제인지 구분할 수 있게 한다.
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        return None, "google-genai 패키지가 설치되어 있지 않습니다. `pip install google-genai` 후 다시 시도해주세요."
 
     headline_lines = "\n".join(f"- {h['title']} ({h['press']})" for h in headlines[:12])
     snapshot_lines = "\n".join(
@@ -947,54 +967,46 @@ def generate_ai_market_briefing(headlines, global_snapshot):
 - summary: 한 줄 요약 (40자 내외, 존댓말 아닌 개조식)
 - impact: 코스피/코스닥에 미칠 영향 방향 한 단어 ("긍정", "부정", "중립" 중 하나)"""
 
-    # ── Gemini의 responseMimeType/responseSchema로 JSON 형식을 강제한다 ──────────
-    # Anthropic 버전에서는 프롬프트로만 "JSON만 출력해" 라고 요청하고 코드블록(```json)을
-    # 방어적으로 벗겨내는 방식이었는데, Gemini는 생성 설정(generationConfig)에서
-    # 아예 스키마를 강제할 수 있어 더 안정적이다. 그래도 혹시 모를 형식 이탈에
-    # 대비해 파싱은 여전히 try/except로 감싼다.
-    request_body = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": {
-                "type": "OBJECT",
-                "properties": {
-                    "topics": {
-                        "type": "ARRAY",
-                        "items": {
-                            "type": "OBJECT",
-                            "properties": {
-                                "topic": {"type": "STRING"},
-                                "summary": {"type": "STRING"},
-                                "impact": {"type": "STRING", "enum": ["긍정", "부정", "중립"]},
-                            },
-                            "required": ["topic", "summary", "impact"],
-                        },
-                    }
-                },
-                "required": ["topics"],
-            },
-        },
-    }
-
     try:
-        res = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}",
-            headers={"content-type": "application/json"},
-            json=request_body,
-            timeout=20,
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema={
+                    "type": "OBJECT",
+                    "properties": {
+                        "topics": {
+                            "type": "ARRAY",
+                            "items": {
+                                "type": "OBJECT",
+                                "properties": {
+                                    "topic": {"type": "STRING"},
+                                    "summary": {"type": "STRING"},
+                                    "impact": {"type": "STRING", "enum": ["긍정", "부정", "중립"]},
+                                },
+                                "required": ["topic", "summary", "impact"],
+                            },
+                        }
+                    },
+                    "required": ["topics"],
+                },
+            ),
         )
-        data = res.json()
-        candidates = data.get("candidates", [])
-        if not candidates:
-            return None
-        parts = candidates[0].get("content", {}).get("parts", [])
-        text = "".join(p.get("text", "") for p in parts).strip()
+        text = (response.text or "").strip()
+        if not text:
+            return None, "Gemini 응답이 비어 있습니다. (안전 필터에 걸렸거나 빈 응답)"
         parsed = json.loads(text)
         topics = parsed.get("topics", [])
-        return topics if topics else None
-    except Exception:
-        return None
+        if not topics:
+            return None, "Gemini가 topics를 비어있게 반환했습니다."
+        return topics, None
+    except Exception as e:
+        # ⚠️ 여기서 str(e)를 그대로 노출한다 — 401 ACCESS_TOKEN_TYPE_UNSUPPORTED처럼
+        # 구글 쪽 에러 코드/메시지를 사용자가 직접 봐야 "내 키 문제인지 구글 버그인지"
+        # 구분해서 포럼에 신고하거나 다음 조치를 판단할 수 있다.
+        return None, f"{type(e).__name__}: {e}"
 
 
 # ── [로그인 직후 스파크라인 차트가 가끔 통째로 빈 상태로 굳어버리는 문제 수정] ────
@@ -10482,9 +10494,25 @@ def render_market_pulse():
     elif not headlines:
         st.warning("⚠️ 국내 뉴스 헤드라인을 불러오지 못해 AI 요약을 생성할 수 없습니다. 네이버 금융 서버 통신이 지연되고 있을 수 있습니다.")
     else:
-        topics = generate_ai_market_briefing(headlines, global_snapshot)
+        topics, error_msg = generate_ai_market_briefing(headlines, global_snapshot)
         if not topics:
             st.warning("⚠️ AI 요약 생성에 실패했습니다. 잠시 후 '데이터 새로고침'을 눌러 다시 시도해주세요.")
+            if error_msg:
+                # ── [원인 파악용] 에러 메시지를 그대로 노출 ────────────────────
+                # 2026-08 기준, 구글이 새로 발급하는 "AQ." 형식 API 키가 공식
+                # google-genai SDK로도 401 ACCESS_TOKEN_TYPE_UNSUPPORTED로
+                # 거부되는 사례가 구글 개발자 포럼에 다수 보고된 상태(구글 측
+                # 미해결 이슈). 어떤 에러인지 그대로 보여줘야 "내 키 설정 문제"인지
+                # "구글 쪽 버그"인지 구분할 수 있다.
+                with st.expander("🔍 에러 상세 (원인 파악용)"):
+                    st.code(error_msg, language=None)
+                    if "ACCESS_TOKEN_TYPE_UNSUPPORTED" in error_msg or "401" in error_msg:
+                        st.caption(
+                            "💡 이 에러는 2026년 6월경부터 구글이 새로 발급하는 'AQ.'로 시작하는 "
+                            "API 키(Auth key)가 REST/공식 SDK 양쪽에서 거부되는, 구글 개발자 포럼에 "
+                            "다수 보고된 미해결 이슈와 일치합니다. 계정/키 문제가 아니라 구글 측 "
+                            "이슈일 가능성이 높습니다."
+                        )
         else:
             impact_style = {
                 "긍정": ("#DC2626", "#FEF2F2"),
