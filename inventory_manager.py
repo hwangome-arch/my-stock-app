@@ -3652,7 +3652,11 @@ def estimate_target_hit_probability(stock_code, market_hint, target_price, horiz
         if sigma_daily <= 0:
             return None
 
-        max_h = max(horizons)
+        # 🆕 [정점 계산용 확장] 기존엔 max(horizons)(=180일)까지만 시뮬레이션했지만,
+        # 아래에서 "확률이 최대가 되는 시점(최대 1년)"을 구하려면 365일치 경로가
+        # 필요하다. 기존 horizons(30/90/180)는 그대로 이 경로의 일부를 잘라 쓰면
+        # 되므로 시뮬레이션을 별도로 두 번 돌릴 필요는 없다.
+        max_h = max(max(horizons), 365)
         rng = np.random.default_rng(7)
         # 드리프트 0 가정(보수적 기본값) : E[가격] = 현재가로 유지되도록 -0.5*sigma^2 보정
         shocks = rng.normal(loc=-0.5 * sigma_daily ** 2, scale=sigma_daily, size=(n_sims, max_h))
@@ -3668,7 +3672,42 @@ def estimate_target_hit_probability(stock_code, market_hint, target_price, horiz
                 hit = terminal_prices <= target_price
             probs[h] = round(float(np.mean(hit)) * 100, 1)
 
-        return {"current_price": current_price, "sigma_daily_pct": round(sigma_daily * 100, 2), "probs": probs}
+        # ── [신규] 확률이 가장 높아지는 시점(peak_day, 최대 1년) 계산 ────────────
+        # 드리프트 0(랜덤워크) 가정에서는 시간이 지날수록 "변동성이 커져서 목표가에
+        # 닿을 여지가 넓어지는 효과"와 "평균회귀 보정(-0.5·sigma²·t)으로 기대가격
+        # 중심이 계속 멀어지는 효과"가 서로 반대로 작용한다. 그 결과 목표가 도달
+        # 확률은 어느 시점까지 오르다가 다시 꺾이는 봉우리(peak) 형태를 띠고, 그
+        # 정점은 기하브라운운동의 알려진 성질로 아래처럼 닫힌 형태 수식으로 바로
+        # 구해진다(별도 스캔/추가 시뮬레이션 없이 계산 가능):
+        #   t* = 2 · ln(더 큰 가격 / 더 작은 가격) / sigma_daily²
+        # 목표가가 변동성 대비 크게 무리하지 않으면 t*가 365일을 훌쩍 넘는 경우가
+        # 많다(=1년 안에서는 확률이 계속 오르기만 하고 실제로 안 꺾인다는 뜻이라,
+        # 그 상태에서 "정점"이라고 보여주면 오히려 사용자에게 오해를 준다). 그래서
+        # 365일을 넘으면 peak_day를 None으로 두고, 호출부에서 "1년 내 계속
+        # 오름세"처럼 정직하게 안내하도록 한다. peak_day가 365 이내로 나오면, 그
+        # 날짜의 확률은 위에서 이미 만든 price_paths(최대 365일까지 시뮬레이션됨)를
+        # 그대로 재사용해서 추가 계산 비용 없이 뽑아낸다.
+        peak_day, peak_prob = None, None
+        if target_price != current_price and max_h >= 365:
+            ratio = (target_price / current_price) if target_price > current_price else (current_price / target_price)
+            t_star = 2 * float(np.log(ratio)) / (sigma_daily ** 2)
+            if 1 <= t_star <= 365:
+                peak_day = int(round(t_star))
+                peak_terminal = price_paths[:, peak_day - 1]
+                if target_price >= current_price:
+                    peak_hit = peak_terminal >= target_price
+                else:
+                    peak_hit = peak_terminal <= target_price
+                peak_prob = round(float(np.mean(peak_hit)) * 100, 1)
+        # ────────────────────────────────────────────────────────────────────
+
+        return {
+            "current_price": current_price,
+            "sigma_daily_pct": round(sigma_daily * 100, 2),
+            "probs": probs,
+            "peak_day": peak_day,
+            "peak_prob": peak_prob,
+        }
     except Exception:
         return None
 
@@ -3845,6 +3884,39 @@ def _format_probability_fun_card(result, target_price, target_src="목표가", c
             '</div>'
         )
 
+    # ── [신규] 4번째 카드: 확률이 가장 높아지는 시점(최대 1년) ─────────────────
+    # estimate_target_hit_probability에서 이미 계산해둔 peak_day/peak_prob를
+    # 그대로 받아 카드로 렌더링만 한다(추가 계산 없음). 다른 3개 카드와 나란히
+    # 4등분으로 좁게 넣으면 문구가 잘려 보여서, 아래에 가로로 넓은 별도 줄로
+    # 뺐다 — 개념적으로도 "특정 기간의 확률"이 아니라 "가장 유리한 시점"이라는
+    # 독립적인 지표라 따로 강조하는 게 자연스럽다. 색상도 위 3개 카드(브랜드
+    # 보라색)와 겹치지 않도록 호박색 계열을 썼다.
+    _PEAK_ACCENT = "#D97706"
+    peak_day = result.get("peak_day")
+    peak_prob = result.get("peak_prob")
+    if peak_day is not None and peak_prob is not None:
+        _peak_fun_phrase = _probability_fun_comparison(peak_prob, exclude=_used_fun_phrases)
+        _used_fun_phrases.add(_peak_fun_phrase)
+        _peak_months = peak_day / 30.4
+        peak_value_html = f'{peak_day}일 후 <span style="font-size:12px; font-weight:600;">(약 {_peak_months:.1f}개월)</span>'
+        peak_sub_html = f'그 시점 확률 {peak_prob:.0f}% · {_peak_fun_phrase}'
+    else:
+        peak_value_html = '1년 내 정점 없음'
+        peak_sub_html = '1년 안에서는 확률이 계속 오르는 추세예요'
+
+    peak_card_html = (
+        f'<div style="margin-top:10px; display:flex; align-items:center; gap:14px; '
+        f'padding:14px 16px; background:{_PEAK_ACCENT}0D; border:1.5px solid {_PEAK_ACCENT}; border-radius:12px;">'
+        f'<div style="flex-shrink:0; font-size:11.5px; color:{_PEAK_ACCENT}; font-weight:700; '
+        f'white-space:nowrap;">🏔️ 확률 가장<br>높은 시점</div>'
+        f'<div style="width:1px; align-self:stretch; background:{_PEAK_ACCENT}33;"></div>'
+        f'<div style="flex:1;">'
+        f'<div style="font-size:20px; font-weight:800; color:{_PEAK_ACCENT}; line-height:1.3;">{peak_value_html}</div>'
+        f'<div style="font-size:13px; color:{_PEAK_ACCENT}; font-weight:700; margin-top:3px; line-height:1.4;">{peak_sub_html}</div>'
+        '</div>'
+        '</div>'
+    )
+
     if current_price and current_price > 0:
         _diff_pct = (target_price - current_price) / current_price * 100
         _diff_sign = "+" if _diff_pct >= 0 else ""
@@ -3865,6 +3937,7 @@ def _format_probability_fun_card(result, target_price, target_src="목표가", c
         f'<div style="font-size:12.5px; color:#64748B; font-weight:700; margin-bottom:10px;">'
         f'🎲 {header_html} 도달 확률 · 종가 기준 통계 추정</div>'
         f'<div style="display:flex; gap:10px;">{cards_html}</div>'
+        f'{peak_card_html}'
         '</div>'
     )
 
@@ -9581,7 +9654,9 @@ def render_ai_probability():
     st.markdown(
         "<p style='font-size:12px; color:#64748B; margin-bottom:12px;'>"
         "최근 1년 변동성을 이용한 몬테카를로 시뮬레이션입니다. 아래 AI 종합점수와는 "
-        "별개로 계산되며, 방향성(상승/하락)을 예단하지 않습니다.</p>",
+        "별개로 계산되며, 방향성(상승/하락)을 예단하지 않습니다. "
+        "맨 아래 '확률 가장 높은 시점' 카드는 최대 1년(365일) 내에서 도달 확률이 "
+        "가장 높아지는 날짜를 계산한 값입니다.</p>",
         unsafe_allow_html=True
     )
 
