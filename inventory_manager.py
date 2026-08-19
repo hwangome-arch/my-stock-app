@@ -3887,11 +3887,10 @@ def _format_probability_fun_card(result, target_price, target_src="목표가", c
     # ── [신규] 4번째 카드: 확률이 가장 높아지는 시점(최대 1년) ─────────────────
     # estimate_target_hit_probability에서 이미 계산해둔 peak_day/peak_prob를
     # 그대로 받아 카드로 렌더링만 한다(추가 계산 없음).
-    # 🎨 [2026-08-19] 처음엔 일수(예: "259일 후")를 메인 값으로 크게 보여줬는데,
-    # 다른 3개 카드는 전부 "%가 메인"이라 이 카드만 튀어 보인다는 피드백을 받아
-    # 구조를 통일했다 — 메인 값은 다른 카드와 동일하게 퍼센트(24px)로, 일수/개월/
-    # 재미 문구는 그 아래 서브 텍스트 한 줄로 합쳤다. 색상(호박색)과 박스 테두리는
-    # 그대로 유지.
+    # 🎨 [2026-08-19] 다른 3개 카드는 라벨→값(%)→문구 순서지만, 이 카드는 "언제"가
+    # 핵심 정보라서 순서를 일수/개월(작게, 상단) → %(메인, 크게) → 라벨(아이콘) →
+    # 재미 문구(하단) 순으로 다르게 배치했다 — 요청받은 순서 그대로. 색상(호박색)과
+    # 박스 테두리는 그대로 유지.
     _PEAK_ACCENT = "#D97706"
     peak_day = result.get("peak_day")
     peak_prob = result.get("peak_prob")
@@ -3899,19 +3898,22 @@ def _format_probability_fun_card(result, target_price, target_src="목표가", c
         _peak_fun_phrase = _probability_fun_comparison(peak_prob, exclude=_used_fun_phrases)
         _used_fun_phrases.add(_peak_fun_phrase)
         _peak_months = peak_day / 30.4
+        peak_day_html = f'{peak_day}일 후(약 {_peak_months:.1f}개월)'
         peak_value_html = f'{peak_prob:.0f}%'
-        peak_sub_html = f'{peak_day}일 후(약 {_peak_months:.1f}개월) · {_peak_fun_phrase}'
+        peak_phrase_html = _peak_fun_phrase
     else:
+        peak_day_html = '1년 내'
         peak_value_html = '—'
-        peak_sub_html = '1년 내 계속 오름세'
+        peak_phrase_html = '계속 오름세예요'
 
     cards_html += (
         f'<div style="flex:1; text-align:center; padding:16px 10px; background:{_PEAK_ACCENT}0D; '
         f'border:1.5px solid {_PEAK_ACCENT}; border-radius:12px;">'
-        f'<div style="font-size:11.5px; color:{_PEAK_ACCENT}; font-weight:700; margin-bottom:6px;">'
-        f'🏔️ 확률 최고 시점</div>'
+        f'<div style="font-size:12px; color:{_PEAK_ACCENT}; font-weight:600; margin-bottom:6px;">{peak_day_html}</div>'
         f'<div style="font-size:24px; font-weight:800; color:{_PEAK_ACCENT};">{peak_value_html}</div>'
-        f'<div style="font-size:14px; color:{_PEAK_ACCENT}; font-weight:700; margin-top:5px; line-height:1.4;">{peak_sub_html}</div>'
+        f'<div style="font-size:11.5px; color:{_PEAK_ACCENT}; font-weight:700; margin-top:6px;">'
+        f'🏔️ 확률 최고 시점</div>'
+        f'<div style="font-size:14px; color:{_PEAK_ACCENT}; font-weight:700; margin-top:5px; line-height:1.4;">{peak_phrase_html}</div>'
         '</div>'
     )
 
