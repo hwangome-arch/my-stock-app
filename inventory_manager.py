@@ -3845,7 +3845,7 @@ def _format_probability_fun_card(result, target_price, target_src="목표가", c
             f'{horizon_labels[h]}</div>'
             f'<div style="font-size:24px; font-weight:800; color:{value_color};">{pct:.0f}%</div>'
             f'<div style="font-size:11px; color:{sub_color}; margin-top:6px; font-weight:600;">{emoji} {label}</div>'
-            f'<div style="font-size:10px; color:#94A3B8; margin-top:4px;">{fun_phrase}</div>'
+            f'<div style="font-size:12px; color:#64748B; margin-top:5px; line-height:1.4;">{fun_phrase}</div>'
             '</div>'
         )
 
