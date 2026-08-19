@@ -824,6 +824,159 @@ def fetch_market_index_table():
     return {k: result.get(k, {"name": all_targets[k]["name"], "value": "-", "status": "neutral"})
             for k in all_targets.keys()}
 
+# =========================
+# 📰 오늘의 마켓 브리핑 (국내 뉴스 + 글로벌 지표 + AI 요약)
+# =========================
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_market_news_naver(limit=12):
+    """네이버 금융 '주요뉴스' 목록에서 헤드라인/링크/언론사를 가져온다.
+    AI 요약이 재료로 쓸 헤드라인 텍스트만 필요하므로 본문은 긁지 않는다
+    (저작권/부하 둘 다 고려해 목록 페이지만 사용)."""
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    url = "https://finance.naver.com/news/mainnews.naver"
+    try:
+        res = requests.get(url, headers=headers, timeout=8)
+        res.encoding = 'euc-kr'  # 네이버금융은 euc-kr 고정 (apparent_encoding 추측 금지 — 파일 상단 규칙 참고)
+        text = res.text
+    except Exception:
+        return []
+
+    items = []
+    try:
+        # mainnews.naver는 <dl> 블록 안에 <dt class="thumb">(썸네일, 있을 수도 없을 수도)와
+        # <dd class="articleSubject"><a href=...>제목</a></dd>,
+        # <dd class="articleSummary">...<span class="press">언론사</span>...<span class="wdate">시간</span></dd>
+        # 형태로 반복된다. 정규식으로 가볍게 파싱 (전체 HTML 파서 의존성 추가를 피함).
+        blocks = re.findall(
+            r'articleSubject.*?href="([^"]+)"[^>]*>\s*(?:<[^>]+>)*\s*([^<]+?)\s*</a>.*?'
+            r'class="press">([^<]*)</span>.*?class="wdate">([^<]*)</span>',
+            text, flags=re.S
+        )
+        for href, title, press, wdate in blocks[:limit]:
+            title = html_lib.unescape(title.strip())
+            if not title:
+                continue
+            link = href if href.startswith("http") else f"https://finance.naver.com{href}"
+            items.append({
+                "title": title,
+                "link": link,
+                "press": press.strip(),
+                "time": wdate.strip(),
+            })
+    except Exception:
+        return []
+    return items
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_global_market_pulse():
+    """미증시/환율/금리/유가 등 '오늘의 마켓 브리핑' 전용 글로벌 스냅샷.
+    기존 fetch_market_index_table()과 별도로 둔 이유: 대시보드 카드 구성(코스피/코스닥
+    중심)을 건드리지 않고, 이 탭에서만 필요한 지표(S&P500·다우·10년물 금리 등)를
+    독립적으로 추가/변경할 수 있게 하기 위함."""
+    yf_targets = {
+        "sp500":  {"symbol": "^GSPC", "name": "S&P 500",   "subtitle": "미국 대형주 지수"},
+        "dow":    {"symbol": "^DJI",  "name": "다우존스",   "subtitle": "미국 산업평균지수"},
+        "nasdaq": {"symbol": "^IXIC", "name": "나스닥",     "subtitle": "미국 기술주 지수"},
+        "ust10y": {"symbol": "^TNX",  "name": "美 10년물 금리", "subtitle": "국채 수익률(%)"},
+        "usdkrw": {"symbol": "KRW=X", "name": "원/달러",    "subtitle": "환율"},
+        "wti":    {"symbol": "CL=F",  "name": "WTI 유가",   "subtitle": "서부텍사스산 원유"},
+    }
+
+    def get_yfinance(key, meta):
+        try:
+            import yfinance as yf
+            df = yf.Ticker(meta["symbol"]).history(period="5d", interval="1d", timeout=8)
+            df = df["Close"].dropna()
+            if df.empty:
+                raise ValueError("empty")
+            price = float(df.iloc[-1])
+            prev = float(df.iloc[-2]) if len(df) > 1 else price
+            diff = price - prev
+            diff_pct = diff / prev * 100 if prev else 0
+            sign = "+" if diff >= 0 else ""
+            # ^TNX는 야후에서 "수익률 x 10" 값으로 내려오므로(예: 42.3 -> 4.23%) 보정
+            if key == "ust10y":
+                price /= 10
+                diff /= 10
+            fmt = f"{price:,.1f}" if key in ("usdkrw",) else (f"{price:,.2f}%" if key == "ust10y" else f"{price:,.2f}")
+            return key, {
+                "name": meta["name"], "subtitle": meta["subtitle"],
+                "value": fmt,
+                "change_pct": f"{sign}{diff_pct:.2f}%",
+                "status": "up" if diff > 0 else ("down" if diff < 0 else "neutral"),
+            }
+        except Exception:
+            return key, None
+
+    result = run_parallel_safe(
+        lambda t: get_yfinance(t[0], t[1]), list(yf_targets.items()),
+        max_workers=6, overall_timeout=12, per_result_timeout=8,
+    )
+    return {k: result.get(k, {"name": v["name"], "subtitle": v["subtitle"], "value": "-", "change_pct": "-", "status": "neutral"})
+            for k, v in yf_targets.items()}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def generate_ai_market_briefing(headlines, global_snapshot):
+    """국내 헤드라인 + 글로벌 지표를 Claude(Sonnet)에게 넘겨 '오늘의 핫 토픽' 3~5개 +
+    미증시 영향 코멘트를 JSON으로 요약받는다. API 키가 없거나 호출이 실패하면
+    None을 반환하고, 호출부(render_market_pulse)에서 "AI 요약 사용 불가" 안내로
+    대체한다 — 이 탭의 나머지(헤드라인 목록/글로벌 지표)는 AI 없이도 정상 동작해야
+    하므로, 여기서 예외를 던지지 않고 항상 조용히 실패한다."""
+    api_key = get_anthropic_api_key()
+    if not api_key or not headlines:
+        return None
+
+    headline_lines = "\n".join(f"- {h['title']} ({h['press']})" for h in headlines[:12])
+    snapshot_lines = "\n".join(
+        f"- {v['name']}: {v['value']} ({v['change_pct']})"
+        for v in global_snapshot.values() if v.get("value") != "-"
+    )
+
+    prompt = f"""아래는 오늘 수집된 국내 금융 뉴스 헤드라인과 글로벌 시장 지표다.
+
+[국내 헤드라인]
+{headline_lines}
+
+[글로벌 지표]
+{snapshot_lines}
+
+이 내용을 바탕으로 오늘의 핵심 토픽 3~5개를 뽑아라. 각 토픽마다:
+- topic: 토픽 제목 (10자 내외)
+- summary: 한 줄 요약 (40자 내외, 존댓말 아닌 개조식)
+- impact: 코스피/코스닥에 미칠 영향 방향 한 단어 ("긍정", "부정", "중립" 중 하나)
+
+반드시 아래 JSON 형식으로만 응답하고, 그 외 설명/전문/코드블록 표시는 절대 붙이지 마라:
+{{"topics": [{{"topic": "...", "summary": "...", "impact": "긍정|부정|중립"}}]}}"""
+
+    try:
+        res = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 700,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=20,
+        )
+        data = res.json()
+        text = "".join(block.get("text", "") for block in data.get("content", []) if block.get("type") == "text")
+        text = text.strip()
+        # 혹시 모델이 코드블록으로 감싸 응답하는 경우를 대비한 방어적 클린업
+        text = re.sub(r"^```json\s*|^```\s*|```$", "", text.strip(), flags=re.M).strip()
+        parsed = json.loads(text)
+        topics = parsed.get("topics", [])
+        return topics if topics else None
+    except Exception:
+        return None
+
+
 # ── [로그인 직후 스파크라인 차트가 가끔 통째로 빈 상태로 굳어버리는 문제 수정] ────
 # 문제: fetch_sparkline_data()는 st.cache_data(ttl=86400)로 하루 종일 캐싱되는데,
 # 야후 파이낸스(yfinance) 쪽이 그 순간 일시적으로 느리거나(클라우드 IP 레이트리밋 등)
@@ -2416,6 +2569,15 @@ def get_dart_api_key():
         return st.secrets["DART_API_KEY"]
     except Exception:
         return os.environ.get("DART_API_KEY", "")
+
+
+def get_anthropic_api_key():
+    """secrets.toml 또는 환경변수에서 Anthropic API 키를 가져온다.
+    (오늘의 마켓 브리핑 탭의 AI 한줄요약 기능에 사용)"""
+    try:
+        return st.secrets["ANTHROPIC_API_KEY"]
+    except Exception:
+        return os.environ.get("ANTHROPIC_API_KEY", "")
 
 
 # ── ⚠️ [임시 우회] Streamlit Cloud → opendart.fss.or.kr 직접 연결 차단 우회용 프록시 ──
@@ -6213,6 +6375,7 @@ def _main_impl():
             ("기업 재무 분석", ":material/bar_chart:"),
             ("AI 확률분석", ":material/percent:"),
             ("실시간 배당 순위", ":material/payments:"),
+            ("오늘의 마켓 브리핑", ":material/newspaper:"),
         ]),
         ("MY PAGE", [
             ("관심종목", ":material/bookmark:"),
@@ -6346,6 +6509,7 @@ def _main_impl():
     elif selected == "기업 재무 분석":   render_fnguide()
     elif selected == "AI 확률분석":      render_ai_probability()
     elif selected == "실시간 배당 순위": render_dividend()
+    elif selected == "오늘의 마켓 브리핑": render_market_pulse()
     elif selected == "관심종목":         render_watchlist()
     elif selected == "비밀번호 변경":     render_change_password()
 
@@ -10234,6 +10398,109 @@ def render_fnguide():
                 _prob_html_custom = render_hit_probability_badge(code, market_hint, _custom_target, "직접 입력")
                 if _prob_html_custom:
                     st.markdown(_prob_html_custom, unsafe_allow_html=True)
+
+
+def render_market_pulse():
+    st.header(
+        "오늘의 마켓 브리핑",
+        help="""💡 **[오늘의 마켓 브리핑 안내]**\n\n국내 주요 뉴스와 미국 증시·환율·금리·유가 등 글로벌 지표를 한 화면에 모아 보여줍니다.\n\n'AI 핫 토픽 요약'은 수집된 헤드라인과 지표를 바탕으로 오늘 코스피/코스닥에 영향을 줄 만한 이슈를 3~5개로 정리해줍니다."""
+    )
+    st.markdown("<hr style='margin: 10px 0 25px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
+
+    col_scan, col_refresh, col_caption = st.columns([1.5, 1.5, 5])
+    with col_scan:
+        if not st.session_state.get("market_pulse_scanned"):
+            if st.button("🔍 오늘의 브리핑 조회", key="market_pulse_scan_btn", type="primary", use_container_width=True):
+                st.session_state["market_pulse_scanned"] = True
+    with col_refresh:
+        if st.session_state.get("market_pulse_scanned"):
+            if st.button("데이터 새로고침", key="market_pulse_refresh_btn", use_container_width=True):
+                fetch_market_news_naver.clear()
+                fetch_global_market_pulse.clear()
+                generate_ai_market_briefing.clear()
+                st.rerun()
+
+    # 🔧 [탭 이동 멈춤 대응] 다른 탭(배당/스크리너 등)과 동일한 패턴: 뉴스 스크래핑 +
+    # yfinance 6종 조회 + (선택) LLM 호출까지 걸리는 무거운 작업이라, 탭에 들어오는
+    # 즉시 자동 실행하지 않고 사용자가 명시적으로 버튼을 눌러야 시작한다.
+    if not st.session_state.get("market_pulse_scanned"):
+        st.info("💡 아직 브리핑을 조회하지 않았습니다. 위 [오늘의 브리핑 조회] 버튼을 눌러주세요. (약 5~15초 소요)")
+        return
+
+    headlines = run_with_progress("국내 뉴스 · 글로벌 지표 수집 중...", fetch_market_news_naver)
+    global_snapshot = fetch_global_market_pulse()
+
+    # ── 글로벌 지표 카드 ──────────────────────────────────────────────
+    st.subheader("🌐 글로벌 마켓 스냅샷")
+    g_cols = st.columns(3)
+    for i, (key, idx) in enumerate(global_snapshot.items()):
+        status = idx.get("status", "neutral")
+        color = "#DC2626" if status == "up" else ("#2563EB" if status == "down" else "#64748B")
+        bg = "#FEF2F2" if status == "up" else ("#EFF6FF" if status == "down" else "#F8FAFC")
+        arrow = "▲" if status == "up" else ("▼" if status == "down" else "–")
+        with g_cols[i % 3]:
+            st.markdown(f"""
+                <div style="background:#FFFFFF; border:1px solid #E2E8F0; border-radius:12px;
+                            padding:14px 16px; margin-bottom:14px; box-shadow:0 1px 4px rgba(0,0,0,0.04);">
+                    <div style="font-size:12px; font-weight:700; color:#1E293B; margin-bottom:4px;">
+                        {idx.get('name','-')} <span style="font-weight:500; color:#94A3B8;">{idx.get('subtitle','')}</span>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                        <span style="font-size:20px; font-weight:800; color:#0F172A;">{idx.get('value','-')}</span>
+                        <span style="background:{bg}; color:{color}; border-radius:6px; padding:2px 7px;
+                                     font-size:12px; font-weight:700;">{arrow} {idx.get('change_pct','-')}</span>
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
+
+    st.markdown("<div style='margin-top:6px;'></div>", unsafe_allow_html=True)
+
+    # ── AI 핫 토픽 요약 ──────────────────────────────────────────────
+    st.subheader("🤖 AI 핫 토픽 요약")
+    if not get_anthropic_api_key():
+        st.info("ℹ️ AI 요약을 사용하려면 `.streamlit/secrets.toml`에 `ANTHROPIC_API_KEY`를 추가해주세요. (헤드라인·글로벌 지표는 아래에서 계속 확인 가능)")
+    elif not headlines:
+        st.warning("⚠️ 국내 뉴스 헤드라인을 불러오지 못해 AI 요약을 생성할 수 없습니다. 네이버 금융 서버 통신이 지연되고 있을 수 있습니다.")
+    else:
+        topics = generate_ai_market_briefing(headlines, global_snapshot)
+        if not topics:
+            st.warning("⚠️ AI 요약 생성에 실패했습니다. 잠시 후 '데이터 새로고침'을 눌러 다시 시도해주세요.")
+        else:
+            impact_style = {
+                "긍정": ("#DC2626", "#FEF2F2"),
+                "부정": ("#2563EB", "#EFF6FF"),
+                "중립": ("#64748B", "#F8FAFC"),
+            }
+            for t in topics:
+                impact = t.get("impact", "중립")
+                color, bg = impact_style.get(impact, impact_style["중립"])
+                st.markdown(f"""
+                    <div style="background:#FFFFFF; border:1px solid #E2E8F0; border-radius:10px;
+                                padding:12px 16px; margin-bottom:10px; display:flex; align-items:flex-start; gap:12px;">
+                        <span style="flex-shrink:0; background:{bg}; color:{color}; border-radius:6px; padding:3px 9px;
+                                     font-size:12px; font-weight:700; margin-top:1px;">{impact}</span>
+                        <div>
+                            <div style="font-size:14px; font-weight:700; color:#111827; margin-bottom:2px;">{html_lib.escape(str(t.get('topic','')))}</div>
+                            <div style="font-size:13px; color:#4B5563;">{html_lib.escape(str(t.get('summary','')))}</div>
+                        </div>
+                    </div>
+                """, unsafe_allow_html=True)
+            st.caption("⚠️ AI가 생성한 요약으로, 실제 시장 상황과 다를 수 있습니다. 투자 판단은 원문 뉴스를 함께 확인해주세요.")
+
+    st.markdown("<div style='margin-top:10px;'></div>", unsafe_allow_html=True)
+
+    # ── 원문 헤드라인 목록 ────────────────────────────────────────────
+    st.subheader("📰 국내 주요 뉴스")
+    if not headlines:
+        st.error("데이터를 불러올 수 없습니다. 네이버 금융 서버 통신이 지연되고 있습니다.")
+    else:
+        for h in headlines:
+            st.markdown(f"""
+                <div style="padding:10px 4px; border-bottom:1px solid #F1F5F9;">
+                    <a href="{h['link']}" target="_blank" style="font-size:14px; font-weight:600; color:#111827; text-decoration:none;">{html_lib.escape(h['title'])}</a>
+                    <div style="font-size:12px; color:#94A3B8; margin-top:2px;">{html_lib.escape(h['press'])} · {html_lib.escape(h['time'])}</div>
+                </div>
+            """, unsafe_allow_html=True)
 
 
 def render_dividend():
