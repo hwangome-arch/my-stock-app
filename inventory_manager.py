@@ -868,6 +868,54 @@ def fetch_market_news_naver(limit=12):
     return items
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_market_news_us(limit=15):
+    """Yahoo Finance 뉴스 RSS(finance.yahoo.com/news/rssindex)에서 미국 시장
+    헤드라인을 가져온다.
+
+    ⚠️ [2026-08-20 추가] 기존 fetch_global_market_pulse는 S&P500/나스닥 등
+    '지수 숫자'만 제공하는데, 모더나 암백신 급등처럼 개별 종목이 크게 튀는
+    뉴스는 지수엔 거의 안 잡혀서(시총 비중이 작으면 지수 등락률에 미미한
+    영향) AI 브리핑이 이런 빅뉴스를 놓치는 문제가 있었다. 국내 헤드라인
+    (fetch_market_news_naver)과 같은 방식으로, 미국 쪽도 실제 뉴스 헤드라인
+    텍스트를 재료로 넣어줘야 이런 종목 단위 이벤트를 잡을 수 있다.
+
+    fetch_market_news_naver와 동일한 fail-safe 원칙: 실패하면 조용히 빈
+    리스트를 반환하고, 호출부(generate_ai_market_briefing)가 국내 헤드라인만
+    으로도 정상 동작하게 한다 (완전 필수 소스로 만들지 않음).
+    """
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    url = "https://finance.yahoo.com/news/rssindex"
+    try:
+        res = requests.get(url, headers=headers, timeout=8)
+        root = ET.fromstring(res.content)
+    except Exception:
+        return []
+
+    items = []
+    try:
+        channel = root.find("channel")
+        if channel is None:
+            return []
+        for item in channel.findall("item")[:limit]:
+            title = (item.findtext("title") or "").strip()
+            if not title:
+                continue
+            link = (item.findtext("link") or "").strip()
+            source_el = item.find("source")
+            source = (source_el.text or "").strip() if source_el is not None else ""
+            pub_date = (item.findtext("pubDate") or "").strip()
+            items.append({
+                "title": html_lib.unescape(title),
+                "link": link,
+                "press": source,
+                "time": pub_date,
+            })
+    except Exception:
+        return []
+    return items
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_global_market_pulse():
     """미증시/환율/금리/유가 등 '오늘의 마켓 브리핑' 전용 글로벌 스냅샷.
@@ -918,9 +966,18 @@ def fetch_global_market_pulse():
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def generate_ai_market_briefing(headlines, global_snapshot):
-    """국내 헤드라인 + 글로벌 지표를 Google Gemini(Flash, 무료 티어 대상)에게 넘겨
-    '오늘의 핫 토픽' 3~5개 + 미증시 영향 코멘트를 JSON으로 요약받는다.
+def generate_ai_market_briefing(headlines, global_snapshot, us_headlines=None):
+    """국내 헤드라인 + 글로벌 지표 + 미국 헤드라인을 Google Gemini(Flash, 무료
+    티어 대상)에게 넘겨 '오늘의 핫 토픽' 3~5개 + 미증시 영향 코멘트를 JSON으로
+    요약받는다.
+
+    us_headlines: [2026-08-20 추가] fetch_market_news_us()의 결과(선택 인자,
+    기본값 None → 빈 리스트로 취급). 기존에는 국내 헤드라인 + 글로벌 '지수
+    숫자'만 넘겼는데, 모더나 암백신 급등 같은 개별 종목 이벤트는 지수엔 거의
+    안 잡혀서(시총 비중 작으면 지수 등락률에 미미한 영향) AI가 놓치는 문제가
+    있었다. 미국 뉴스 헤드라인 텍스트를 별도로 넣어 이런 종목 단위 빅뉴스도
+    토픽 후보에 오를 수 있게 한다. 기존 호출부와의 하위호환을 위해 선택
+    인자로 두어, 이 인자를 안 넘기고 예전처럼 호출해도 그대로 동작한다.
 
     반환값: (topics 리스트 또는 None, 에러 메시지 문자열 또는 None)
     성공하면 (topics, None), 실패하면 (None, "원인 문자열")을 돌려준다 — 예전에는
@@ -935,6 +992,7 @@ def generate_ai_market_briefing(headlines, global_snapshot):
         return None, "GEMINI_API_KEY가 설정되지 않았습니다."
     if not headlines:
         return None, "국내 뉴스 헤드라인을 불러오지 못해 요약할 재료가 없습니다."
+    us_headlines = us_headlines or []
 
     # ── 공식 google-genai SDK 사용 (REST 직접 호출 대신) ──────────────────────
     # requests로 REST 엔드포인트를 직접 호출하던 이전 방식에서, 최근 구글이 발급하는
@@ -953,16 +1011,21 @@ def generate_ai_market_briefing(headlines, global_snapshot):
         f"- {v['name']}: {v['value']} ({v['change_pct']})"
         for v in global_snapshot.values() if v.get("value") != "-"
     )
+    us_headline_lines = "\n".join(f"- {h['title']} ({h['press']})" for h in us_headlines[:12])
+    us_section = f"\n\n[미국 헤드라인]\n{us_headline_lines}" if us_headline_lines else ""
 
-    prompt = f"""아래는 오늘 수집된 국내 금융 뉴스 헤드라인과 글로벌 시장 지표다.
+    prompt = f"""아래는 오늘 수집된 국내 금융 뉴스 헤드라인, 글로벌 시장 지표, 미국 금융 뉴스 헤드라인이다.
 
 [국내 헤드라인]
 {headline_lines}
 
 [글로벌 지표]
-{snapshot_lines}
+{snapshot_lines}{us_section}
 
-이 내용을 바탕으로 오늘의 핵심 토픽 3~5개를 뽑아라. 각 토픽마다:
+이 내용을 바탕으로 오늘의 핵심 토픽 3~5개를 뽑아라. 국내 뉴스뿐 아니라 미국
+헤드라인 쪽도 같은 비중으로 검토해서, 지수 등락률만으로는 안 드러나는 개별
+종목의 급등락(예: 특정 기업의 임상 결과·실적 서프라이즈로 인한 폭등/폭락)처럼
+파급력이 큰 이벤트가 있다면 반드시 토픽 후보에 포함해라. 각 토픽마다:
 - topic: 토픽 제목 (10자 내외)
 - summary: 한 줄 요약 (40자 내외, 존댓말 아닌 개조식)
 - impact: 코스피/코스닥에 미칠 영향 방향 한 단어 ("긍정", "부정", "중립" 중 하나)"""
@@ -10448,6 +10511,7 @@ def render_market_pulse():
         if st.session_state.get("market_pulse_scanned"):
             if st.button("데이터 새로고침", key="market_pulse_refresh_btn", use_container_width=True):
                 fetch_market_news_naver.clear()
+                fetch_market_news_us.clear()
                 fetch_global_market_pulse.clear()
                 generate_ai_market_briefing.clear()
                 st.rerun()
@@ -10461,6 +10525,11 @@ def render_market_pulse():
 
     headlines = run_with_progress("국내 뉴스 · 글로벌 지표 수집 중...", fetch_market_news_naver)
     global_snapshot = fetch_global_market_pulse()
+    # [2026-08-20 추가] 미국 개별 종목 뉴스(지수엔 안 잡히는 급등락 이벤트)를
+    # AI 토픽 후보에 넣기 위해 별도 수집. 실패해도 국내 헤드라인만으로 브리핑은
+    # 정상 동작하므로(generate_ai_market_briefing의 us_headlines는 선택 인자),
+    # 여기서 실패를 조용히 넘어가도 무방하다.
+    us_headlines = fetch_market_news_us()
 
     # ── 글로벌 지표 카드 ──────────────────────────────────────────────
     st.subheader("🌐 글로벌 마켓 스냅샷")
@@ -10494,7 +10563,7 @@ def render_market_pulse():
     elif not headlines:
         st.warning("⚠️ 국내 뉴스 헤드라인을 불러오지 못해 AI 요약을 생성할 수 없습니다. 네이버 금융 서버 통신이 지연되고 있을 수 있습니다.")
     else:
-        topics, error_msg = generate_ai_market_briefing(headlines, global_snapshot)
+        topics, error_msg = generate_ai_market_briefing(headlines, global_snapshot, us_headlines)
         if not topics:
             st.warning("⚠️ AI 요약 생성에 실패했습니다. 잠시 후 '데이터 새로고침'을 눌러 다시 시도해주세요.")
             if error_msg:
@@ -10515,8 +10584,11 @@ def render_market_pulse():
                         )
         else:
             impact_style = {
-                "긍정": ("#DC2626", "#FEF2F2"),
-                "부정": ("#2563EB", "#EFF6FF"),
+                # ⚠️ [2026-08-20] AI 핫토픽 섹션에 한해 의도적으로 국제식 관례(초록=긍정, 빨강=부정) 적용.
+                # 앱의 다른 곳(등락률·수급 등)은 국내 관례(빨강=상승, 파랑=하락)를 그대로 유지함 — 서로
+                # 다른 규칙이니 헷갈리지 않도록 주의. 관련 논의: 이 섹션만 바꿔달라는 명시적 요청이 있었음.
+                "긍정": ("#16A34A", "#F0FDF4"),
+                "부정": ("#DC2626", "#FEF2F2"),
                 "중립": ("#64748B", "#F8FAFC"),
             }
             for t in topics:
