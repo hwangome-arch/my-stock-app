@@ -828,7 +828,7 @@ def fetch_market_index_table():
 # 📰 오늘의 마켓 브리핑 (국내 뉴스 + 글로벌 지표 + AI 요약)
 # =========================
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_market_news_naver(limit=12):
+def fetch_market_news_naver(limit=15):
     """네이버 금융 '주요뉴스' 목록에서 헤드라인/링크/언론사를 가져온다.
     AI 요약이 재료로 쓸 헤드라인 텍스트만 필요하므로 본문은 긁지 않는다
     (저작권/부하 둘 다 고려해 목록 페이지만 사용)."""
@@ -968,7 +968,7 @@ def fetch_global_market_pulse():
 @st.cache_data(ttl=1800, show_spinner=False)
 def generate_ai_market_briefing(headlines, global_snapshot, us_headlines=None):
     """국내 헤드라인 + 글로벌 지표 + 미국 헤드라인을 Google Gemini(Flash, 무료
-    티어 대상)에게 넘겨 '오늘의 핫 토픽' 3~5개 + 미증시 영향 코멘트를 JSON으로
+    티어 대상)에게 넘겨 '오늘의 핫 토픽' 5~6개 + 미증시 영향 코멘트를 JSON으로
     요약받는다.
 
     us_headlines: [2026-08-20 추가] fetch_market_news_us()의 결과(선택 인자,
@@ -1006,12 +1006,12 @@ def generate_ai_market_briefing(headlines, global_snapshot, us_headlines=None):
     except ImportError:
         return None, "google-genai 패키지가 설치되어 있지 않습니다. `pip install google-genai` 후 다시 시도해주세요."
 
-    headline_lines = "\n".join(f"- {h['title']} ({h['press']})" for h in headlines[:12])
+    headline_lines = "\n".join(f"- {h['title']} ({h['press']})" for h in headlines[:15])
     snapshot_lines = "\n".join(
         f"- {v['name']}: {v['value']} ({v['change_pct']})"
         for v in global_snapshot.values() if v.get("value") != "-"
     )
-    us_headline_lines = "\n".join(f"- {h['title']} ({h['press']})" for h in us_headlines[:12])
+    us_headline_lines = "\n".join(f"- {h['title']} ({h['press']})" for h in us_headlines[:15])
     us_section = f"\n\n[미국 헤드라인]\n{us_headline_lines}" if us_headline_lines else ""
 
     prompt = f"""아래는 오늘 수집된 국내 금융 뉴스 헤드라인, 글로벌 시장 지표, 미국 금융 뉴스 헤드라인이다.
@@ -1022,13 +1022,15 @@ def generate_ai_market_briefing(headlines, global_snapshot, us_headlines=None):
 [글로벌 지표]
 {snapshot_lines}{us_section}
 
-이 내용을 바탕으로 오늘의 핵심 토픽 3~5개를 뽑아라. 국내 뉴스뿐 아니라 미국
+이 내용을 바탕으로 오늘의 핵심 토픽 5~6개를 뽑아라. 국내 뉴스뿐 아니라 미국
 헤드라인 쪽도 같은 비중으로 검토해서, 지수 등락률만으로는 안 드러나는 개별
 종목의 급등락(예: 특정 기업의 임상 결과·실적 서프라이즈로 인한 폭등/폭락)처럼
 파급력이 큰 이벤트가 있다면 반드시 토픽 후보에 포함해라. 각 토픽마다:
 - topic: 토픽 제목 (10자 내외)
 - summary: 한 줄 요약 (40자 내외, 존댓말 아닌 개조식)
-- impact: 코스피/코스닥에 미칠 영향 방향 한 단어 ("긍정", "부정", "중립" 중 하나)"""
+- impact: 코스피/코스닥에 미칠 영향 방향 한 단어 ("긍정", "부정", "중립" 중 하나)
+- region: 이 토픽이 [국내 헤드라인]에서 나온 이슈면 "국내", [미국 헤드라인]이나
+  [글로벌 지표]에서 나온 이슈면 "해외" 중 하나로 표기"""
 
     try:
         client = genai.Client(api_key=api_key)
@@ -1048,8 +1050,9 @@ def generate_ai_market_briefing(headlines, global_snapshot, us_headlines=None):
                                     "topic": {"type": "STRING"},
                                     "summary": {"type": "STRING"},
                                     "impact": {"type": "STRING", "enum": ["긍정", "부정", "중립"]},
+                                    "region": {"type": "STRING", "enum": ["국내", "해외"]},
                                 },
-                                "required": ["topic", "summary", "impact"],
+                                "required": ["topic", "summary", "impact", "region"],
                             },
                         }
                     },
@@ -10498,7 +10501,7 @@ def render_fnguide():
 def render_market_pulse():
     st.header(
         "오늘의 마켓 브리핑",
-        help="""💡 **[오늘의 마켓 브리핑 안내]**\n\n국내 주요 뉴스와 미국 증시·환율·금리·유가 등 글로벌 지표를 한 화면에 모아 보여줍니다.\n\n'AI 핫 토픽 요약'은 수집된 헤드라인과 지표를 바탕으로 오늘 코스피/코스닥에 영향을 줄 만한 이슈를 3~5개로 정리해줍니다."""
+        help="""💡 **[오늘의 마켓 브리핑 안내]**\n\n국내 주요 뉴스와 미국 증시·환율·금리·유가 등 글로벌 지표를 한 화면에 모아 보여줍니다.\n\n'AI 핫 토픽 요약'은 수집된 헤드라인과 지표를 바탕으로 오늘 코스피/코스닥에 영향을 줄 만한 이슈를 5~6개로 정리해줍니다."""
     )
     st.markdown("<hr style='margin: 10px 0 25px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
 
@@ -10591,14 +10594,27 @@ def render_market_pulse():
                 "부정": ("#DC2626", "#FEF2F2"),
                 "중립": ("#64748B", "#F8FAFC"),
             }
+            # [2026-08-20 추가] 국내/해외 헤드라인이 섞이면서 어느 쪽 이슈인지 구분이 안
+            # 된다는 피드백 → impact(긍정/부정) 배지와는 별도로, 색이 겹치지 않도록
+            # 중립적인 톤(남색 계열)의 출처 배지를 하나 더 붙인다.
+            region_style = {
+                "국내": ("#334155", "#F1F5F9"),
+                "해외": ("#7C3AED", "#F5F3FF"),
+            }
             for t in topics:
                 impact = t.get("impact", "중립")
                 color, bg = impact_style.get(impact, impact_style["중립"])
+                region = t.get("region", "국내")
+                r_color, r_bg = region_style.get(region, region_style["국내"])
                 st.markdown(f"""
                     <div style="background:#FFFFFF; border:1px solid #E2E8F0; border-radius:10px;
                                 padding:12px 16px; margin-bottom:10px; display:flex; align-items:flex-start; gap:12px;">
-                        <span style="flex-shrink:0; background:{bg}; color:{color}; border-radius:6px; padding:3px 9px;
-                                     font-size:12px; font-weight:700; margin-top:1px;">{impact}</span>
+                        <div style="flex-shrink:0; display:flex; flex-direction:column; gap:4px; align-items:center; margin-top:1px;">
+                            <span style="background:{bg}; color:{color}; border-radius:6px; padding:3px 9px;
+                                         font-size:12px; font-weight:700; white-space:nowrap;">{impact}</span>
+                            <span style="background:{r_bg}; color:{r_color}; border-radius:6px; padding:2px 8px;
+                                         font-size:11px; font-weight:600; white-space:nowrap;">{region}</span>
+                        </div>
                         <div>
                             <div style="font-size:14px; font-weight:700; color:#111827; margin-bottom:2px;">{html_lib.escape(str(t.get('topic','')))}</div>
                             <div style="font-size:13px; color:#4B5563;">{html_lib.escape(str(t.get('summary','')))}</div>
