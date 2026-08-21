@@ -2064,6 +2064,44 @@ def _apply_forecast_valuation_fallback(rows, cols=('ROE', 'PER', 'PBR', '부채�
     return rows
 
 
+def _calc_period_growth(prev_series, latest_series):
+    """직전 기간 대비 증감률(YoY/QoQ)을 계산한다.
+
+    ⚠️ [버그 수정: 적자↔흑자 전환 구간에서 부호가 뒤집혀 표시되던 문제]
+    pandas의 pct_change()는 단순히 (현재-이전)/이전×100으로 계산하는데,
+    영업이익·순이익처럼 적자가 날 수 있는 지표는 '이전' 값이 음수일 때
+    이 공식이 그대로 부호를 뒤집어버린다. 예: 이전 -74억 → 이번 +70억
+    (실제로는 흑자 전환한 개선 상황)인데 (70-(-74))/(-74)×100 ≈ -194.6%로
+    계산되어, 마치 실적이 194.6% 나빠진 것처럼(🔻 빨간색) 표시됐다.
+
+    해결:
+    - 이전·이번이 서로 다른 부호(적자→흑자 또는 흑자→적자)면, 왜곡된 숫자
+      대신 '흑자전환'/'적자전환' 문자열을 반환한다. 이 구간은 통상적인
+      "%성장률" 개념 자체가 성립하지 않는 구간이라, 숫자보다 상태 전환을
+      그대로 알려주는 게 증권가 리포트 관례에도 맞고 오해도 없다.
+    - 이전·이번이 같은 부호(흑자→흑자, 적자→적자)면 분모에 절댓값을 써서
+      (latest-prev)/abs(prev)×100으로 계산한다. 예: 적자가 -100억→-50억으로
+      줄어든(개선된) 경우, 절댓값 분모를 쓰면 +50%(개선)로 올바르게 나오지만
+      pct_change() 그대로면 -50%(악화처럼 보임)로 잘못 나온다.
+      (AI 종합점수의 성장성 서브점수 계산(calc_financial_score_detailed)은
+      원래부터 이 방식을 쓰고 있어서 문제가 없었다 — 이번에 화면 표시 로직만
+      같은 방식으로 맞춘다.)
+
+    반환값은 float(정상 계산값) 또는 str('흑자전환'/'적자전환') 또는 NaN(직전값이
+    0이거나 없는 경우, 계산 불가)이 섞인 pandas Series."""
+    results = []
+    for prev, latest in zip(prev_series, latest_series):
+        if pd.isna(prev) or pd.isna(latest) or prev == 0:
+            results.append(float('nan'))
+        elif prev < 0 and latest > 0:
+            results.append('흑자전환')
+        elif prev > 0 and latest < 0:
+            results.append('적자전환')
+        else:
+            results.append((latest - prev) / abs(prev) * 100)
+    return pd.Series(results, index=prev_series.index if hasattr(prev_series, 'index') else None)
+
+
 def _fn_build_period_table(income_df, balance_df, valuation_df, is_quarter):
     """손익/재무상태/투자지표 테이블을 기간(연도·분기) 기준 한 표로 병합."""
     core_items = ['매출액', '영업이익', '당기순이익', '영업이익률', '순이익률', 'ROE', 'PER', 'PBR', '부채비율']
@@ -2109,7 +2147,7 @@ def _fn_build_period_table(income_df, balance_df, valuation_df, is_quarter):
 
     label = '성장률(QoQ)' if is_quarter else '성장률(YoY)'
     for col in ['매출액', '영업이익']:
-        out[f'{col} {label}'] = out[col].pct_change() * 100
+        out[f'{col} {label}'] = _calc_period_growth(out[col].shift(1), out[col])
 
     final_cols = ['연도/분기']
     for item in core_items:
@@ -2476,7 +2514,7 @@ def _naver_wise_build_period_table(real_df, col_period_pairs, is_quarter):
 
     label = '성장률(QoQ)' if is_quarter else '성장률(YoY)'
     for c in ['매출액', '영업이익']:
-        out[f'{c} {label}'] = out[c].pct_change() * 100
+        out[f'{c} {label}'] = _calc_period_growth(out[c].shift(1), out[c])
 
     final_cols = ['연도/분기']
     for item in _NAVER_WISE_CORE_ITEMS:
@@ -4478,6 +4516,14 @@ def draw_fnguide_details(code):
                         st.json(_fdbg3)
 
             def custom_formatter(val, col_name, is_est=False):
+                # ⚠️ 적자↔흑자 전환 구간은 _calc_period_growth가 숫자 대신
+                # '흑자전환'/'적자전환' 문자열을 반환한다(부호 왜곡 방지, 자세한
+                # 이유는 _calc_period_growth 주석 참고). float() 파싱 전에
+                # 먼저 이 문자열들을 가로채 이모지를 붙여준다.
+                if '성장률' in col_name and str(val).strip() in ('흑자전환', '적자전환'):
+                    prefix = "≈ " if is_est else ""
+                    emoji = "🔺" if val == '흑자전환' else "🔻"
+                    return f"{prefix}{emoji} {val}"
                 try:
                     clean_val = str(val).replace(',', '').strip()
                     f_val = float(clean_val)
@@ -9118,6 +9164,18 @@ def render_recommendations():
         if _need_ai_calc and (_bulk_scan_active or not display_df.empty) and not _reco_df.empty:
             _ai_calc_target_df = _reco_df if _bulk_scan_active else display_df
             _ai_score_map, _ai_still_loading, _ai_done, _ai_total, _ai_stalled = _render_ai_grade_filter_and_score(_ai_calc_target_df, _reco_df)
+            # ── [버그 수정: "AI 재무 데이터가 준비되지 않았습니다"가 배치 완료 후에도
+            # 계속 뜨던 문제] 위에서 계산된 _ai_score_map은 이 스코프 지역 변수라서,
+            # 카드 렌더링부(9428줄)가 "이미 계산됐는지" 확인할 때 조회하는
+            # st.session_state['_reco_ai_score_cache']에는 실제로 반영된 적이 없었다.
+            # 그래서 배치가 실제로 이 종목까지 끝났어도 항상 미완료로 오판되어
+            # "지금 불러오기" 버튼을 매번 눌러야 했다. 여기서 세션 캐시를 함께
+            # 채워서 다음 rerun부터 정상적으로 "이미 계산됨"을 인식하게 한다.
+            # (점수 계산이 실패(None)한 종목도 fetch_financial_data 자체는 이미
+            # 시도된 것이므로 함께 반영한다.)
+            _existing_reco_cache = st.session_state.get('_reco_ai_score_cache', {})
+            _existing_reco_cache.update(_ai_score_map)
+            st.session_state['_reco_ai_score_cache'] = _existing_reco_cache
             if _bulk_scan_active and not _ai_still_loading:
                 # 일괄 계산이 끝났으면 버튼 상태를 꺼서, 다음 rerun부터는 이
                 # 무거운 전체 재계산을 매번 반복하지 않고 캐시만 조회한다.
