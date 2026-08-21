@@ -113,6 +113,7 @@ primaryColor="#5A4EE5"
 backgroundColor="#F8FAFC"
 secondaryBackgroundColor="#0F141F"
 textColor="#111827"
+dataframeHeaderBackgroundColor="#F1F5F9"
 """
     _existing_theme_config = None
     if os.path.exists(config_path):
