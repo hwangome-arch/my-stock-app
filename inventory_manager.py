@@ -10693,7 +10693,7 @@ def render_dividend():
     )
     st.markdown("<hr style='margin: 10px 0 25px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
 
-    col_search, col_btn = st.columns([8, 1])
+    col_search, col_btn, col_scan = st.columns([6, 1, 2])
     with col_search:
         search_text = st.text_input(
             "검색",
@@ -10703,16 +10703,15 @@ def render_dividend():
         )
     with col_btn:
         st.button("조회", key="dividend_search_btn", use_container_width=True)
-
-    col_refresh, col_scan, col_caption2, col_toggle = st.columns([1.5, 1.5, 4, 1.5])
-    with col_refresh:
-        if st.button("데이터 새로고침", use_container_width=True):
+    with col_scan:
+        # [2026-08-21 수정] "배당 데이터 조회" 버튼을 검색창 옆 "조회" 버튼과
+        # 나란히 배치. 누를 때마다 캐시를 비우고 새로 조회하므로 새로고침
+        # 역할도 그대로 겸한다.
+        if st.button("🔍 순위 데이터 조회", key="dividend_scan_btn", type="primary", use_container_width=True):
             fetch_dividend_ranking.clear()
             st.session_state["dividend_scanned"] = True
-    with col_scan:
-        if not st.session_state.get("dividend_scanned"):
-            if st.button("🔍 배당 데이터 조회", key="dividend_manual_scan_btn", type="primary", use_container_width=True):
-                st.session_state["dividend_scanned"] = True
+
+    col_caption2, col_toggle = st.columns([8.5, 1.5])
     with col_toggle:
         st.markdown("<div style='display:flex; justify-content:flex-end; align-items:center; padding-top:4px; width:100%;'>", unsafe_allow_html=True)
         st.toggle(
@@ -10728,7 +10727,7 @@ def render_dividend():
     # 블로킹됐다. 그래서 다른 탭으로 빠르게 넘어가려 해도 이 스캔이 끝날 때까지 클릭이
     # 씹혔다. 이제는 사용자가 명시적으로 버튼을 눌러야만 스캔을 시작하도록 변경.
     if not st.session_state.get("dividend_scanned"):
-        st.info("💡 아직 배당 데이터를 조회하지 않았습니다. 위 [배당 데이터 조회] 버튼을 눌러 조회해주세요. (약 5~15초 소요)")
+        st.info("💡 아직 배당 데이터를 조회하지 않았습니다. 위 [순위 데이터 조회] 버튼을 눌러 조회해주세요. (약 5~15초 소요)")
         return
 
     df = run_with_progress("마켓 데이터 수집 중...", fetch_dividend_ranking)
