@@ -10689,7 +10689,7 @@ def render_market_pulse():
 def render_dividend():
     st.header(
         "실시간 배당 순위",
-        help="""💡 **[실시간 배당 순위 안내]**\n\n현재 주가 기준으로 가장 배당 매력이 높은 종목들을 순위별로 보여줍니다.\n\n'정상만 보기' 필터를 켜면 리츠(REITs)나 배당성향이 비정상적으로 높은(100% 초과) 위험 종목을 자동으로 제외하여 건강한 고배당주를 찾기 쉽습니다."""
+        help="""💡 **[실시간 배당 순위 안내]**\n\n현재 주가 기준으로 가장 배당 매력이 높은 종목들을 순위별로 보여줍니다.\n\n리츠(REITs)나 배당성향이 비정상적으로 높은(100% 초과) 종목, 배당수익률 30% 초과 등 비정상적인 값을 가진 종목은 자동으로 제외한 '정상' 데이터만 표시됩니다."""
     )
     st.markdown("<hr style='margin: 10px 0 25px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
 
@@ -10710,17 +10710,6 @@ def render_dividend():
         if st.button("🔍 순위 데이터 조회", key="dividend_scan_btn", type="primary", use_container_width=True):
             fetch_dividend_ranking.clear()
             st.session_state["dividend_scanned"] = True
-
-    col_caption2, col_toggle = st.columns([8.5, 1.5])
-    with col_toggle:
-        st.markdown("<div style='display:flex; justify-content:flex-end; align-items:center; padding-top:4px; width:100%;'>", unsafe_allow_html=True)
-        st.toggle(
-            "정상만 보기",
-            value=True,
-            key="dividend_clean_filter",
-            help="리츠(REITs) / 배당성향 100% 초과 / 배당수익률 30% 초과 종목을 제외합니다."
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
 
     # 🔧 [탭 이동 멈춤 대응] 예전에는 이 탭에 들어오기만 해도 fetch_dividend_ranking()이
     # 자동으로 실행되면서(네이버 배당 페이지 여러 장 병렬 스크래핑) 스크립트가 그 자리에서
@@ -10785,20 +10774,20 @@ def render_dividend():
             
         df = df[front_cols + cols]
 
-        clean_filter_val = st.session_state.get("dividend_clean_filter", True)
-        if clean_filter_val:
-            name_col = find_col(df, ["종목명"])
-            REIT_KEYWORDS = r'리츠|REIT|reit|부동산투자|리얼티'
-            if name_col:
-                df = df[~df[name_col].astype(str).str.contains(REIT_KEYWORDS, regex=True, case=False, na=False)]
-            payout_col = find_col(df, ["배당성향", "성향"])
-            if payout_col:
-                payout_num = pd.to_numeric(df[payout_col].astype(str).str.replace(r'[^\d.-]', '', regex=True), errors='coerce')
-                df = df[payout_num.isna() | (payout_num <= 100)]
-            yield_col = find_col(df, ["배당수익률", "수익률"])
-            if yield_col:
-                yield_num = pd.to_numeric(df[yield_col].astype(str).str.replace(r'[^\d.-]', '', regex=True), errors='coerce')
-                df = df[yield_num.isna() | (yield_num <= 30)]
+        # [2026-08-21 수정] '정상만 보기' 토글 제거, 항상 정상 데이터만 표시하도록 고정.
+        # (리츠/배당성향 100% 초과/배당수익률 30% 초과 종목은 항상 제외)
+        name_col = find_col(df, ["종목명"])
+        REIT_KEYWORDS = r'리츠|REIT|reit|부동산투자|리얼티'
+        if name_col:
+            df = df[~df[name_col].astype(str).str.contains(REIT_KEYWORDS, regex=True, case=False, na=False)]
+        payout_col = find_col(df, ["배당성향", "성향"])
+        if payout_col:
+            payout_num = pd.to_numeric(df[payout_col].astype(str).str.replace(r'[^\d.-]', '', regex=True), errors='coerce')
+            df = df[payout_num.isna() | (payout_num <= 100)]
+        yield_col = find_col(df, ["배당수익률", "수익률"])
+        if yield_col:
+            yield_num = pd.to_numeric(df[yield_col].astype(str).str.replace(r'[^\d.-]', '', regex=True), errors='coerce')
+            df = df[yield_num.isna() | (yield_num <= 30)]
 
         if search_text:
             name_col = find_col(df, ["종목명"])
@@ -10810,13 +10799,10 @@ def render_dividend():
                 mask = mask | df[code_col].astype(str).str.contains(search_text, case=False, na=False)
             df = df[mask]
 
-        with col_caption2:
-            st.markdown("<div style='padding-top:8px;'>", unsafe_allow_html=True)
-            if search_text:
-                st.caption(f"🔍 '{search_text}' 검색 결과 {len(df)}건")
-            elif clean_filter_val:
-                st.caption(f"ℹ️ 리츠·배당성향 100% 초과·수익률 30% 초과 종목 제외 후 {len(df)}건 표시 중")
-            st.markdown("</div>", unsafe_allow_html=True)
+        if search_text:
+            st.caption(f"🔍 '{search_text}' 검색 결과 {len(df)}건")
+        else:
+            st.caption(f"ℹ️ 리츠·배당성향 100% 초과·수익률 30% 초과 종목 제외 후 {len(df)}건 표시 중")
 
         st.dataframe(get_styled_dataframe(df), use_container_width=True, hide_index=True)
     else: 
