@@ -8543,7 +8543,11 @@ def pick_daily_highlight_stock(reco_df):
             continue
         code = str(row.get('종목코드', '')).zfill(6)
         entry = score_cache.get(code)
-        if not entry:
+        # [검수 2026-08-24] 캐시에 있기만 하면 무조건 썼던 걸 수정 — 다른 곳
+        # (_render_ai_grade_filter_and_score)과 동일하게 TTL(30분) 이내에 계산된
+        # "신선한" 점수만 인정한다. 그렇지 않으면 며칠 전, 예전 시세 기준으로
+        # 계산된 낡은 점수가 오늘 하이라이트에 그대로 노출될 수 있다.
+        if not _ai_cache_entry_fresh(entry):
             continue
         score = entry.get("score")
         if score is None or score < _HIGHLIGHT_MIN_SCORE:
