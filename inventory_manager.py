@@ -2105,7 +2105,12 @@ def _calc_period_growth(prev_series, latest_series):
 
 def _fn_build_period_table(income_df, balance_df, valuation_df, is_quarter):
     """손익/재무상태/투자지표 테이블을 기간(연도·분기) 기준 한 표로 병합."""
-    core_items = ['매출액', '영업이익', '당기순이익', '영업이익률', '순이익률', 'ROE', 'PER', 'PBR', '부채비율']
+    # ⚠️ [버그 수정 2026-08-24] 'EPS'가 core_items에 빠져 있어서 df_annual에
+    # EPS 컬럼 자체가 생성되지 않았다. 그 결과 calc_financial_score_detailed()의
+    # eps_col 탐색이 항상 실패해서, 실제 EPS가 얼마든(예: 적자기업의 -598원) 성장성
+    # 점수 중 EPS 항목(20점 만점)이 무조건 중립값(10점)으로 고정되는 문제가 있었다.
+    # valuation_df(ROE/PER/PBR과 같은 표)에 EPS 행이 이미 존재하므로 그대로 끌어온다.
+    core_items = ['매출액', '영업이익', '당기순이익', '영업이익률', '순이익률', 'ROE', 'PER', 'PBR', '부채비율', 'EPS']
 
     period_cols = [c for c in income_df.columns if re.match(r'^\d{4}/\d{2}(\(E\))?$', str(c))]
     rows = []
@@ -2124,6 +2129,9 @@ def _fn_build_period_table(income_df, balance_df, valuation_df, is_quarter):
         roe = _fn_lookup(valuation_df, 'ROE', c)
         per = _fn_lookup(valuation_df, 'PER(배)', c)
         pbr = _fn_lookup(valuation_df, 'PBR(배)', c)
+        # [버그 수정 2026-08-24] EPS는 _fn_build_dividend_table에서 이미 안정적으로
+        # 조회하던 방식(_fn_lookup_row_multi, 부분일치)을 그대로 재사용한다.
+        eps = _fn_lookup_row_multi(valuation_df, ['EPS'], c)
 
         # 연도/분기 라벨의 '(E)' 표기는 마지막에 붙여서 다시 표시하되, 마감 전
         # 기간 판별(_apply_forecast_valuation_fallback)은 원본 컬럼명 c로 판단해야
@@ -2133,7 +2141,7 @@ def _fn_build_period_table(income_df, balance_df, valuation_df, is_quarter):
             '연도/분기': c,
             '매출액': rev, '영업이익': op, '당기순이익': ni,
             '영업이익률': op_margin, '순이익률': ni_margin,
-            'ROE': roe, 'PER': per, 'PBR': pbr, '부채비율': debt_ratio,
+            'ROE': roe, 'PER': per, 'PBR': pbr, '부채비율': debt_ratio, 'EPS': eps,
         })
 
     # 🔧 [2026-08-06] 분기별 컨센서스에는 ROE/PER/PBR/부채비율 자체가 없는 경우가
@@ -2458,7 +2466,7 @@ _NAVER_WISE_HEADERS = {
 }
 
 _NAVER_WISE_CORE_ITEMS = ['매출액', '영업이익', '당기순이익', '영업이익률', '순이익률',
-                          'ROE', 'PER', 'PBR', '부채비율']
+                          'ROE', 'PER', 'PBR', '부채비율', 'EPS']
 
 
 def _naver_wise_lookup(df, row_label, col):
@@ -2470,6 +2478,28 @@ def _naver_wise_lookup(df, row_label, col):
         if isinstance(val, pd.Series):  # 중복 인덱스 방어
             val = val.iloc[0]
         return pd.to_numeric(str(val).replace(',', '').strip(), errors='coerce')
+    except Exception:
+        return float('nan')
+
+
+def _naver_wise_lookup_row_multi(df, keyword_candidates, col):
+    """df.index 중 keyword_candidates(부분 일치) 어느 하나라도 포함된 행을 찾아 값을 반환.
+    _fn_lookup_row_multi()의 네이버 WiseReport 버전. EPS처럼 정확한 행 이름이
+    'EPS(원)'인지 'EPS'인지 사이트마다 표기가 다를 수 있는 항목에 사용."""
+    try:
+        if df is None or df.empty or col not in df.columns:
+            return float('nan')
+        idx_str_list = [str(x) for x in df.index.tolist()]
+        for kw in keyword_candidates:
+            for idx_str, idx_orig in zip(idx_str_list, df.index.tolist()):
+                if kw in idx_str:
+                    val = df.loc[idx_orig, col]
+                    if isinstance(val, pd.Series):
+                        val = val.iloc[0]
+                    result = pd.to_numeric(str(val).replace(',', '').strip(), errors='coerce')
+                    if pd.notna(result):
+                        return result
+        return float('nan')
     except Exception:
         return float('nan')
 
@@ -2499,6 +2529,9 @@ def _naver_wise_build_period_table(real_df, col_period_pairs, is_quarter):
             'PER': _naver_wise_lookup(real_df, 'PER(배)', col),
             'PBR': _naver_wise_lookup(real_df, 'PBR(배)', col),
             '부채비율': _naver_wise_lookup(real_df, '부채비율', col),
+            # [버그 수정 2026-08-24] 정확일치 lookup 대신 부분일치 lookup 사용
+            # (행 이름이 'EPS(원)'일 가능성이 높아 정확일치로는 못 찾을 수 있음)
+            'EPS': _naver_wise_lookup_row_multi(real_df, ['EPS'], col),
         })
 
     # 🔧 [2026-08-06] 마감 전 마지막 기간(E)은 ROE/PER/PBR/부채비율 항목 자체가
@@ -7714,14 +7747,40 @@ def calc_financial_score_detailed(df_annual, roe, debt=None, return_breakdown=Fa
                 latest_rev = _to_float_safe(df_annual.iloc[-1]['매출액'])
                 if prev_rev not in (None, 0) and latest_rev is not None:
                     rev_growth = (latest_rev - prev_rev) / abs(prev_rev) * 100
-                    s_revenue = _lerp_score(rev_growth, [(-20, 0), (0, 5), (10, 12), (20, 20)])
+                    # ⚠️ [버그 수정 2026-08-24] 예전에는 매출 성장률만 보고 20/20 만점을
+                    # 줬다. 그래서 제넥신처럼 매출 +56%면서 영업손실 -362억인 종목도
+                    # 매출액 항목에서 그냥 만점을 받았다("외형만 커지는 성장"과 "돈을
+                    # 벌면서 크는 성장"이 구분 안 됨). 지금은 직전에 이미 계산해 둔
+                    # op_margin(영업이익률)이 적자면 매출 성장 점수의 만점 상한 자체를
+                    # 절반(10점)으로 낮춘다 — 매출이 늘어난 사실 자체는 여전히 인정하되,
+                    # 적자인 채로 외형만 커지는 것에 정상 성장과 같은 가중치를 주지 않는다.
+                    if op_margin is not None and op_margin < 0:
+                        s_revenue = _lerp_score(rev_growth, [(-20, 0), (0, 2.5), (10, 6), (20, 10)])
+                    else:
+                        s_revenue = _lerp_score(rev_growth, [(-20, 0), (0, 5), (10, 12), (20, 20)])
 
             if '영업이익' in df_annual.columns:
                 prev = _to_float_safe(df_annual.iloc[-2]['영업이익'])
                 latest = _to_float_safe(df_annual.iloc[-1]['영업이익'])
                 if prev not in (None, 0) and latest is not None:
                     growth = (latest - prev) / abs(prev) * 100
-                    s_op = _lerp_score(growth, [(-30, 0), (0, 6), (10, 18), (20, 30)])
+                    # ⚠️ [버그 수정 2026-08-24] 예전 공식은 부호 구분 없이 그냥
+                    # (latest-prev)/abs(prev)만 봐서, "적자 -412억 → -362억으로 폭이
+                    # 줄어든 것"과 "실제로 흑자가 늘어난 것"을 구분하지 못했다. 제넥신
+                    # 같은 경우 적자폭 12% 축소만으로도 30점 만점 중 20점 넘게 받았다.
+                    # 지금은 세 경우를 구분한다:
+                    #  1) 적자 지속(prev<0, latest<0): 적자가 줄었어도 '성장'이 아니라
+                    #     '개선'일 뿐이므로 만점 상한을 절반(15점)으로 제한. 적자가 더
+                    #     커졌으면 기존과 동일하게 낮은 점수.
+                    #  2) 적자→흑자 전환(prev<0, latest>=0): 실질적 턴어라운드이므로
+                    #     만점 인정.
+                    #  3) 기존 흑자 상태의 통상적 성장(prev>=0): 기존 로직 그대로 유지.
+                    if prev < 0 and latest < 0:
+                        s_op = _lerp_score(growth, [(-30, 0), (0, 3), (10, 9), (20, 15)])
+                    elif prev < 0 and latest >= 0:
+                        s_op = 30.0
+                    else:
+                        s_op = _lerp_score(growth, [(-30, 0), (0, 6), (10, 18), (20, 30)])
 
             eps_col = next((c for c in df_annual.columns if 'EPS' in str(c)), None)
             if eps_col:
@@ -7775,13 +7834,27 @@ def calc_valuation_score_detailed(per, pbr, roe, div=None):
     됐던 값). 배당수익률은 '싸게 사는지'를 보는 밸류 관점에도 들어맞는 지표라 여기에
     가산점으로 추가했다."""
     try:
-        if per is None or per <= 0:
+        # ⚠️ [버그 수정 2026-08-24] 예전엔 per<=0을 전부 '데이터 없음'으로 간주해
+        # 중립 20점을 줬다. 그런데 get_ai_diagnosis_inputs()에서 PER 원본이 없을 때의
+        # 기본값도 0.0이고, 실제로 적자기업이라 PER이 마이너스로 계산된 경우도 여기서
+        # 똑같이 <=0으로 걸려서 두 경우가 구분이 안 됐다(제넥신처럼 실적이 적자인
+        # 종목이 '데이터 없음'과 동일하게 중립점수를 받아 밸류 점수가 부풀려지는
+        # 원인 중 하나). 같은 함수 안에서 ROE는 이미 -999(결측 전용 센티널)와 실제
+        # 마이너스 ROE를 구분해서 처리하고 있어서, PER/PBR도 동일한 원칙으로 맞춘다:
+        # per==0.0(결측 기본값)은 중립, per<0(실제 적자로 계산된 음수)은 낮은 점수.
+        if per is None or per == 0.0:
             s_per = 20.0
+        elif per < 0:
+            s_per = 0.0  # 실제 적자 → '저평가'가 아니라 이익 자체가 없다는 나쁜 신호
         else:
             s_per = _lerp_score(per, [(8, 50), (12, 40), (18, 30), (25, 10), (40, 0)])
 
-        if pbr is None or pbr <= 0:
+        # PBR이 마이너스인 경우는 자기자본이 마이너스(자본잠식)라는 뜻이라 PER 적자보다도
+        # 심각한 신호다. 마찬가지로 결측(0.0)과 구분해서 낮은 점수를 준다.
+        if pbr is None or pbr == 0.0:
             s_pbr = 10.0
+        elif pbr < 0:
+            s_pbr = 0.0  # 자본잠식
         else:
             s_pbr = _lerp_score(pbr, [(1, 30), (1.5, 20), (2.5, 10), (4, 0)])
 
@@ -8051,6 +8124,11 @@ def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=
 
     df_annual을 미리 전달하면(재무 데이터를 이미 조회한 경우) 재조회를 생략한다.
 
+    ⚠️ [2026-08-24 추가] 반환 dict에 기업체력/모멘텀 분리 점수를 추가했다:
+        fundamental_score(0~300) / fundamental_100(0~100) = 재무+밸류
+        momentum_score(0~700) / momentum_100(0~100) = 추세+수급+거래량+모멘텀+AI패턴+리스크
+    기존 total(0~1000, 통합점수)은 그대로 유지된다.
+
     ⚠️ [내부 호출 재병렬화 — 2026-08-18] 2026-08-12에는 이 4개 네트워크 호출
     (가격이력·스파크라인·재무·수급)을 get_orchestration_executor()로 동시에
     던졌다가, 그 풀이 다시 get_shared_executor()를 기다리고 AI 점수 배치
@@ -8109,6 +8187,28 @@ def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=
 
     total = int(round(max(0, min(1000, trend + flow + volume + financial + valuation + momentum + pattern + risk))))
 
+    # ── [2026-08-24 추가] 기업체력 / 모멘텀 분리 점수 ──────────────────────
+    # 배경: 통합 total(1000점)은 '지금 주가가 얼마나 뜨거운가'(추세·수급·거래량·
+    # 모멘텀·AI패턴·리스크 = 최대 700점, 리스크 포함 시 -80~700)가 '회사가 실제로
+    # 괜찮은가'(재무·밸류 = 최대 300점)보다 압도적으로 비중이 커서, 재무는 부실해도
+    # 주가 움직임만 강하면 총점이 삼성전자 같은 우량주보다 높게 나올 수 있다
+    # (실제로 제넥신 사례에서 확인됨). 사용자가 '재무는 나쁜데 왜 총점이 높지?'를
+    # 오해 없이 바로 볼 수 있도록, 총점을 대체하지 않고 별도의 두 축을 추가한다.
+    #  - fundamental(기업체력): 재무 + 밸류. 0~300점, 0~100 환산값도 함께 제공.
+    #  - momentum_combined(모멘텀): 추세+수급+거래량+모멘텀+AI패턴+리스크.
+    #    -80~700점, 0~100 환산값도 함께 제공(리스크 감점 포함 후 0~700 구간으로 클램프).
+    # ⚠️ 기존 total(통합 1000점)은 하위 호환을 위해 그대로 유지한다 — 스크리너 정렬,
+    # 추천종목 필터, 등급 배지 등 기존에 total을 참조하는 코드는 지금 당장 건드리지
+    # 않아도 계속 정상 동작한다.
+    fundamental = round(financial + valuation, 1)
+    fundamental_max = 300
+    fundamental_100 = round(max(0, min(100, fundamental / fundamental_max * 100)), 1)
+
+    momentum_combined = round(trend + flow + volume + momentum + pattern + risk, 1)
+    momentum_combined_max = 700
+    momentum_combined = max(0.0, min(momentum_combined_max, momentum_combined))
+    momentum_combined_100 = round(momentum_combined / momentum_combined_max * 100, 1)
+
     return {
         "total": total,
         "trend": trend,         "trend_max": 200,    "trend_min": 0,
@@ -8119,6 +8219,9 @@ def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=
         "momentum": momentum,   "momentum_max": 100, "momentum_min": 0,
         "pattern": pattern,     "pattern_max": 100,  "pattern_min": 0,
         "risk": risk,           "risk_max": 0,       "risk_min": -80,
+        # ── 기업체력 / 모멘텀 분리 점수 (신규) ──
+        "fundamental_score": fundamental, "fundamental_max": fundamental_max, "fundamental_100": fundamental_100,
+        "momentum_score": momentum_combined, "momentum_score_max": momentum_combined_max, "momentum_100": momentum_combined_100,
         "debug": _ai_score_debug_info(df_price, kospi_closes, debt, drop_pct),
     }
 
@@ -8917,6 +9020,38 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         '</style>'
     )
 
+    # ── [2026-08-24 추가] 기업체력 / 모멘텀 요약 바 ──────────────────────────
+    # 통합 total(1000점) 하나만 보여주면 "재무는 나쁜데 왜 점수가 높지?"를 8개
+    # 세부항목을 일일이 뜯어봐야만 알 수 있었다. 재무+밸류(기업체력)와 나머지
+    # 6개 기술적 항목(모멘텀)을 각각 0~100으로 정규화해 총점 바로 아래 두 줄
+    # 요약 바로 보여줘서, 총점이 어느 쪽에 기대어 나온 숫자인지 한눈에 보이게 한다.
+    def _mini_bar(label, val_100, icon):
+        if val_100 >= 65:   bar_color = "#16A34A"
+        elif val_100 >= 40:  bar_color = "#D97706"
+        else:                bar_color = "#DC2626"
+        return (
+            '<div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">'
+            f'<div style="width:76px; font-size:11.5px; color:#475569; font-weight:600;">{icon} {label}</div>'
+            '<div style="flex:1; background:#F1F5F9; border-radius:4px; height:8px;">'
+            f'<div style="width:{val_100}%; background:{bar_color}; border-radius:4px; height:8px;"></div>'
+            '</div>'
+            f'<div style="width:44px; font-size:11.5px; color:#334155; font-weight:700; text-align:right;">{val_100:.0f}/100</div>'
+            '</div>'
+        )
+
+    fundamental_100 = detailed.get("fundamental_100", 0.0)
+    momentum_100 = detailed.get("momentum_100", 0.0)
+    split_html = (
+        '<div style="background:#FFFFFF; border:1px solid #E2E8F0; border-radius:8px; '
+        'padding:10px 12px 4px; margin-bottom:12px;">'
+        '<div style="font-size:10.5px; color:#94A3B8; margin-bottom:8px;">'
+        '재무·밸류(기업체력)와 추세·수급·거래량·모멘텀·패턴·리스크(모멘텀)를 각각 100점 만점으로 나눠서 봅니다. '
+        '기업체력은 낮은데 모멘텀만 높으면, 회사보다는 지금 주가 흐름이 뜨거운 종목이라는 뜻입니다.</div>'
+        + _mini_bar("기업체력", fundamental_100, "🏢")
+        + _mini_bar("모멘텀", momentum_100, "🚀")
+        + '</div>'
+    )
+
     html = (
         TOOLTIP_CSS +
         '<div style="background:#FAFBFF; border:1px solid #C7D2FE; border-radius:10px; padding:18px 20px; margin-top:12px;">'
@@ -8929,6 +9064,7 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         '<div style="font-size:14px; font-weight:700; color:#0F172A;">AI 종합 점수' + grade_badge + '</div>'
         '<div style="font-size:12px; color:' + total_color + '; font-weight:600;">● ' + total_label + '</div>'
         '</div></div>'
+        + split_html +
         '<div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">'
         + cat_cards +
         '</div>'
