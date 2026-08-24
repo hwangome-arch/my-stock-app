@@ -10774,6 +10774,42 @@ def render_market_pulse():
         _hl_per = _hl_row.get('PER', 0)
         _hl_pbr = _hl_row.get('PBR', 0)
         _hl_roe = _hl_row.get('ROE', 0)
+        # [2026-08-24 추가] 오늘 현재가·등락 정보. reco_df의 현재가_num은 마지막
+        # 스캔 시점 스냅샷이라 시간이 지나면 오래된 값일 수 있어서, 종목 헤더에서
+        # 쓰는 실시간 현재가 조회(fetch_current_price_info, 60초 캐시)로 갱신한다.
+        # 실패하면 스캔 당시 값으로 폴백. (다른 곳과 동일하게 국내 관례: 빨강=상승,
+        # 파랑=하락)
+        try:
+            _hl_price_info = fetch_current_price_info(_hl_code)
+        except Exception:
+            _hl_price_info = {"price": None}
+        if _hl_price_info.get("price") is not None:
+            _p_color = {"up": "#DC2626", "down": "#2563EB", "neutral": "#64748B"}[_hl_price_info["status"]]
+            _p_arrow = {"up": "▲", "down": "▼", "neutral": "-"}[_hl_price_info["status"]]
+            _p_sign = "+" if _hl_price_info["diff"] >= 0 else ""
+            _hl_price_line = (
+                f'{_hl_price_info["price"]:,.0f}원 '
+                f'<span style="color:{_p_color}; font-weight:700;">{_p_arrow} {_p_sign}{_hl_price_info["diff"]:,.0f}'
+                f' ({_p_sign}{_hl_price_info["diff_pct"]:.2f}%)</span>'
+            )
+        else:
+            _hl_price_line = f'{_hl_price:,.0f}원'
+        # [2026-08-24 추가] 어떤 회사인지 감이 안 온다는 피드백 → 기업정보 탭에서
+        # 이미 쓰고 있는 fetch_company_info_fnguide()의 기업개요를 그대로 재사용
+        # (종목 1개뿐이라 부담 적음). 카드가 너무 길어지지 않도록 앞부분만 잘라
+        # 보여주고, 실패해도(네트워크 오류 등) 카드 자체는 그대로 뜨게 폴백한다.
+        _hl_summary = ""
+        try:
+            _hl_info = fetch_company_info_fnguide(_hl_code)
+            _hl_summary_raw = (_hl_info.get("summary") or "").strip()
+            if _hl_summary_raw and "제공된 기업개요가 없습니다" not in _hl_summary_raw:
+                _hl_summary = (_hl_summary_raw[:90] + "…") if len(_hl_summary_raw) > 90 else _hl_summary_raw
+        except Exception:
+            _hl_summary = ""
+        _hl_summary_html = (
+            f'<div style="font-size:12.5px; color:#64748B; margin-top:6px; line-height:1.5;">📖 {html_lib.escape(_hl_summary)}</div>'
+            if _hl_summary else ""
+        )
         st.markdown(f"""
             <div style="background:#FFFFFF; border:1.5px solid #5A4EE5; border-radius:14px;
                         padding:16px 18px; margin-bottom:6px;">
@@ -10790,8 +10826,8 @@ def render_market_pulse():
                     </div>
                 </div>
                 <div style="font-size:13px; color:#4B5563; margin-top:10px;">
-                    현재가 {_hl_price:,.0f}원 · PER {_hl_per:.1f} · PBR {_hl_pbr:.2f} · ROE {_hl_roe:.1f}%
-                </div>
+                    현재가 {_hl_price_line} · PER {_hl_per:.1f} · PBR {_hl_pbr:.2f} · ROE {_hl_roe:.1f}%
+                </div>{_hl_summary_html}
             </div>
         """, unsafe_allow_html=True)
         st.caption("💡 추천종목 탭 기준(저평가 등급 C급 이상 + AI 종합점수 500점 이상)을 통과한 종목 중 매일 하나를 참고용으로 보여드려요. 투자 조언이 아니며, 매수 추천이 아닙니다.")
