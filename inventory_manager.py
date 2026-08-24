@@ -10638,6 +10638,14 @@ def render_market_pulse():
                 "국내": ("#334155", "#F1F5F9"),
                 "해외": ("#7C3AED", "#F5F3FF"),
             }
+            # ── [2026-08-24 추가] 국내/해외 번갈아 배치 ──────────────────────
+            # Gemini가 반환하는 topics 순서는 국내/해외가 뒤섞여 랜덤하게 나온다.
+            # "국내 → 해외 → 국내 → 해외..." 순으로 보이도록, 각 region 내에서는
+            # 원래(=AI가 매긴 중요도) 순서를 그대로 유지한 채 교대로 재배치한다.
+            # 한쪽이 먼저 소진되면 남은 쪽을 이어서 붙인다.
+            _domestic = [t for t in topics if t.get("region", "국내") == "국내"]
+            _overseas = [t for t in topics if t.get("region", "국내") == "해외"]
+            topics = [t for pair in zip_longest(_domestic, _overseas) for t in pair if t is not None]
             for t in topics:
                 impact = t.get("impact", "중립")
                 color, bg = impact_style.get(impact, impact_style["중립"])
