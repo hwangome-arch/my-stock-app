@@ -10796,14 +10796,14 @@ def render_market_pulse():
             _hl_price_line = f'{_hl_price:,.0f}원'
         # [2026-08-24 추가] 어떤 회사인지 감이 안 온다는 피드백 → 기업정보 탭에서
         # 이미 쓰고 있는 fetch_company_info_fnguide()의 기업개요를 그대로 재사용
-        # (종목 1개뿐이라 부담 적음). 카드가 너무 길어지지 않도록 앞부분만 잘라
-        # 보여주고, 실패해도(네트워크 오류 등) 카드 자체는 그대로 뜨게 폴백한다.
+        # (종목 1개뿐이라 부담 적음). 잘리면 답답하다는 요청으로 자르지 않고
+        # 전체 다 보여준다. 실패해도(네트워크 오류 등) 카드 자체는 그대로 뜨게 폴백한다.
         _hl_summary = ""
         try:
             _hl_info = fetch_company_info_fnguide(_hl_code)
             _hl_summary_raw = (_hl_info.get("summary") or "").strip()
             if _hl_summary_raw and "제공된 기업개요가 없습니다" not in _hl_summary_raw:
-                _hl_summary = (_hl_summary_raw[:90] + "…") if len(_hl_summary_raw) > 90 else _hl_summary_raw
+                _hl_summary = _hl_summary_raw
         except Exception:
             _hl_summary = ""
         _hl_summary_html = (
@@ -10817,6 +10817,7 @@ def render_market_pulse():
                     <div>
                         <span style="font-size:16px; font-weight:800; color:#111827;">{html_lib.escape(str(_hl_name))}</span>
                         <span style="font-size:12.5px; color:#94A3B8; margin-left:6px;">{_hl_code}</span>
+                        <span style="font-size:14px; margin-left:10px;">{_hl_price_line}</span>
                     </div>
                     <div style="display:flex; align-items:center; gap:8px;">
                         <span style="background:{_hl_grade_label[1]}1A; color:{_hl_grade_label[1]}; border-radius:6px;
@@ -10826,7 +10827,7 @@ def render_market_pulse():
                     </div>
                 </div>
                 <div style="font-size:13px; color:#4B5563; margin-top:10px;">
-                    현재가 {_hl_price_line} · PER {_hl_per:.1f} · PBR {_hl_pbr:.2f} · ROE {_hl_roe:.1f}%
+                    PER {_hl_per:.1f} · PBR {_hl_pbr:.2f} · ROE {_hl_roe:.1f}%
                 </div>{_hl_summary_html}
             </div>
         """, unsafe_allow_html=True)
