@@ -8480,6 +8480,87 @@ def _ai_cache_entry_fresh(entry, ttl=AI_SCORE_CACHE_TTL):
     return isinstance(entry, dict) and "ts" in entry and (time.time() - entry["ts"]) < ttl
 
 
+def assign_valuation_grade(row, is_strict=True):
+    """저평가 등급(S~D) 판정 로직. render_recommendations() 안의 동명 로직(assign_grade)과
+    완전히 동일한 기준이며, 다른 곳(오늘의 브리핑 종목 하이라이트 등)에서도 재사용할 수
+    있도록 모듈 레벨 함수로 뽑아냈다. 기존 render_recommendations 쪽 코드는 그대로 두고
+    건드리지 않았다(회귀 위험 최소화 목적) — 두 함수는 로직만 같고 서로 독립적이다.
+    반환값: "S"/"A"/"B"/"C"/"D" 중 하나, 조건 미달 시 None."""
+    try:
+        per, pbr, roe, debt, drop, div = (
+            row['PER'], row['PBR'], row['ROE'], row['부채비율'], row['고점 / 하락률'], row['배당수익률']
+        )
+    except Exception:
+        return None
+    try:
+        if any(pd.isna(v) for v in (per, pbr, roe, debt, drop, div)):
+            return None
+    except Exception:
+        return None
+
+    s_debt = 100 if is_strict else 300
+    a_debt = 120 if is_strict else 300
+    b_debt = 150 if is_strict else 300
+    c_debt = 200 if is_strict else 300
+    d_debt = 300
+
+    if per <= 8 and pbr <= 0.8 and roe >= 12 and debt <= s_debt and drop <= -20.0 and div >= 3.0:
+        return "S"
+    elif per <= 12 and pbr <= 1.2 and roe >= 10 and debt <= a_debt and drop <= -15.0 and div >= 1.5:
+        return "A"
+    elif per <= 15 and pbr <= 1.5 and roe >= 8 and debt <= b_debt and drop <= -10.0:
+        return "B"
+    elif per <= 25 and pbr <= 2.5 and roe >= 5 and debt <= c_debt and drop <= -5.0:
+        return "C"
+    elif per <= 40 and pbr <= 4.0 and roe >= 0 and debt <= d_debt and drop <= 0.0:
+        return "D"
+    return None
+
+
+# ── [오늘의 브리핑] 종목 하이라이트 1개 뽑기 ──────────────────────────────────
+# 조건: 저평가 등급 C급 이상 AND AI 종합점수 500점 이상. AI 종합점수는 여기서
+# 새로 계산하지 않고(종목당 야후/네이버/재무 조회가 필요해 무거움) 이미 계산돼
+# 디스크에 캐싱된 값만 사용한다 — 캐시에 없는 종목(아직 AI 점수 배치 계산이 안
+# 돈 종목)은 후보에서 자연히 제외된다. 조건을 만족하는 종목을 점수 내림차순으로
+# 최대 20개까지 추린 뒤, '오늘 날짜'를 시드로 고정한 랜덤으로 하나를 뽑는다 —
+# 같은 날 여러 번 다시 봐도 같은 종목이 나오고, 하루가 지나면 자연스럽게 다른
+# 종목으로 바뀐다(페이지 새로고침마다 바뀌면 "왜 매번 다르지" 하는 혼란을 줄인다).
+_HIGHLIGHT_MIN_SCORE = 500
+_HIGHLIGHT_MIN_GRADES = {"S", "A", "B", "C"}  # C급 이상
+_HIGHLIGHT_TOP_N = 20
+
+
+def pick_daily_highlight_stock(reco_df):
+    """조건을 만족하는 종목이 없으면 (None, None, None)을 반환한다."""
+    if reco_df is None or reco_df.empty:
+        return None, None, None
+
+    score_cache = _load_ai_score_disk_cache()
+    candidates = []
+    for _, row in reco_df.iterrows():
+        grade = assign_valuation_grade(row, is_strict=True)
+        if grade not in _HIGHLIGHT_MIN_GRADES:
+            continue
+        code = str(row.get('종목코드', '')).zfill(6)
+        entry = score_cache.get(code)
+        if not entry:
+            continue
+        score = entry.get("score")
+        if score is None or score < _HIGHLIGHT_MIN_SCORE:
+            continue
+        candidates.append((score, grade, row))
+
+    if not candidates:
+        return None, None, None
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    top = candidates[:_HIGHLIGHT_TOP_N]
+
+    seed = datetime.date.today().isoformat()
+    picked_score, picked_grade, picked_row = random.Random(seed).choice(top)
+    return picked_row, picked_score, picked_grade
+
+
 def _flush_ai_score_partial(scores):
     """지금까지 새로 계산된 부분 결과를 디스크 캐시에 병합 저장한다(기존에 남아있는
     신선한 항목은 그대로 두고, 새로 계산된 것만 갱신). 배치 계산 도중(청크마다)
@@ -10669,6 +10750,52 @@ def render_market_pulse():
             st.caption("⚠️ AI가 생성한 요약으로, 실제 시장 상황과 다를 수 있습니다. 투자 판단은 원문 뉴스를 함께 확인해주세요.")
 
     st.markdown("<div style='margin-top:10px;'></div>", unsafe_allow_html=True)
+
+    # ── [신규 2026-08-24] 오늘의 종목 하이라이트 ─────────────────────────
+    # 추천종목 후보(최대 300개) 중 저평가 등급 C급 이상 + AI 종합점수 500점 이상을
+    # 만족하는 종목을 상위 20개까지 추린 뒤 하루 단위로 랜덤 하나를 보여준다.
+    # 완전 무작위가 아니라 두 축(밸류+AI점수)을 통과한 종목 중에서만 고르므로
+    # 품질 하한선은 지키면서도, 매번 똑같은 1등 종목만 반복 노출되는 걸 피한다.
+    # (추천종목 탭에서 이미 검증된 등급 로직·AI점수 캐시를 그대로 재사용 — 새
+    # 네트워크 호출 없음)
+    _highlight_reco_df = load_reco_df()
+    _hl_row, _hl_score, _hl_grade = pick_daily_highlight_stock(_highlight_reco_df)
+    if _hl_row is not None:
+        st.subheader("🎯 오늘의 종목 하이라이트")
+        _hl_grade_label = {
+            "S": ("💎 S급 초저평가 고배당", "#7C3AED"),
+            "A": ("🥇 A급 우량 가치주", "#2563EB"),
+            "B": ("🥈 B급 적정 가치주", "#16A34A"),
+            "C": ("🥉 C급 성장 기대주", "#D97706"),
+        }.get(_hl_grade, ("-", "#64748B"))
+        _hl_name = _hl_row.get('종목명', '-')
+        _hl_code = str(_hl_row.get('종목코드', '')).zfill(6)
+        _hl_price = _hl_row.get('현재가_num', 0)
+        _hl_per = _hl_row.get('PER', 0)
+        _hl_pbr = _hl_row.get('PBR', 0)
+        _hl_roe = _hl_row.get('ROE', 0)
+        st.markdown(f"""
+            <div style="background:#FFFFFF; border:1.5px solid #5A4EE5; border-radius:14px;
+                        padding:16px 18px; margin-bottom:6px;">
+                <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:8px;">
+                    <div>
+                        <span style="font-size:16px; font-weight:800; color:#111827;">{html_lib.escape(str(_hl_name))}</span>
+                        <span style="font-size:12.5px; color:#94A3B8; margin-left:6px;">{_hl_code}</span>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:8px;">
+                        <span style="background:{_hl_grade_label[1]}1A; color:{_hl_grade_label[1]}; border-radius:6px;
+                                     padding:3px 9px; font-size:12px; font-weight:700; white-space:nowrap;">{_hl_grade_label[0]}</span>
+                        <span style="background:#5A4EE51A; color:#5A4EE5; border-radius:6px; padding:3px 9px;
+                                     font-size:12px; font-weight:700; white-space:nowrap;">AI {_hl_score:.0f}점</span>
+                    </div>
+                </div>
+                <div style="font-size:13px; color:#4B5563; margin-top:10px;">
+                    현재가 {_hl_price:,.0f}원 · PER {_hl_per:.1f} · PBR {_hl_pbr:.2f} · ROE {_hl_roe:.1f}%
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+        st.caption("💡 추천종목 탭 기준(저평가 등급 C급 이상 + AI 종합점수 500점 이상)을 통과한 종목 중 매일 하나를 참고용으로 보여드려요. 투자 조언이 아니며, 매수 추천이 아닙니다.")
+        st.markdown("<div style='margin-top:10px;'></div>", unsafe_allow_html=True)
 
     # ── 원문 헤드라인 목록 ────────────────────────────────────────────
     st.subheader("📰 국내 주요 뉴스")
