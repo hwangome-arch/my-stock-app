@@ -4161,25 +4161,20 @@ def _format_probability_fun_card(result, target_price, target_src="목표가", c
     best_h = max(horizons, key=lambda h: probs.get(h, 0))
 
     cards_html = ""
-    _used_fun_phrases = set()
     _BEST_ACCENT = "#5A4EE5"  # 강조 색상: 감성 라벨(tier) 없이 브랜드 컬러로 고정
     for h in horizons:
         pct = probs.get(h, 0)
-        fun_phrase = _probability_fun_comparison(pct, exclude=_used_fun_phrases)
-        _used_fun_phrases.add(fun_phrase)
         is_best = (h == best_h)
         border = f"1.5px solid {_BEST_ACCENT}" if is_best else "1px solid #E2E8F0"
         bg = f"{_BEST_ACCENT}0D" if is_best else "#FFFFFF"
         label_color = _BEST_ACCENT if is_best else "#94A3B8"
         value_color = _BEST_ACCENT if is_best else "#0F172A"
-        sub_color = _BEST_ACCENT if is_best else "#94A3B8"
         cards_html += (
             f'<div style="flex:1; text-align:center; padding:16px 10px; background:{bg}; '
             f'border:{border}; border-radius:12px;">'
             f'<div style="font-size:11.5px; color:{label_color}; font-weight:700; margin-bottom:6px;">'
             f'{horizon_labels[h]}</div>'
-            f'<div style="font-size:24px; font-weight:800; color:{value_color};">{pct:.0f}%</div>'
-            f'<div style="font-size:14px; color:{sub_color}; font-weight:700; margin-top:5px; line-height:1.4;">{fun_phrase}</div>'
+            f'<div style="font-size:32px; font-weight:800; color:{value_color};">{pct:.0f}%</div>'
             '</div>'
         )
 
@@ -4194,25 +4189,20 @@ def _format_probability_fun_card(result, target_price, target_src="목표가", c
     peak_day = result.get("peak_day")
     peak_prob = result.get("peak_prob")
     if peak_day is not None and peak_prob is not None:
-        _peak_fun_phrase = _probability_fun_comparison(peak_prob, exclude=_used_fun_phrases)
-        _used_fun_phrases.add(_peak_fun_phrase)
         _peak_months = peak_day / 30.4
         peak_day_html = f'{peak_day}일 후(약 {_peak_months:.1f}개월)'
         peak_value_html = f'{peak_prob:.0f}%'
-        peak_phrase_html = _peak_fun_phrase
     else:
         peak_day_html = '1년 내'
         peak_value_html = '—'
-        peak_phrase_html = '계속 오름세예요'
 
     cards_html += (
         f'<div style="flex:1; text-align:center; padding:16px 10px; background:{_PEAK_ACCENT}0D; '
         f'border:1.5px solid {_PEAK_ACCENT}; border-radius:12px;">'
         f'<div style="font-size:12px; color:{_PEAK_ACCENT}; font-weight:600; margin-bottom:6px;">{peak_day_html}</div>'
-        f'<div style="font-size:24px; font-weight:800; color:{_PEAK_ACCENT};">{peak_value_html}</div>'
+        f'<div style="font-size:32px; font-weight:800; color:{_PEAK_ACCENT};">{peak_value_html}</div>'
         f'<div style="font-size:11.5px; color:{_PEAK_ACCENT}; font-weight:700; margin-top:6px;">'
         f'🏔️ 확률 최고 시점</div>'
-        f'<div style="font-size:14px; color:{_PEAK_ACCENT}; font-weight:700; margin-top:5px; line-height:1.4;">{peak_phrase_html}</div>'
         '</div>'
     )
 
