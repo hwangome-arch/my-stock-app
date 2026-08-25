@@ -9020,75 +9020,37 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         '</style>'
     )
 
-    # ── [2026-08-25 5차 수정] 사용자 피드백 4가지 반영 ──────────────────────
-    #  1) 카드가 숫자 하나 치고 너무 넓어 보임 → flex:1(꽉 채움) 대신 고정폭으로 축소
-    #  2) "기업체력/모멘텀"이 뭘 합친 건지 라벨만 봐선 안 와닿음 → 라벨 아래
-    #     아주 작은 서브텍스트로 구성 항목을 바로 붙임
-    #  3) 정작 제일 중요한 한 줄(인사이트)이 카드 밑에 작은 회색 글씨로 깔려서
-    #     존재감이 없었음 → 카드보다 먼저, 굵은 배지 형태로 위로 올림
-    #  4) 상단 총점(예: 389·주의, 빨강)과 아래 기업체력(88, 초록)이 같이 보이면
-    #     "체력 좋다며 왜 주의야?"로 헷갈릴 수 있었음 → 인사이트 문장 안에서
-    #     총점이 왜 그렇게 나왔는지(둘 중 무엇 때문인지)를 아예 명시적으로 설명
-    def _fit_tier_color(val_100):
-        if val_100 >= 65:   return "#16A34A"
-        elif val_100 >= 40:  return "#D97706"
-        else:                return "#DC2626"
-
-    fundamental_100 = detailed.get("fundamental_100", 0.0)
-    momentum_100 = detailed.get("momentum_100", 0.0)
-    _fund_color = _fit_tier_color(fundamental_100)
-    _mom_color = _fit_tier_color(momentum_100)
-
-    def _fit_stat_card(icon, label, sub_label, val_100, color):
+    # ── [2026-08-25 6차 수정 — 최초(막대바) 버전으로 복귀] ─────────────────
+    # 사분면 차트 → 배지 → 큰 숫자카드 + 인사이트 문장까지 여러 스타일을 시도했지만,
+    # 결국 제일 처음 만들었던 "라벨 + 얇은 바 + 오른쪽 XX/100" 막대바 버전이 가장
+    # 낫다는 피드백을 받아 그 버전으로 되돌린다. 크기도 최초 버전과 동일(카드 하나,
+    # 안에 설명 한 줄 + 막대 2줄)하게 맞춘다.
+    def _mini_bar(label, val_100, icon):
+        if val_100 >= 65:   bar_color = "#16A34A"
+        elif val_100 >= 40:  bar_color = "#D97706"
+        else:                bar_color = "#DC2626"
         return (
-            f'<div style="width:150px; text-align:center; padding:12px 8px; background:{color}0D; '
-            f'border:1px solid {color}33; border-radius:12px;">'
-            f'<div style="font-size:11.5px; color:{color}; font-weight:700;">{icon} {label}</div>'
-            f'<div style="font-size:9.5px; color:#94A3B8; margin-bottom:6px;">{sub_label}</div>'
-            f'<div style="font-size:30px; font-weight:800; color:{color};">{val_100:.0f}</div>'
-            f'<div style="font-size:10px; color:#94A3B8; margin-top:2px;">/ 100</div>'
+            '<div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">'
+            f'<div style="width:76px; font-size:11.5px; color:#475569; font-weight:600;">{icon} {label}</div>'
+            '<div style="flex:1; background:#F1F5F9; border-radius:4px; height:8px;">'
+            f'<div style="width:{val_100}%; background:{bar_color}; border-radius:4px; height:8px;"></div>'
+            '</div>'
+            f'<div style="width:44px; font-size:11.5px; color:#334155; font-weight:700; text-align:right;">{val_100:.0f}/100</div>'
             '</div>'
         )
 
-    # [4] 총점(빨강/초록 등급색)과 아래 카드색이 반대로 보일 때의 혼동을 인사이트
-    # 문장 안에서 직접 풀어준다 — "총점이 왜 이렇게 나왔는지"를 사분면별로 명시.
-    _fit_gap = momentum_100 - fundamental_100
-    if _fit_gap >= 20:
-        _insight_icon, _insight_color = "🚀", _mom_color
-        _insight_text = (
-            f"이 총점({total})은 회사 체력(재무)보다 <b>모멘텀 쪽에 더 크게 기대어</b> 나온 숫자입니다. "
-            f"기업체력만 보면 {fundamental_100:.0f}/100으로 {'우수' if fundamental_100>=65 else ('보통' if fundamental_100>=40 else '약한')} 편이고, "
-            f"지금은 주가 흐름(모멘텀 {momentum_100:.0f}/100)이 점수를 끌어올리고 있습니다."
-        )
-    elif _fit_gap <= -20:
-        _insight_icon, _insight_color = "🏢", _fund_color
-        _insight_text = (
-            f"이 총점({total})은 지금 주가 흐름보다 <b>회사 체력(재무) 쪽에 더 크게 기대어</b> 나온 숫자입니다. "
-            f"모멘텀만 보면 {momentum_100:.0f}/100으로 {'뜨겁지 않은' if momentum_100<40 else '보통'} 편이고, "
-            f"기업체력({fundamental_100:.0f}/100)이 점수를 받쳐주고 있습니다."
-        )
-    else:
-        _insight_icon, _insight_color = "⚖️", total_color
-        _insight_text = (
-            f"이 총점({total})은 기업체력({fundamental_100:.0f}/100)과 모멘텀({momentum_100:.0f}/100)이 "
-            f"비슷한 비중으로 함께 반영된 숫자입니다."
-        )
-
-    insight_html = (
-        f'<div style="background:{_insight_color}0D; border:1px solid {_insight_color}33; border-radius:10px; '
-        f'padding:10px 14px; margin-bottom:10px; font-size:12.5px; color:#1E293B; line-height:1.6;">'
-        f'<b style="color:{_insight_color};">{_insight_icon} </b>{_insight_text}'
-        '</div>'
-    )
-
+    fundamental_100 = detailed.get("fundamental_100", 0.0)
+    momentum_100 = detailed.get("momentum_100", 0.0)
     split_html = (
-        insight_html +
-        '<div style="display:flex; gap:10px; margin-bottom:10px;">'
-        + _fit_stat_card("🏢", "기업체력", "(재무·밸류)", fundamental_100, _fund_color)
-        + _fit_stat_card("🚀", "모멘텀", "(추세·수급·거래량 등)", momentum_100, _mom_color)
+        '<div style="background:#FFFFFF; border:1px solid #E2E8F0; border-radius:8px; '
+        'padding:10px 12px 4px; margin-bottom:12px;">'
+        '<div style="font-size:10.5px; color:#94A3B8; margin-bottom:8px;">'
+        '재무·밸류(기업체력)와 추세·수급·거래량·모멘텀·패턴·리스크(모멘텀)를 각각 100점 만점으로 나눠서 봅니다. '
+        '기업체력은 낮은데 모멘텀만 높으면, 회사보다는 지금 주가 흐름이 뜨거운 종목이라는 뜻입니다.</div>'
+        + _mini_bar("기업체력", fundamental_100, "🏢")
+        + _mini_bar("모멘텀", momentum_100, "🚀")
         + '</div>'
     )
-
 
     html = (
         TOOLTIP_CSS +
@@ -9103,7 +9065,7 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         '<div style="font-size:12px; color:' + total_color + '; font-weight:600;">● ' + total_label + '</div>'
         '</div></div>'
         + split_html +
-        '<div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:12px;">'
+        '<div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">'
         + cat_cards +
         '</div>'
         '<div style="margin-top:10px; font-size:10.5px; color:#94A3B8; line-height:1.6;">'
