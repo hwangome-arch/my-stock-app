@@ -9020,57 +9020,47 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         '</style>'
     )
 
-    # ── [2026-08-25 3차 수정] 배지만으로는 "관계"가 잘 안 보인다는 피드백 →
-    # 사분면 차트를 다시 쓰되, 세로 높이를 216→122로 줄이고 설명 문장·y축 라벨을
-    # 빼서 훨씬 작게 만들었다. 위에는 한 줄 배지, 아래에 축소된 사분면을 같이 둔다.
-    def _quadrant_svg(fundamental_100, momentum_100):
-        W, H = 400, 122
-        ML, MT, MR, MB = 38, 8, 8, 20
-        PW, PH = W - ML - MR, H - MT - MB
-        fx = max(0.0, min(100.0, momentum_100))
-        fy = max(0.0, min(100.0, fundamental_100))
-        px = ML + (fx / 100.0) * PW
-        py = MT + PH - (fy / 100.0) * PH
-        midx, midy = ML + PW / 2, MT + PH / 2
-        if fy >= 50 and fx >= 50:
-            dot_color, quad_label = "#16A34A", "우량 강세"
-        elif fy >= 50 and fx < 50:
-            dot_color, quad_label = "#2563EB", "저평가 우량주"
-        elif fy < 50 and fx >= 50:
-            dot_color, quad_label = "#DC2626", "테마·모멘텀 주도"
-        else:
-            dot_color, quad_label = "#64748B", "관망"
-        svg = (
-            f'<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" style="width:100%; height:auto; display:block;">'
-            f'<rect x="{ML}" y="{MT}" width="{PW/2}" height="{PH/2}" fill="#EFF6FF"/>'
-            f'<rect x="{midx}" y="{MT}" width="{PW/2}" height="{PH/2}" fill="#F0FDF4"/>'
-            f'<rect x="{ML}" y="{midy}" width="{PW/2}" height="{PH/2}" fill="#F8FAFC"/>'
-            f'<rect x="{midx}" y="{midy}" width="{PW/2}" height="{PH/2}" fill="#FEF2F2"/>'
-            f'<line x1="{ML}" y1="{midy}" x2="{ML+PW}" y2="{midy}" stroke="#CBD5E1" stroke-width="1" stroke-dasharray="3,3"/>'
-            f'<line x1="{midx}" y1="{MT}" x2="{midx}" y2="{MT+PH}" stroke="#CBD5E1" stroke-width="1" stroke-dasharray="3,3"/>'
-            f'<rect x="{ML}" y="{MT}" width="{PW}" height="{PH}" fill="none" stroke="#CBD5E1" stroke-width="1"/>'
-            f'<text x="{ML+4}" y="{MT+10}" font-size="8" font-weight="700" fill="#1D4ED8">저평가 우량주</text>'
-            f'<text x="{midx+4}" y="{MT+10}" font-size="8" font-weight="700" fill="#15803D">우량 강세</text>'
-            f'<text x="{ML+4}" y="{midy+11}" font-size="8" font-weight="700" fill="#64748B">관망</text>'
-            f'<text x="{midx+4}" y="{midy+11}" font-size="8" font-weight="700" fill="#B91C1C">테마·모멘텀 주도</text>'
-            f'<text x="{ML}" y="{MT+PH+13}" font-size="7.5" fill="#94A3B8" text-anchor="start">모멘텀0</text>'
-            f'<text x="{ML+PW}" y="{MT+PH+13}" font-size="7.5" fill="#94A3B8" text-anchor="end">모멘텀100</text>'
-            f'<circle cx="{px}" cy="{py}" r="6" fill="{dot_color}" fill-opacity="0.2"/>'
-            f'<circle cx="{px}" cy="{py}" r="4" fill="{dot_color}" stroke="white" stroke-width="1.5"/>'
-            f'</svg>'
-        )
-        return svg, quad_label, dot_color
+    # ── [2026-08-25 4차 수정] 확률분석 탭의 "라벨 위 + 숫자 크게" 카드 스타일과
+    # 통일했다. 사분면 차트도 여전히 그래프라 부담스럽다는 피드백이 있어서,
+    # 이 탭 다른 곳(estimate_target_hit_probability 카드)과 똑같은 방식 —
+    # 흰 배경 카드에 작은 라벨 + 큰 숫자(32px) — 로 완전히 단순화했다.
+    def _fit_tier_color(val_100):
+        if val_100 >= 65:   return "#16A34A"
+        elif val_100 >= 40:  return "#D97706"
+        else:                return "#DC2626"
 
     fundamental_100 = detailed.get("fundamental_100", 0.0)
     momentum_100 = detailed.get("momentum_100", 0.0)
-    quad_svg, quad_label, quad_color = _quadrant_svg(fundamental_100, momentum_100)
+    _fund_color = _fit_tier_color(fundamental_100)
+    _mom_color = _fit_tier_color(momentum_100)
+
+    def _fit_stat_card(icon, label, val_100, color):
+        return (
+            f'<div style="flex:1; text-align:center; padding:14px 10px; background:{color}0D; '
+            f'border:1px solid {color}33; border-radius:12px;">'
+            f'<div style="font-size:11.5px; color:{color}; font-weight:700; margin-bottom:6px;">{icon} {label}</div>'
+            f'<div style="font-size:32px; font-weight:800; color:{color};">{val_100:.0f}</div>'
+            f'<div style="font-size:10px; color:#94A3B8; margin-top:2px;">/ 100</div>'
+            '</div>'
+        )
+
+    # 두 값 격차가 크면(재무는 약한데 모멘텀만 강한 경우 등) 한 줄 코멘트를 덧붙인다.
+    _fit_gap = momentum_100 - fundamental_100
+    if _fit_gap >= 20:
+        _fit_caption = "회사 체력보다 지금 주가 흐름이 더 뜨거운 쪽에 기대고 있는 종목입니다."
+    elif _fit_gap <= -20:
+        _fit_caption = "지금 주가 흐름보다 회사 체력이 더 튼튼한 종목입니다."
+    else:
+        _fit_caption = "기업체력과 모멘텀이 비슷한 비중으로 점수에 반영돼 있습니다."
+
     split_html = (
-        f'<div style="display:inline-flex; align-items:center; gap:6px; background:{quad_color}1A; '
-        f'border:1px solid {quad_color}33; border-radius:16px; padding:4px 10px; margin-bottom:8px; '
-        f'font-size:11px; font-weight:700; color:{quad_color};">'
-        f'🏢체력 {fundamental_100:.0f} · 🚀모멘텀 {momentum_100:.0f} → {quad_label}</div>'
-        + quad_svg
+        '<div style="display:flex; gap:10px; margin-bottom:8px;">'
+        + _fit_stat_card("🏢", "기업체력", fundamental_100, _fund_color)
+        + _fit_stat_card("🚀", "모멘텀", momentum_100, _mom_color)
+        + '</div>'
+        f'<div style="font-size:11px; color:#94A3B8; margin-bottom:10px;">{_fit_caption}</div>'
     )
+
 
     html = (
         TOOLTIP_CSS +
