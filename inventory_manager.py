@@ -9020,35 +9020,30 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         '</style>'
     )
 
-    # ── [2026-08-25 6차 수정 — 최초(막대바) 버전으로 복귀] ─────────────────
-    # 사분면 차트 → 배지 → 큰 숫자카드 + 인사이트 문장까지 여러 스타일을 시도했지만,
-    # 결국 제일 처음 만들었던 "라벨 + 얇은 바 + 오른쪽 XX/100" 막대바 버전이 가장
-    # 낫다는 피드백을 받아 그 버전으로 되돌린다. 크기도 최초 버전과 동일(카드 하나,
-    # 안에 설명 한 줄 + 막대 2줄)하게 맞춘다.
-    def _mini_bar(label, val_100, icon):
-        if val_100 >= 65:   bar_color = "#16A34A"
-        elif val_100 >= 40:  bar_color = "#D97706"
-        else:                bar_color = "#DC2626"
+    # ── [2026-08-25 7차 수정 — 큰 숫자 카드 스타일로 복귀] ──────────────────
+    # 막대바보다 "라벨 + 큰 숫자(88/100 형태)" 카드 느낌이 낫다는 피드백. 인사이트
+    # 문장이나 하단 캡션 없이, 카드 2개만 나란히 두는 가장 단순한 형태로 맞춘다.
+    def _fit_tier_color(val_100):
+        if val_100 >= 65:   return "#16A34A"
+        elif val_100 >= 40:  return "#D97706"
+        else:                return "#DC2626"
+
+    def _fit_stat_card(icon, label, val_100, color):
         return (
-            '<div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">'
-            f'<div style="width:76px; font-size:11.5px; color:#475569; font-weight:600;">{icon} {label}</div>'
-            '<div style="flex:1; background:#F1F5F9; border-radius:4px; height:8px;">'
-            f'<div style="width:{val_100}%; background:{bar_color}; border-radius:4px; height:8px;"></div>'
-            '</div>'
-            f'<div style="width:44px; font-size:11.5px; color:#334155; font-weight:700; text-align:right;">{val_100:.0f}/100</div>'
+            f'<div style="flex:1; text-align:center; padding:14px 10px; background:{color}0D; '
+            f'border:1px solid {color}33; border-radius:12px;">'
+            f'<div style="font-size:11.5px; color:{color}; font-weight:700; margin-bottom:6px;">{icon} {label}</div>'
+            f'<div style="font-size:32px; font-weight:800; color:{color};">{val_100:.0f}</div>'
+            f'<div style="font-size:10px; color:#94A3B8; margin-top:2px;">/ 100</div>'
             '</div>'
         )
 
     fundamental_100 = detailed.get("fundamental_100", 0.0)
     momentum_100 = detailed.get("momentum_100", 0.0)
     split_html = (
-        '<div style="background:#FFFFFF; border:1px solid #E2E8F0; border-radius:8px; '
-        'padding:10px 12px 4px; margin-bottom:12px;">'
-        '<div style="font-size:10.5px; color:#94A3B8; margin-bottom:8px;">'
-        '재무·밸류(기업체력)와 추세·수급·거래량·모멘텀·패턴·리스크(모멘텀)를 각각 100점 만점으로 나눠서 봅니다. '
-        '기업체력은 낮은데 모멘텀만 높으면, 회사보다는 지금 주가 흐름이 뜨거운 종목이라는 뜻입니다.</div>'
-        + _mini_bar("기업체력", fundamental_100, "🏢")
-        + _mini_bar("모멘텀", momentum_100, "🚀")
+        '<div style="display:flex; gap:10px; margin-bottom:12px;">'
+        + _fit_stat_card("🏢", "기업체력", fundamental_100, _fit_tier_color(fundamental_100))
+        + _fit_stat_card("🚀", "모멘텀", momentum_100, _fit_tier_color(momentum_100))
         + '</div>'
     )
 
