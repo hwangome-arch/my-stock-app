@@ -9020,36 +9020,66 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         '</style>'
     )
 
-    # ── [2026-08-24 추가] 기업체력 / 모멘텀 요약 바 ──────────────────────────
-    # 통합 total(1000점) 하나만 보여주면 "재무는 나쁜데 왜 점수가 높지?"를 8개
-    # 세부항목을 일일이 뜯어봐야만 알 수 있었다. 재무+밸류(기업체력)와 나머지
-    # 6개 기술적 항목(모멘텀)을 각각 0~100으로 정규화해 총점 바로 아래 두 줄
-    # 요약 바로 보여줘서, 총점이 어느 쪽에 기대어 나온 숫자인지 한눈에 보이게 한다.
-    def _mini_bar(label, val_100, icon):
-        if val_100 >= 65:   bar_color = "#16A34A"
-        elif val_100 >= 40:  bar_color = "#D97706"
-        else:                bar_color = "#DC2626"
-        return (
-            '<div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">'
-            f'<div style="width:76px; font-size:11.5px; color:#475569; font-weight:600;">{icon} {label}</div>'
-            '<div style="flex:1; background:#F1F5F9; border-radius:4px; height:8px;">'
-            f'<div style="width:{val_100}%; background:{bar_color}; border-radius:4px; height:8px;"></div>'
-            '</div>'
-            f'<div style="width:44px; font-size:11.5px; color:#334155; font-weight:700; text-align:right;">{val_100:.0f}/100</div>'
-            '</div>'
+    # ── [2026-08-24 → 2026-08-25 수정] 기업체력 / 모멘텀 요약: 막대바 2개 → 사분면 차트 ──
+    # 막대바 2개는 각 값을 따로 보여줄 뿐 "관계"가 한눈에 안 들어오고, 이미 아래에
+    # 세부항목 막대가 8개나 더 있어서 막대 그래프가 과하게 반복되는 느낌이 있었다.
+    # 대신 x=모멘텀, y=기업체력인 2x2 사분면 위에 점 하나로 위치를 찍어서, 그 자체로
+    # "회사가 좋은가"와 "지금 흐름이 뜨거운가"의 관계를 시각적으로 보여준다.
+    def _quadrant_svg(fundamental_100, momentum_100):
+        W, H = 400, 216
+        ML, MT, MR, MB = 46, 14, 10, 34  # 좌/상/우/하 여백
+        PW, PH = W - ML - MR, H - MT - MB
+        fx = max(0.0, min(100.0, momentum_100))
+        fy = max(0.0, min(100.0, fundamental_100))
+        px = ML + (fx / 100.0) * PW
+        py = MT + PH - (fy / 100.0) * PH
+        midx, midy = ML + PW / 2, MT + PH / 2
+
+        if fy >= 50 and fx >= 50:
+            dot_color, quad_label, quad_desc = "#16A34A", "우량 강세", "재무도 튼튼하고 지금 주가 흐름도 강합니다."
+        elif fy >= 50 and fx < 50:
+            dot_color, quad_label, quad_desc = "#2563EB", "저평가 우량주", "재무는 튼튼한데 아직 주가 흐름은 조용합니다."
+        elif fy < 50 and fx >= 50:
+            dot_color, quad_label, quad_desc = "#DC2626", "테마·모멘텀 주도", "회사 체력보다 지금 주가 흐름이 뜨거운 쪽에 훨씬 더 기대고 있습니다."
+        else:
+            dot_color, quad_label, quad_desc = "#64748B", "관망", "재무도 약하고 지금 주가 흐름도 약합니다."
+
+        svg = (
+            f'<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" style="width:100%; height:auto; display:block;">'
+            f'<rect x="{ML}" y="{MT}" width="{PW/2}" height="{PH/2}" fill="#EFF6FF"/>'
+            f'<rect x="{midx}" y="{MT}" width="{PW/2}" height="{PH/2}" fill="#F0FDF4"/>'
+            f'<rect x="{ML}" y="{midy}" width="{PW/2}" height="{PH/2}" fill="#F8FAFC"/>'
+            f'<rect x="{midx}" y="{midy}" width="{PW/2}" height="{PH/2}" fill="#FEF2F2"/>'
+            f'<line x1="{ML}" y1="{midy}" x2="{ML+PW}" y2="{midy}" stroke="#CBD5E1" stroke-width="1" stroke-dasharray="3,3"/>'
+            f'<line x1="{midx}" y1="{MT}" x2="{midx}" y2="{MT+PH}" stroke="#CBD5E1" stroke-width="1" stroke-dasharray="3,3"/>'
+            f'<rect x="{ML}" y="{MT}" width="{PW}" height="{PH}" fill="none" stroke="#CBD5E1" stroke-width="1"/>'
+            f'<text x="{ML+6}" y="{MT+15}" font-size="10.5" font-weight="700" fill="#1D4ED8">저평가 우량주</text>'
+            f'<text x="{midx+6}" y="{MT+15}" font-size="10.5" font-weight="700" fill="#15803D">우량 강세</text>'
+            f'<text x="{ML+6}" y="{midy+17}" font-size="10.5" font-weight="700" fill="#64748B">관망</text>'
+            f'<text x="{midx+6}" y="{midy+17}" font-size="10.5" font-weight="700" fill="#B91C1C">테마·모멘텀 주도</text>'
+            f'<text x="{ML-5}" y="{MT+5}" font-size="9" fill="#94A3B8" text-anchor="end">체력100</text>'
+            f'<text x="{ML-5}" y="{MT+PH+3}" font-size="9" fill="#94A3B8" text-anchor="end">체력0</text>'
+            f'<text x="{ML}" y="{MT+PH+16}" font-size="9" fill="#94A3B8" text-anchor="start">모멘텀0</text>'
+            f'<text x="{ML+PW}" y="{MT+PH+16}" font-size="9" fill="#94A3B8" text-anchor="end">모멘텀100</text>'
+            f'<circle cx="{px}" cy="{py}" r="9" fill="{dot_color}" fill-opacity="0.18"/>'
+            f'<circle cx="{px}" cy="{py}" r="6" fill="{dot_color}" stroke="white" stroke-width="2"/>'
+            f'</svg>'
         )
+        return svg, quad_label, quad_desc, dot_color
 
     fundamental_100 = detailed.get("fundamental_100", 0.0)
     momentum_100 = detailed.get("momentum_100", 0.0)
+    quad_svg, quad_label, quad_desc, quad_color = _quadrant_svg(fundamental_100, momentum_100)
     split_html = (
         '<div style="background:#FFFFFF; border:1px solid #E2E8F0; border-radius:8px; '
-        'padding:10px 12px 4px; margin-bottom:12px;">'
-        '<div style="font-size:10.5px; color:#94A3B8; margin-bottom:8px;">'
-        '재무·밸류(기업체력)와 추세·수급·거래량·모멘텀·패턴·리스크(모멘텀)를 각각 100점 만점으로 나눠서 봅니다. '
-        '기업체력은 낮은데 모멘텀만 높으면, 회사보다는 지금 주가 흐름이 뜨거운 종목이라는 뜻입니다.</div>'
-        + _mini_bar("기업체력", fundamental_100, "🏢")
-        + _mini_bar("모멘텀", momentum_100, "🚀")
-        + '</div>'
+        'padding:12px 14px 10px; margin-bottom:12px;">'
+        '<div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">'
+        f'<span style="font-size:11.5px; font-weight:700; color:{quad_color}; background:{quad_color}1A; '
+        f'border-radius:10px; padding:3px 10px;">🏢 기업체력 {fundamental_100:.0f} · 🚀 모멘텀 {momentum_100:.0f} → {quad_label}</span>'
+        '</div>'
+        + quad_svg +
+        f'<div style="font-size:10.5px; color:#94A3B8; margin-top:6px;">{quad_desc}</div>'
+        '</div>'
     )
 
     html = (
