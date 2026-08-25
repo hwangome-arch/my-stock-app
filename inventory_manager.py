@@ -9020,30 +9020,26 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         '</style>'
     )
 
-    # ── [2026-08-24 → 2026-08-25 수정] 기업체력 / 모멘텀 요약: 막대바 2개 → 사분면 차트 ──
-    # 막대바 2개는 각 값을 따로 보여줄 뿐 "관계"가 한눈에 안 들어오고, 이미 아래에
-    # 세부항목 막대가 8개나 더 있어서 막대 그래프가 과하게 반복되는 느낌이 있었다.
-    # 대신 x=모멘텀, y=기업체력인 2x2 사분면 위에 점 하나로 위치를 찍어서, 그 자체로
-    # "회사가 좋은가"와 "지금 흐름이 뜨거운가"의 관계를 시각적으로 보여준다.
+    # ── [2026-08-25 3차 수정] 배지만으로는 "관계"가 잘 안 보인다는 피드백 →
+    # 사분면 차트를 다시 쓰되, 세로 높이를 216→122로 줄이고 설명 문장·y축 라벨을
+    # 빼서 훨씬 작게 만들었다. 위에는 한 줄 배지, 아래에 축소된 사분면을 같이 둔다.
     def _quadrant_svg(fundamental_100, momentum_100):
-        W, H = 400, 216
-        ML, MT, MR, MB = 46, 14, 10, 34  # 좌/상/우/하 여백
+        W, H = 400, 122
+        ML, MT, MR, MB = 38, 8, 8, 20
         PW, PH = W - ML - MR, H - MT - MB
         fx = max(0.0, min(100.0, momentum_100))
         fy = max(0.0, min(100.0, fundamental_100))
         px = ML + (fx / 100.0) * PW
         py = MT + PH - (fy / 100.0) * PH
         midx, midy = ML + PW / 2, MT + PH / 2
-
         if fy >= 50 and fx >= 50:
-            dot_color, quad_label, quad_desc = "#16A34A", "우량 강세", "재무도 튼튼하고 지금 주가 흐름도 강합니다."
+            dot_color, quad_label = "#16A34A", "우량 강세"
         elif fy >= 50 and fx < 50:
-            dot_color, quad_label, quad_desc = "#2563EB", "저평가 우량주", "재무는 튼튼한데 아직 주가 흐름은 조용합니다."
+            dot_color, quad_label = "#2563EB", "저평가 우량주"
         elif fy < 50 and fx >= 50:
-            dot_color, quad_label, quad_desc = "#DC2626", "테마·모멘텀 주도", "회사 체력보다 지금 주가 흐름이 뜨거운 쪽에 훨씬 더 기대고 있습니다."
+            dot_color, quad_label = "#DC2626", "테마·모멘텀 주도"
         else:
-            dot_color, quad_label, quad_desc = "#64748B", "관망", "재무도 약하고 지금 주가 흐름도 약합니다."
-
+            dot_color, quad_label = "#64748B", "관망"
         svg = (
             f'<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" style="width:100%; height:auto; display:block;">'
             f'<rect x="{ML}" y="{MT}" width="{PW/2}" height="{PH/2}" fill="#EFF6FF"/>'
@@ -9053,39 +9049,33 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
             f'<line x1="{ML}" y1="{midy}" x2="{ML+PW}" y2="{midy}" stroke="#CBD5E1" stroke-width="1" stroke-dasharray="3,3"/>'
             f'<line x1="{midx}" y1="{MT}" x2="{midx}" y2="{MT+PH}" stroke="#CBD5E1" stroke-width="1" stroke-dasharray="3,3"/>'
             f'<rect x="{ML}" y="{MT}" width="{PW}" height="{PH}" fill="none" stroke="#CBD5E1" stroke-width="1"/>'
-            f'<text x="{ML+6}" y="{MT+15}" font-size="10.5" font-weight="700" fill="#1D4ED8">저평가 우량주</text>'
-            f'<text x="{midx+6}" y="{MT+15}" font-size="10.5" font-weight="700" fill="#15803D">우량 강세</text>'
-            f'<text x="{ML+6}" y="{midy+17}" font-size="10.5" font-weight="700" fill="#64748B">관망</text>'
-            f'<text x="{midx+6}" y="{midy+17}" font-size="10.5" font-weight="700" fill="#B91C1C">테마·모멘텀 주도</text>'
-            f'<text x="{ML-5}" y="{MT+5}" font-size="9" fill="#94A3B8" text-anchor="end">체력100</text>'
-            f'<text x="{ML-5}" y="{MT+PH+3}" font-size="9" fill="#94A3B8" text-anchor="end">체력0</text>'
-            f'<text x="{ML}" y="{MT+PH+16}" font-size="9" fill="#94A3B8" text-anchor="start">모멘텀0</text>'
-            f'<text x="{ML+PW}" y="{MT+PH+16}" font-size="9" fill="#94A3B8" text-anchor="end">모멘텀100</text>'
-            f'<circle cx="{px}" cy="{py}" r="9" fill="{dot_color}" fill-opacity="0.18"/>'
-            f'<circle cx="{px}" cy="{py}" r="6" fill="{dot_color}" stroke="white" stroke-width="2"/>'
+            f'<text x="{ML+4}" y="{MT+10}" font-size="8" font-weight="700" fill="#1D4ED8">저평가 우량주</text>'
+            f'<text x="{midx+4}" y="{MT+10}" font-size="8" font-weight="700" fill="#15803D">우량 강세</text>'
+            f'<text x="{ML+4}" y="{midy+11}" font-size="8" font-weight="700" fill="#64748B">관망</text>'
+            f'<text x="{midx+4}" y="{midy+11}" font-size="8" font-weight="700" fill="#B91C1C">테마·모멘텀 주도</text>'
+            f'<text x="{ML}" y="{MT+PH+13}" font-size="7.5" fill="#94A3B8" text-anchor="start">모멘텀0</text>'
+            f'<text x="{ML+PW}" y="{MT+PH+13}" font-size="7.5" fill="#94A3B8" text-anchor="end">모멘텀100</text>'
+            f'<circle cx="{px}" cy="{py}" r="6" fill="{dot_color}" fill-opacity="0.2"/>'
+            f'<circle cx="{px}" cy="{py}" r="4" fill="{dot_color}" stroke="white" stroke-width="1.5"/>'
             f'</svg>'
         )
-        return svg, quad_label, quad_desc, dot_color
+        return svg, quad_label, dot_color
 
     fundamental_100 = detailed.get("fundamental_100", 0.0)
     momentum_100 = detailed.get("momentum_100", 0.0)
-    quad_svg, quad_label, quad_desc, quad_color = _quadrant_svg(fundamental_100, momentum_100)
+    quad_svg, quad_label, quad_color = _quadrant_svg(fundamental_100, momentum_100)
     split_html = (
-        '<div style="background:#FFFFFF; border:1px solid #E2E8F0; border-radius:8px; '
-        'padding:12px 14px 10px; margin-bottom:12px;">'
-        '<div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">'
-        f'<span style="font-size:11.5px; font-weight:700; color:{quad_color}; background:{quad_color}1A; '
-        f'border-radius:10px; padding:3px 10px;">🏢 기업체력 {fundamental_100:.0f} · 🚀 모멘텀 {momentum_100:.0f} → {quad_label}</span>'
-        '</div>'
-        + quad_svg +
-        f'<div style="font-size:10.5px; color:#94A3B8; margin-top:6px;">{quad_desc}</div>'
-        '</div>'
+        f'<div style="display:inline-flex; align-items:center; gap:6px; background:{quad_color}1A; '
+        f'border:1px solid {quad_color}33; border-radius:16px; padding:4px 10px; margin-bottom:8px; '
+        f'font-size:11px; font-weight:700; color:{quad_color};">'
+        f'🏢체력 {fundamental_100:.0f} · 🚀모멘텀 {momentum_100:.0f} → {quad_label}</div>'
+        + quad_svg
     )
 
     html = (
         TOOLTIP_CSS +
         '<div style="background:#FAFBFF; border:1px solid #C7D2FE; border-radius:10px; padding:18px 20px; margin-top:12px;">'
-        '<div style="display:flex; align-items:center; gap:12px; margin-bottom:14px;">'
+        '<div style="display:flex; align-items:center; gap:12px; margin-bottom:10px;">'
         '<div style="text-align:center;">'
         '<div style="font-size:32px; font-weight:900; color:' + total_color + '; line-height:1;">' + str(total) + '</div>'
         '<div style="font-size:11px; color:#94A3B8;">/ 1000점</div>'
@@ -9095,7 +9085,7 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         '<div style="font-size:12px; color:' + total_color + '; font-weight:600;">● ' + total_label + '</div>'
         '</div></div>'
         + split_html +
-        '<div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">'
+        '<div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:12px;">'
         + cat_cards +
         '</div>'
         '<div style="margin-top:10px; font-size:10.5px; color:#94A3B8; line-height:1.6;">'
