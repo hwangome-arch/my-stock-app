@@ -9020,10 +9020,15 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         '</style>'
     )
 
-    # ── [2026-08-25 4차 수정] 확률분석 탭의 "라벨 위 + 숫자 크게" 카드 스타일과
-    # 통일했다. 사분면 차트도 여전히 그래프라 부담스럽다는 피드백이 있어서,
-    # 이 탭 다른 곳(estimate_target_hit_probability 카드)과 똑같은 방식 —
-    # 흰 배경 카드에 작은 라벨 + 큰 숫자(32px) — 로 완전히 단순화했다.
+    # ── [2026-08-25 5차 수정] 사용자 피드백 4가지 반영 ──────────────────────
+    #  1) 카드가 숫자 하나 치고 너무 넓어 보임 → flex:1(꽉 채움) 대신 고정폭으로 축소
+    #  2) "기업체력/모멘텀"이 뭘 합친 건지 라벨만 봐선 안 와닿음 → 라벨 아래
+    #     아주 작은 서브텍스트로 구성 항목을 바로 붙임
+    #  3) 정작 제일 중요한 한 줄(인사이트)이 카드 밑에 작은 회색 글씨로 깔려서
+    #     존재감이 없었음 → 카드보다 먼저, 굵은 배지 형태로 위로 올림
+    #  4) 상단 총점(예: 389·주의, 빨강)과 아래 기업체력(88, 초록)이 같이 보이면
+    #     "체력 좋다며 왜 주의야?"로 헷갈릴 수 있었음 → 인사이트 문장 안에서
+    #     총점이 왜 그렇게 나왔는지(둘 중 무엇 때문인지)를 아예 명시적으로 설명
     def _fit_tier_color(val_100):
         if val_100 >= 65:   return "#16A34A"
         elif val_100 >= 40:  return "#D97706"
@@ -9034,31 +9039,54 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
     _fund_color = _fit_tier_color(fundamental_100)
     _mom_color = _fit_tier_color(momentum_100)
 
-    def _fit_stat_card(icon, label, val_100, color):
+    def _fit_stat_card(icon, label, sub_label, val_100, color):
         return (
-            f'<div style="flex:1; text-align:center; padding:14px 10px; background:{color}0D; '
+            f'<div style="width:150px; text-align:center; padding:12px 8px; background:{color}0D; '
             f'border:1px solid {color}33; border-radius:12px;">'
-            f'<div style="font-size:11.5px; color:{color}; font-weight:700; margin-bottom:6px;">{icon} {label}</div>'
-            f'<div style="font-size:32px; font-weight:800; color:{color};">{val_100:.0f}</div>'
+            f'<div style="font-size:11.5px; color:{color}; font-weight:700;">{icon} {label}</div>'
+            f'<div style="font-size:9.5px; color:#94A3B8; margin-bottom:6px;">{sub_label}</div>'
+            f'<div style="font-size:30px; font-weight:800; color:{color};">{val_100:.0f}</div>'
             f'<div style="font-size:10px; color:#94A3B8; margin-top:2px;">/ 100</div>'
             '</div>'
         )
 
-    # 두 값 격차가 크면(재무는 약한데 모멘텀만 강한 경우 등) 한 줄 코멘트를 덧붙인다.
+    # [4] 총점(빨강/초록 등급색)과 아래 카드색이 반대로 보일 때의 혼동을 인사이트
+    # 문장 안에서 직접 풀어준다 — "총점이 왜 이렇게 나왔는지"를 사분면별로 명시.
     _fit_gap = momentum_100 - fundamental_100
     if _fit_gap >= 20:
-        _fit_caption = "회사 체력보다 지금 주가 흐름이 더 뜨거운 쪽에 기대고 있는 종목입니다."
+        _insight_icon, _insight_color = "🚀", _mom_color
+        _insight_text = (
+            f"이 총점({total})은 회사 체력(재무)보다 <b>모멘텀 쪽에 더 크게 기대어</b> 나온 숫자입니다. "
+            f"기업체력만 보면 {fundamental_100:.0f}/100으로 {'우수' if fundamental_100>=65 else ('보통' if fundamental_100>=40 else '약한')} 편이고, "
+            f"지금은 주가 흐름(모멘텀 {momentum_100:.0f}/100)이 점수를 끌어올리고 있습니다."
+        )
     elif _fit_gap <= -20:
-        _fit_caption = "지금 주가 흐름보다 회사 체력이 더 튼튼한 종목입니다."
+        _insight_icon, _insight_color = "🏢", _fund_color
+        _insight_text = (
+            f"이 총점({total})은 지금 주가 흐름보다 <b>회사 체력(재무) 쪽에 더 크게 기대어</b> 나온 숫자입니다. "
+            f"모멘텀만 보면 {momentum_100:.0f}/100으로 {'뜨겁지 않은' if momentum_100<40 else '보통'} 편이고, "
+            f"기업체력({fundamental_100:.0f}/100)이 점수를 받쳐주고 있습니다."
+        )
     else:
-        _fit_caption = "기업체력과 모멘텀이 비슷한 비중으로 점수에 반영돼 있습니다."
+        _insight_icon, _insight_color = "⚖️", total_color
+        _insight_text = (
+            f"이 총점({total})은 기업체력({fundamental_100:.0f}/100)과 모멘텀({momentum_100:.0f}/100)이 "
+            f"비슷한 비중으로 함께 반영된 숫자입니다."
+        )
+
+    insight_html = (
+        f'<div style="background:{_insight_color}0D; border:1px solid {_insight_color}33; border-radius:10px; '
+        f'padding:10px 14px; margin-bottom:10px; font-size:12.5px; color:#1E293B; line-height:1.6;">'
+        f'<b style="color:{_insight_color};">{_insight_icon} </b>{_insight_text}'
+        '</div>'
+    )
 
     split_html = (
-        '<div style="display:flex; gap:10px; margin-bottom:8px;">'
-        + _fit_stat_card("🏢", "기업체력", fundamental_100, _fund_color)
-        + _fit_stat_card("🚀", "모멘텀", momentum_100, _mom_color)
+        insight_html +
+        '<div style="display:flex; gap:10px; margin-bottom:10px;">'
+        + _fit_stat_card("🏢", "기업체력", "(재무·밸류)", fundamental_100, _fund_color)
+        + _fit_stat_card("🚀", "모멘텀", "(추세·수급·거래량 등)", momentum_100, _mom_color)
         + '</div>'
-        f'<div style="font-size:11px; color:#94A3B8; margin-bottom:10px;">{_fit_caption}</div>'
     )
 
 
