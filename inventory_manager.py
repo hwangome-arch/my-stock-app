@@ -10941,8 +10941,17 @@ def render_market_pulse():
                 _hl_summary = _hl_summary_raw
         except Exception:
             _hl_summary = ""
+        # [버그 수정] _hl_summary는 _parse_wisereport_overview()에서 줄바꿈용으로
+        # 실제 문자열 "<br>"를 구분자로 넣어 만들어진다(HTML로 렌더링될 것을 전제).
+        # 그런데 이 카드에서는 summary 전체를 html_lib.escape()로 한 번에 이스케이프해서
+        # "<br>"가 "&lt;br&gt;"로 바뀌어 화면에 글자 그대로 노출되는 문제가 있었다.
+        # → "<br>" 구분자 기준으로 나눠 각 줄만 개별 escape한 뒤 다시 "<br>"로 합쳐서
+        # 줄바꿈은 그대로 유지하면서 각 줄의 실제 텍스트는 안전하게 이스케이프한다.
+        _hl_summary_escaped = "<br>".join(
+            html_lib.escape(_line) for _line in _hl_summary.split("<br>")
+        )
         _hl_summary_html = (
-            f'<div style="font-size:12.5px; color:#64748B; margin-top:6px; line-height:1.5;">📖 {html_lib.escape(_hl_summary)}</div>'
+            f'<div style="font-size:12.5px; color:#64748B; margin-top:6px; line-height:1.5;">📖 {_hl_summary_escaped}</div>'
             if _hl_summary else ""
         )
         st.markdown(f"""
