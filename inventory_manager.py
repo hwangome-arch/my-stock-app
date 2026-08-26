@@ -4429,6 +4429,21 @@ def draw_fnguide_details(code):
                 with st.expander("🔧 디버그 정보 (컨센서스 조회 실패 원인 확인용)"):
                     st.json(_cdbg)
 
+        # ── [2026-08-26 추가] 최근 104주(약 2년) 주간 종가 추이 ─────────────────
+        # 대시보드/관심종목의 미니 스파크라인은 종목 카드 하나에 들어가야 해서
+        # 최근 30영업일 정도의 초소형 그래프였다. 여기 기업 재무 분석 페이지는
+        # 종목 하나만 자세히 들여다보는 화면이라, 조금 더 긴 호흡(약 2년)의 흐름을
+        # 볼 수 있으면 좋겠다는 요청으로 추가. 새 네트워크 호출을 늘리지 않도록
+        # 이미 검증 로직을 갖춘 fetch_price_history_for_score()의 결과를 주 단위로
+        # 리샘플링해서 재사용한다(fetch_weekly_price_series).
+        st.markdown("<h4 style='font-size:16px; margin:20px 0 4px 0;'>📈 최근 104주 주가 추이</h4>", unsafe_allow_html=True)
+        _weekly_series = fetch_weekly_price_series(code, weeks=104)
+        if not _weekly_series.empty:
+            st.line_chart(_weekly_series, height=240, use_container_width=True)
+            st.caption("ℹ️ 주 마지막 거래일 종가 기준, 최근 최대 104주(약 2년)까지 표시됩니다. 30분 캐시로 갱신됩니다.")
+        else:
+            st.caption("📉 주가 추이 데이터를 불러올 수 없습니다.")
+
         # ── 최근 수급 동향 (외국인 / 기관 / 개인 추정 순매매) ────────────────────
         st.markdown("<h4 style='font-size:16px; margin:20px 0 4px 0;'>📊 최근 수급 동향</h4>", unsafe_allow_html=True)
         st.markdown(
@@ -7409,6 +7424,25 @@ def fetch_price_history_for_score(code, period="1y"):
         return df
     except Exception:
         return pd.DataFrame()
+
+
+# ── [기업 재무 분석 페이지용] 최근 104주(약 2년) 주간 종가 추이 ────────────────
+# fetch_price_history_for_score()가 이미 야후파이낸스 일봉 데이터를 가져오면서
+# (1) 코스피/코스닥 폴백 (2) 확정 안 된 당일 봉 제거 (3) 네이버 실시간가와 대조해
+# 배율이 어긋나면 통째로 버리는 검증을 다 해주고 있으므로, 새로 스크래핑 로직을
+# 만들지 않고 이 함수의 결과(2년치 일봉)를 주 단위로 리샘플(주 마지막 거래일 종가)
+# 해서 재사용한다. 새로운 네트워크 호출이 늘지 않아 부담이 적다.
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_weekly_price_series(code, weeks=104):
+    """최근 N주(기본 104주≈2년)의 주간 종가 Series(index=주 마지막 거래일)를 반환.
+    데이터가 없거나 조회 실패 시 빈 Series."""
+    df = fetch_price_history_for_score(code, period="2y")
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+    weekly_close = df["Close"].resample("W").last().dropna()
+    if weekly_close.empty:
+        return pd.Series(dtype=float)
+    return weekly_close.tail(weeks)
 
 
 def _lerp_score(x, points):
