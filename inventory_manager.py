@@ -4436,11 +4436,21 @@ def draw_fnguide_details(code):
         # 볼 수 있으면 좋겠다는 요청으로 추가. 새 네트워크 호출을 늘리지 않도록
         # 이미 검증 로직을 갖춘 fetch_price_history_for_score()의 결과를 주 단위로
         # 리샘플링해서 재사용한다(fetch_weekly_price_series).
-        st.markdown("<h4 style='font-size:16px; margin:20px 0 4px 0;'>📈 최근 104주 주가 추이</h4>", unsafe_allow_html=True)
+        st.markdown("<h4 style='font-size:16px; margin:20px 0 4px 0;'>📈 최근 주가 추이</h4>", unsafe_allow_html=True)
         _weekly_series = fetch_weekly_price_series(code, weeks=104)
         if not _weekly_series.empty:
             st.line_chart(_weekly_series, height=240, use_container_width=True)
-            st.caption("ℹ️ 주 마지막 거래일 종가 기준, 최근 최대 104주(약 2년)까지 표시됩니다. 30분 캐시로 갱신됩니다.")
+            # [2026-08-26 개선] "104주"라고 제목에 못박지 않고, 실제로 확보된 데이터 범위를
+            # 그대로 캡션에 표시한다. 종목에 따라 야후파이낸스가 2년치를 다 못 주는 경우가
+            # 있어서(코스닥 소형주·장기 거래정지 이력 등), 실제 기간과 다르게 "104주"라고
+            # 써두면 사용자가 데이터가 잘린 걸 못 알아채고 오해할 수 있기 때문.
+            _wk_count = len(_weekly_series)
+            _start_d = _weekly_series.index[0].strftime("%Y-%m-%d")
+            _end_d = _weekly_series.index[-1].strftime("%Y-%m-%d")
+            if _wk_count < 52:
+                st.caption(f"⚠️ 이 종목은 최근 {_wk_count}주치({_start_d} ~ {_end_d})만 조회됐습니다. 거래정지 이력이 있거나 데이터 제공처가 과거 데이터를 온전히 갖고 있지 않은 종목일 수 있습니다.")
+            else:
+                st.caption(f"ℹ️ 주 마지막 거래일 종가 기준 · {_start_d} ~ {_end_d} (총 {_wk_count}주) · 30분 캐시로 갱신됩니다.")
         else:
             st.caption("📉 주가 추이 데이터를 불러올 수 없습니다.")
 
@@ -7426,7 +7436,79 @@ def fetch_price_history_for_score(code, period="1y"):
         return pd.DataFrame()
 
 
-# ── [기업 재무 분석 페이지용] 최근 104주(약 2년) 주간 종가 추이 ────────────────
+# ── [2026-08-26 추가] 네이버 금융 자체 차트 API로 주간 종가 조회 ──────────────
+# 배경: 야후파이낸스 기반 fetch_price_history_for_score()로는 일부 종목(예: 제넥신
+# 095700)에서 요청한 기간(2~5년)보다 훨씬 짧은 데이터만 돌아오는 경우가 있었다.
+# 그런데 실제 네이버 금융 페이지에서 같은 종목을 보면 정상적으로 긴 차트가 나온다
+# (사용자 확인: 제넥신은 실제로 계속 거래되고 있음). 즉 야후파이낸스 쪽 데이터 커버리지
+# 문제이지, 종목 자체에 거래정지 등 실제 이력이 있는 게 아닐 가능성이 크다.
+# → 네이버 금융이 자기 차트 위젯에 쓰는 시세 API(api.finance.naver.com/siseJson.naver)를
+# 1차 소스로 쓴다. 이 API는 날짜별 시가/고가/저가/종가/거래량을 JS 배열 형태 텍스트로
+# 반환하며, timeframe=week로 요청하면 네이버가 차트에 그리는 것과 동일한 주간 데이터를
+# 바로 받을 수 있다(직접 리샘플링할 필요도 없음).
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_naver_weekly_price_series(code, weeks=104):
+    """네이버 금융 시세 API에서 최근 N주 주간 종가 Series(index=주 마지막 거래일)를 반환.
+    실패하거나 데이터가 없으면 빈 Series."""
+    code = normalize_kr_code(code)
+    if _is_invalid_kr_code(code):
+        return pd.Series(dtype=float)
+    try:
+        end_dt = datetime.datetime.now()
+        # 주간 데이터라 주 단위 정렬 오차가 있을 수 있어 여유있게 넉넉히(주 수+8주치) 더 앞에서부터 요청
+        start_dt = end_dt - datetime.timedelta(weeks=weeks + 8)
+        url = (
+            "https://api.finance.naver.com/siseJson.naver"
+            f"?symbol={code}&requestType=1"
+            f"&startTime={start_dt.strftime('%Y%m%d')}&endTime={end_dt.strftime('%Y%m%d')}"
+            "&timeframe=week"
+        )
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Referer': 'https://finance.naver.com/',
+        }
+        res = call_with_timeout(lambda: requests.get(url, headers=headers, timeout=8), timeout=10)
+        if res is None or res.status_code != 200:
+            return pd.Series(dtype=float)
+
+        # 응답 형식: [['날짜','시가','고가','저가','종가','거래량'],['20240102','48750',...], ...]
+        # 정식 JSON이 아니라(작은따옴표 사용) 파이썬 리터럴에 가까우므로 ast.literal_eval로 안전하게 파싱
+        import ast as _ast
+        text = res.text.strip()
+        rows = _ast.literal_eval(text)
+        if not rows or len(rows) < 2:
+            return pd.Series(dtype=float)
+
+        header = rows[0]
+        try:
+            date_idx = header.index('날짜')
+            close_idx = header.index('종가')
+        except ValueError:
+            date_idx, close_idx = 0, 4  # 포맷이 바뀌어도 관례상 위치로 폴백
+
+        dates, closes = [], []
+        for row in rows[1:]:
+            if len(row) <= max(date_idx, close_idx):
+                continue
+            try:
+                d = pd.to_datetime(str(row[date_idx]), format="%Y%m%d")
+                c = float(row[close_idx])
+            except (ValueError, TypeError):
+                continue
+            if c > 0:
+                dates.append(d)
+                closes.append(c)
+
+        if not dates:
+            return pd.Series(dtype=float)
+
+        series = pd.Series(closes, index=pd.DatetimeIndex(dates)).sort_index()
+        return series.tail(weeks)
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+
 # fetch_price_history_for_score()가 이미 야후파이낸스 일봉 데이터를 가져오면서
 # (1) 코스피/코스닥 폴백 (2) 확정 안 된 당일 봉 제거 (3) 네이버 실시간가와 대조해
 # 배율이 어긋나면 통째로 버리는 검증을 다 해주고 있으므로, 새로 스크래핑 로직을
@@ -7435,13 +7517,36 @@ def fetch_price_history_for_score(code, period="1y"):
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_weekly_price_series(code, weeks=104):
     """최근 N주(기본 104주≈2년)의 주간 종가 Series(index=주 마지막 거래일)를 반환.
-    데이터가 없거나 조회 실패 시 빈 Series."""
-    df = fetch_price_history_for_score(code, period="2y")
-    if df is None or df.empty:
-        return pd.Series(dtype=float)
-    weekly_close = df["Close"].resample("W").last().dropna()
+    데이터가 없거나 조회 실패 시 빈 Series.
+
+    [2026-08-26 개선] 처음엔 야후파이낸스(fetch_price_history_for_score)만 썼는데,
+    일부 종목(실측: 제넥신 095700)에서 요청한 기간보다 훨씬 짧은 데이터만 돌아오는
+    문제가 있었다. 실제로는 해당 종목이 계속 정상 거래 중이었고(사용자 확인), 네이버
+    금융에서 같은 종목을 보면 훨씬 긴 차트가 정상적으로 나왔다 — 즉 종목 자체의 거래
+    이력 문제가 아니라 야후파이낸스 쪽 데이터 커버리지 문제였다.
+    → 네이버 금융 자체 차트 API(fetch_naver_weekly_price_series)를 1순위로 쓰고,
+    실패하거나 데이터가 부실할 때만 야후파이낸스 결과로 보완/대체한다."""
+    # 1순위: 네이버 금융 (실제 거래 이력을 온전히 갖고 있어 더 신뢰도 높음)
+    weekly_close = fetch_naver_weekly_price_series(code, weeks=weeks)
+
+    # 네이버 쪽이 비었거나 요청한 주 수의 절반에도 못 미치면 야후파이낸스로 보완 시도
+    if len(weekly_close) < weeks * 0.5:
+        df = fetch_price_history_for_score(code, period="2y")
+        yf_weekly = pd.Series(dtype=float)
+        if df is not None and not df.empty:
+            yf_weekly = df["Close"].resample("W").last().dropna()
+        if len(yf_weekly) < weeks * 0.5:
+            df_long = fetch_price_history_for_score(code, period="5y")
+            if df_long is not None and not df_long.empty:
+                yf_long = df_long["Close"].resample("W").last().dropna()
+                if len(yf_long) > len(yf_weekly):
+                    yf_weekly = yf_long
+        # 둘 중 더 긴(데이터가 더 풍부한) 쪽을 채택
+        if len(yf_weekly) > len(weekly_close):
+            weekly_close = yf_weekly
+
     if weekly_close.empty:
-        return pd.Series(dtype=float)
+        return weekly_close
     return weekly_close.tail(weeks)
 
 
