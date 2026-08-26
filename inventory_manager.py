@@ -4439,7 +4439,30 @@ def draw_fnguide_details(code):
         st.markdown("<h4 style='font-size:16px; margin:20px 0 4px 0;'>📈 최근 주가 추이</h4>", unsafe_allow_html=True)
         _weekly_series = fetch_weekly_price_series(code, weeks=104)
         if not _weekly_series.empty:
-            st.line_chart(_weekly_series, height=240, use_container_width=True)
+            # [2026-08-26 개선] st.line_chart(스트림릿 기본 차트)는 마우스오버 툴팁의
+            # 날짜 표시 형식을 직접 지정할 수 있는 옵션이 없어서 "Jan 02, 2026"처럼
+            # 영문 기본 포맷으로만 나온다. 툴팁을 "2026.09"처럼 원하는 형식으로 보여주려면
+            # 세부 인코딩을 직접 지정할 수 있는 altair(스트림릿이 이미 내부적으로 쓰는
+            # 차트 라이브러리라 별도 설치가 필요 없음)로 직접 그린다.
+            import altair as alt
+            _chart_df = _weekly_series.rename("종가(원)").reset_index()
+            _chart_df.columns = ["날짜", "종가(원)"]
+            _price_chart = (
+                alt.Chart(_chart_df)
+                .mark_line(color="#3B82F6")
+                .encode(
+                    # 축 눈금은 라벨이 겹치지 않도록 월 단위(YYYY.MM)로 유지하고,
+                    # 마우스오버 시 나오는 툴팁에만 정확한 날짜(YYYY.MM.DD)를 표시한다.
+                    x=alt.X("날짜:T", title=None, axis=alt.Axis(format="%Y.%m")),
+                    y=alt.Y("종가(원):Q", title=None),
+                    tooltip=[
+                        alt.Tooltip("날짜:T", title="날짜", format="%Y.%m.%d"),
+                        alt.Tooltip("종가(원):Q", title="종가(원)", format=","),
+                    ],
+                )
+                .properties(height=240)
+            )
+            st.altair_chart(_price_chart, use_container_width=True)
             # [2026-08-26 개선] "104주"라고 제목에 못박지 않고, 실제로 확보된 데이터 범위를
             # 그대로 캡션에 표시한다. 종목에 따라 야후파이낸스가 2년치를 다 못 주는 경우가
             # 있어서(코스닥 소형주·장기 거래정지 이력 등), 실제 기간과 다르게 "104주"라고
