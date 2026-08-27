@@ -4474,19 +4474,41 @@ def draw_fnguide_details(code):
             import altair as alt
             _chart_df = _weekly_series.rename("종가(원)").reset_index()
             _chart_df.columns = ["날짜", "종가(원)"]
+
+            # [2026-08-27 개선] 기존엔 mark_line()만 그려서, 실제 선(두께 1~2px) 위에
+            # 마우스 커서를 정확히 올려야만 툴팁(=가격)이 떴다. 그래서 사용자 입장에서
+            # "커서를 갖다 대도 금액이 잘 안 찍힌다"는 문제가 있었다.
+            # 해결: 투명한 넓은 포인트 레이어를 하나 겹쳐서, 마우스가 그 x축 근처 어디에
+            # 있든(nearest=True) 가장 가까운 주(week)의 데이터를 잡아 툴팁을 띄우도록 한다.
+            # 추가로 그 지점에 눈에 보이는 점(circle)과 세로 기준선(rule)을 표시해서,
+            # "지금 어느 지점의 가격이 찍힌 건지" 시각적으로도 바로 알 수 있게 했다.
+            _hover = alt.selection_point(
+                nearest=True, on="mouseover", fields=["날짜"], empty=False,
+            )
+
+            _base = alt.Chart(_chart_df).encode(
+                x=alt.X("날짜:T", title=None, axis=alt.Axis(format="%Y.%m")),
+                y=alt.Y("종가(원):Q", title=None),
+            )
+            _line = _base.mark_line(color="#3B82F6")
+            # 실제 마우스 히트 영역(투명, 두꺼움) — 여기에 hover 선택과 툴팁을 붙인다.
+            _hit_area = _base.mark_line(strokeWidth=30, opacity=0).encode(
+                tooltip=[
+                    alt.Tooltip("날짜:T", title="날짜", format="%Y.%m.%d"),
+                    alt.Tooltip("종가(원):Q", title="종가(원)", format=","),
+                ]
+            ).add_params(_hover)
+            # 세로 기준선: hover 중인 날짜 위치에만 표시
+            _rule = _base.mark_rule(color="#94A3B8", strokeDash=[4, 3]).encode(
+                opacity=alt.condition(_hover, alt.value(0.6), alt.value(0)),
+            )
+            # hover 지점을 강조하는 점
+            _point = _line.mark_point(size=80, filled=True, color="#3B82F6").encode(
+                opacity=alt.condition(_hover, alt.value(1), alt.value(0)),
+            )
+
             _price_chart = (
-                alt.Chart(_chart_df)
-                .mark_line(color="#3B82F6")
-                .encode(
-                    # 축 눈금은 라벨이 겹치지 않도록 월 단위(YYYY.MM)로 유지하고,
-                    # 마우스오버 시 나오는 툴팁에만 정확한 날짜(YYYY.MM.DD)를 표시한다.
-                    x=alt.X("날짜:T", title=None, axis=alt.Axis(format="%Y.%m")),
-                    y=alt.Y("종가(원):Q", title=None),
-                    tooltip=[
-                        alt.Tooltip("날짜:T", title="날짜", format="%Y.%m.%d"),
-                        alt.Tooltip("종가(원):Q", title="종가(원)", format=","),
-                    ],
-                )
+                (_line + _rule + _point + _hit_area)
                 .properties(height=240)
             )
             st.altair_chart(_price_chart, use_container_width=True)
