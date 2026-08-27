@@ -9208,16 +9208,28 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         ratio = (val - min_v) / rng if rng else 1.0
         pct = max(0, min(100, ratio * 100))
         if pct >= 70:
-            badges.append(("#16A34A", "#F0FDF4", "🟢", _STRONG_LABEL.get(label, f"{label} 우수")))
+            badges.append((0, "#16A34A", "#F0FDF4", "🟢", _STRONG_LABEL.get(label, f"{label} 우수")))
         elif pct <= 30:
-            badges.append(("#DC2626", "#FEF2F2", "🔴", _WEAK_LABEL.get(label, f"{label} 약함")))
+            badges.append((2, "#DC2626", "#FEF2F2", "🔴", _WEAK_LABEL.get(label, f"{label} 약함")))
+        # 30~70% 구간(주황/보통 신호)은 지금은 별도 라벨이 없어 배지를 안 붙이지만,
+        # 나중에 "🟡 OO 보통" 같은 배지가 추가되면 sort_order=1로 자동으로 좋은
+        # 신호(0)와 나쁜 신호(2) 사이에 끼어들도록 정렬 기준을 미리 맞춰둔다.
+
+    # ── [2026-08-27 수정: 배지 정렬] ────────────────────────────────────────
+    # 예전엔 배지가 categories 목록 순서(추세→수급→거래량→재무→밸류→모멘텀→AI패턴→
+    # 리스크) 그대로 나열돼서, 🟢(좋은 신호)와 🔴(나쁜 신호)가 뒤섞여 나왔다
+    # ("🟢 수급 양호 🔴 거래량 저조 🟢 재무 안정적 🟢 밸류 매력적"처럼). 한눈에
+    # "좋은 점 먼저, 나쁜 점 나중에" 보이도록 sort_order(0=좋음, 2=나쁨) 기준으로
+    # 재정렬한다. 같은 그룹 안에서는 원래 categories 순서를 그대로 유지한다
+    # (sort는 안정 정렬이라 순서가 안 흐트러짐).
+    badges.sort(key=lambda b: b[0])
 
     if badges:
         badge_html = "".join(
             f'<span style="display:inline-flex; align-items:center; gap:4px; font-size:11.5px; '
             f'font-weight:600; color:{fg}; background:{bg}; border-radius:12px; padding:3px 9px; '
             f'margin:3px 6px 0 0;">{emoji} {text}</span>'
-            for fg, bg, emoji, text in badges
+            for _sort_order, fg, bg, emoji, text in badges
         )
         cat_cards += (
             '<div style="grid-column:1 / -1; margin-top:2px;">' + badge_html + '</div>'
