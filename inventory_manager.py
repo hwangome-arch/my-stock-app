@@ -4450,11 +4450,16 @@ def draw_fnguide_details(code):
             </div>
         """, unsafe_allow_html=True)
 
-        if info.get("consensus_note"):
-            _cdbg = _DEBUG_STORE.get(f"_consensus_debug_{code}")
-            if _cdbg:
-                with st.expander("🔧 디버그 정보 (컨센서스 조회 실패 원인 확인용)"):
-                    st.json(_cdbg)
+        # ── [2026-08-27 수정] 컨센서스 디버그 정보(JSON) 숨김 ──────────────────
+        # 개발 단계에서 "왜 컨센서스가 안 잡히는지" 원인 진단용으로 넣어뒀던
+        # expander였는데, 실제 사용자 화면에도 그대로 노출되고 있었다. 일반
+        # 사용자에게는 불필요한 raw 응답 정보라서 화면에서는 뺀다(디버그 저장 자체는
+        # _DEBUG_STORE에 계속 쌓이므로, 필요하면 나중에 다시 켤 수 있다).
+        # if info.get("consensus_note"):
+        #     _cdbg = _DEBUG_STORE.get(f"_consensus_debug_{code}")
+        #     if _cdbg:
+        #         with st.expander("🔧 디버그 정보 (컨센서스 조회 실패 원인 확인용)"):
+        #             st.json(_cdbg)
 
         # ── [2026-08-26 추가] 최근 104주(약 2년) 주간 종가 추이 ─────────────────
         # 대시보드/관심종목의 미니 스파크라인은 종목 카드 하나에 들어가야 해서
@@ -9246,8 +9251,8 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
             f'<div style="flex:1; text-align:center; padding:14px 10px; background:{color}0D; '
             f'border:1px solid {color}33; border-radius:12px;">'
             f'<div style="font-size:11.5px; color:{color}; font-weight:700; margin-bottom:6px;">{icon} {label}</div>'
-            f'<div style="font-size:32px; font-weight:800; color:{color};">{val_100:.0f}</div>'
-            f'<div style="font-size:10px; color:#94A3B8; margin-top:2px;">/ 100</div>'
+            f'<div style="font-size:32px; font-weight:800; color:{color};">'
+            f'{val_100:.0f}<span style="font-size:15px; font-weight:600; color:#94A3B8;"> / 100</span></div>'
             '</div>'
         )
 
