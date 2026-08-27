@@ -418,6 +418,20 @@ def run_parallel_safe(task_fn, items, max_workers=5, overall_timeout=15, per_res
     return results
 # ────────────────────────────────────────────────────────────────────────
 
+# ── 공용 회전 스피너(span) 헬퍼 ─────────────────────────────────────────
+# st.spinner는 with 블록이 끝나는 즉시 사라지는 임시 표시라서, st.info/st.caption/
+# st.markdown처럼 "로딩이 끝날 때까지 화면에 계속 떠있어야 하는" 문구 옆에는 쓸 수
+# 없다. 대신 CSS @keyframes로 회전하는 작은 원(span)을 만들어서, 고정 이모지
+# (🔄/⏳ 등) 자리에 넣어 쓴다. color는 해당 박스의 텍스트 색상과 맞춰서 넘긴다.
+def _spin_span_html(color="#1E40AF"):
+    return (
+        f'<span style="width:12px;height:12px;border:2px solid {color}33;'
+        f'border-top-color:{color};border-radius:50%;display:inline-block;'
+        f'vertical-align:-2px;margin-right:6px;animation:_inv_spin 0.8s linear infinite;'
+        f'flex-shrink:0;"></span>'
+        '<style>@keyframes _inv_spin{from{transform:rotate(0deg);}to{transform:rotate(360deg);}}</style>'
+    )
+
 def run_with_progress(text, func, *args, **kwargs):
     pb = st.progress(0, text=f"🔄 {text}")
     for i in range(1, 85, 12):
@@ -578,7 +592,20 @@ def _global_poll_fragment():
                 scan_pct_text = f" — {_st.get('text', '스캔 중...')} ({min(_st.get('pct', 0), 100)}%)"
             break
         n_total = n_bg + len(scan_jobs)
-        st.info(f"🔄 데이터를 불러오는 중... (백그라운드 작업 {n_total}건 진행 중){scan_pct_text}")
+        # [수정] 기존엔 🔄(고정 이모지)였던 것을, 위쪽 st.spinner처럼 실제로 뱅글뱅글
+        # 도는 동그라미로 교체. st.info는 계속 화면에 떠있어야 하는 요소라
+        # (with st.spinner(): pass 로는 즉시 사라져버림) st.spinner를 그대로 쓸 수
+        # 없어서, st.info와 같은 배색의 박스를 st.markdown+CSS로 직접 그리고
+        # 그 안에 @keyframes로 회전하는 원(span)을 넣는 방식으로 구현.
+        st.markdown(
+            f'<div style="display:flex; align-items:center; gap:2px; background:#EFF6FF; '
+            f'border:1px solid #BFDBFE; border-radius:6px; padding:8px 12px; '
+            f'margin-bottom:10px; font-size:14px; color:#1E40AF;">'
+            f'{_spin_span_html("#1E40AF")}'
+            f'<span>데이터를 불러오는 중... (백그라운드 작업 {n_total}건 진행 중){scan_pct_text}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
 
 
 # ── [탭 이동 중 "끊겼다 됐다" 반복 현상 수정] 다른 페이지 소유의 완료된 job 정리 ──
@@ -7131,8 +7158,9 @@ def render_dashboard():
             # streamlit/issues/10719)에 걸린다. 그래서 스캔이 끝날 때까지는 이
             # 수급 추이 조회 자체를 잠깐 미뤄둔다(스캔이 끝나면 자연히 다시 열림).
             st.markdown(
-                '<div style="border:1px solid #E2E8F0;border-top:none;border-radius:0 0 8px 8px;'
-                'padding:12px 16px;font-size:12px;color:#94A3B8;">⏳ 전체 시장 스캔이 진행 중이라 잠시 후 표시됩니다.</div>',
+                '<div style="display:flex;align-items:center;border:1px solid #E2E8F0;border-top:none;'
+                'border-radius:0 0 8px 8px;padding:12px 16px;font-size:12px;color:#94A3B8;">'
+                f'{_spin_span_html("#94A3B8")}전체 시장 스캔이 진행 중이라 잠시 후 표시됩니다.</div>',
                 unsafe_allow_html=True
             )
         elif is_open:
@@ -7169,8 +7197,9 @@ def render_dashboard():
             # (데이터 안내 박스 바로 아래) 한 곳에서만 뜨도록 통일한다.
             if not _monthly_ready:
                 st.markdown(
-                    '<div style="border:1px solid #E2E8F0;border-top:none;border-radius:0 0 8px 8px;'
-                    'padding:12px 16px;font-size:12px;color:#94A3B8;">⏳ 월별 수급 데이터를 불러오는 중입니다...</div>',
+                    '<div style="display:flex;align-items:center;border:1px solid #E2E8F0;border-top:none;'
+                    'border-radius:0 0 8px 8px;padding:12px 16px;font-size:12px;color:#94A3B8;">'
+                    f'{_spin_span_html("#94A3B8")}월별 수급 데이터를 불러오는 중입니다...</div>',
                     unsafe_allow_html=True
                 )
                 monthly = []
@@ -9601,7 +9630,18 @@ def render_recommendations():
                 # 보이는 새로고침 버튼을 같이 둔다.
                 _cap_col, _btn_col = st.columns([5, 1])
                 with _cap_col:
-                    st.info(f"⏳ AI 종합점수를 계산하는 중입니다 ({_ai_done}/{_ai_total}건, {_ai_pct}%). 완료되면 결과가 한 번에 표시됩니다. 게이지가 한동안 안 움직이면 오른쪽 새로고침을 눌러주세요...")
+                    # [수정] st.info(⏳ 고정 이모지) → 같은 배색의 박스를 직접 그리고
+                    # 그 안에 회전 스피너(_spin_span_html)를 넣는 방식으로 교체.
+                    st.markdown(
+                        f'<div style="display:flex; align-items:center; gap:2px; background:#EFF6FF; '
+                        f'border:1px solid #BFDBFE; border-radius:6px; padding:8px 12px; '
+                        f'margin-bottom:10px; font-size:14px; color:#1E40AF;">'
+                        f'{_spin_span_html("#1E40AF")}'
+                        f'<span>AI 종합점수를 계산하는 중입니다 ({_ai_done}/{_ai_total}건, {_ai_pct}%). '
+                        f'완료되면 결과가 한 번에 표시됩니다. 게이지가 한동안 안 움직이면 오른쪽 새로고침을 눌러주세요...</span>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
                 with _btn_col:
                     if st.button("🔄 새로고침", key="reco_ai_filtered_manual_refresh"):
                         st.rerun()
@@ -9621,7 +9661,17 @@ def render_recommendations():
                 # (정체 감지 시에는 위 _ai_stalled 분기에서 여전히 "새로고침해서
                 # 이어서 계산하기" 버튼을 보여주므로, 진행이 멈췄을 때의 탈출구는
                 # 남아있다.)
-                st.caption(f"🤖 AI 점수 일괄 계산 중... ({_ai_done}/{_ai_total}건, {_ai_pct}%) — 계산되는 동안에도 아래 목록은 그대로 보실 수 있어요.")
+                # [수정] st.caption(🤖 고정 이모지) → caption과 동일한 스타일(회색, 작은 글씨)의
+                # div를 직접 그리고 그 안에 회전 스피너(_spin_span_html)를 넣는 방식으로 교체.
+                st.markdown(
+                    f'<div style="display:flex; align-items:center; gap:2px; '
+                    f'color:#808495; font-size:14px; margin-top:-8px; margin-bottom:8px;">'
+                    f'{_spin_span_html("#808495")}'
+                    f'<span>AI 점수 일괄 계산 중... ({_ai_done}/{_ai_total}건, {_ai_pct}%) '
+                    f'— 계산되는 동안에도 아래 목록은 그대로 보실 수 있어요.</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
         elif st.session_state.get('_reco_ai_bulk_scan_done_info'):
             # ⚠️ [완료 표시] 계산이 끝난 뒤에도 (다음 스캔을 새로 누르기 전까지)
             # 계속 남아있는 안내 — "조용히 사라짐" 대신 "확실히 끝났다"는 걸
