@@ -10272,6 +10272,179 @@ def resolve_stock_query(query):
 
     return None, None, []
 
+def _calculate_martingale_rounds(current_price, initial_amount, multiplier, drop_pct, target_profit_pct, max_rounds):
+    """마틴게일(물타기) 시나리오를 회차별로 계산한다.
+
+    ⚠️ [설계 의도] 실제 주가가 정확히 drop_pct%씩 규칙적으로 하락한다고
+    가정하는 게 아니다. "만약 이런 흐름으로 계속 하락했다면 회차마다 필요
+    자금과 회복(반등) 조건이 얼마나 커지는지"를 보여주는 what-if 산술
+    시뮬레이션이며, 실제 매수/매도 주문을 만들거나 실행하지 않는다.
+    """
+    rows = []
+    price = float(current_price)
+    buy_amount = float(initial_amount)
+    cum_invested = 0.0
+    cum_shares = 0.0
+    for n in range(1, int(max_rounds) + 1):
+        if n > 1:
+            price = price * (1 - drop_pct / 100.0)
+            buy_amount = buy_amount * multiplier
+        if price <= 0:
+            # 하락률 100% 이상 등 비정상 입력이면 더 이상 계산 불가 — 여기서 중단.
+            break
+        shares = buy_amount / price
+        cum_invested += buy_amount
+        cum_shares += shares
+        avg_price = cum_invested / cum_shares if cum_shares > 0 else 0
+        breakeven_rebound_pct = (avg_price / price - 1) * 100 if price > 0 else 0
+        target_price = avg_price * (1 + target_profit_pct / 100.0)
+        target_rebound_pct = (target_price / price - 1) * 100 if price > 0 else 0
+        drop_from_start_pct = (price / float(current_price) - 1) * 100
+        rows.append({
+            "회차": n,
+            "매수단가": price,
+            "시작가대비": drop_from_start_pct,
+            "이번회차매수금액": buy_amount,
+            "누적투자금액": cum_invested,
+            "평단가": avg_price,
+            "본전필요반등률": breakeven_rebound_pct,
+            "목표필요반등률": target_rebound_pct,
+        })
+    return pd.DataFrame(rows)
+
+
+def render_martingale_simulator(code, current_price):
+    """AI 확률분석 탭 하단에 붙는 "마틴게일(물타기) 시뮬레이터".
+
+    ⚠️ 이 계산기는 매매를 추천하거나 자동으로 실행하지 않는다. 사용자가
+    입력한 조건(하락 기준·배율·최대 회차)대로 하락이 반복됐다고 가정할 때
+    필요 자금과 회복 조건이 얼마나 커지는지를 미리 보여주는 참고용
+    what-if 계산기다. AI 종합점수/도달확률과는 완전히 별개의 도구다.
+    """
+    st.markdown("<hr style='margin:24px 0 16px 0; border-color:#E5E7EB;'>", unsafe_allow_html=True)
+    st.markdown(
+        "<h4 style='font-size:16px; margin-bottom:4px;'>🎰 마틴게일(물타기) 시뮬레이터</h4>",
+        unsafe_allow_html=True
+    )
+    st.markdown(
+        "<p style='font-size:12px; color:#64748B; margin-bottom:10px;'>"
+        "하락할 때마다 매수 금액을 배로 늘려가는 시나리오를 미리 계산해봅니다. "
+        "<b>매매를 추천하거나 자동 실행하지 않으며</b>, 입력한 조건대로 하락이 이어졌을 때 "
+        "필요 자금과 회복 조건이 얼마나 커지는지 보여주는 참고용 계산기입니다.</p>",
+        unsafe_allow_html=True
+    )
+
+    with st.form(f"martingale_form_{code}", border=False):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            initial_amount = st.number_input(
+                "1회차 매수금액 (원)", min_value=10000, value=100000, step=10000,
+                key=f"mg_initial_{code}"
+            )
+        with c2:
+            multiplier = st.number_input(
+                "회차별 배율 (배)", min_value=1.1, max_value=5.0, value=2.0, step=0.1,
+                key=f"mg_mult_{code}"
+            )
+        with c3:
+            drop_pct = st.number_input(
+                "추가매수 하락 기준 (%)", min_value=1.0, max_value=50.0, value=10.0, step=1.0,
+                key=f"mg_drop_{code}"
+            )
+        c4, c5 = st.columns(2)
+        with c4:
+            target_profit_pct = st.number_input(
+                "목표 수익률 (평단가 대비, %)", min_value=1.0, max_value=100.0, value=5.0, step=1.0,
+                key=f"mg_target_{code}"
+            )
+        with c5:
+            max_rounds = st.number_input(
+                "최대 회차 (자금 한도)", min_value=2, max_value=15, value=6, step=1,
+                key=f"mg_rounds_{code}"
+            )
+        run_btn = st.form_submit_button("📊 시뮬레이션 실행", use_container_width=True)
+
+    # 폼 제출 시 결과를 세션에 저장해두고, 다른 위젯(로그스케일 체크박스 등) 조작으로
+    # 페이지가 다시 실행되더라도(=폼 재제출 없이도) 마지막 계산 결과가 계속 보이게 한다.
+    result_key = f"mg_result_{code}"
+    if run_btn:
+        st.session_state[result_key] = (initial_amount, multiplier, drop_pct, target_profit_pct, max_rounds)
+
+    if result_key not in st.session_state:
+        return
+
+    _init, _mult, _drop, _target, _rounds = st.session_state[result_key]
+    df = _calculate_martingale_rounds(current_price, _init, _mult, _drop, _target, int(_rounds))
+    if df.empty:
+        st.warning("계산에 필요한 값이 올바르지 않습니다. 입력값을 다시 확인해주세요.")
+        return
+
+    last = df.iloc[-1]
+    total_needed = last["누적투자금액"]
+    multiple_of_initial = total_needed / _init if _init else 0
+    breakeven_needed = last["본전필요반등률"]
+
+    st.markdown(
+        f"""
+        <div style="background:#FEF2F2; border:1.5px solid #DC2626; border-radius:14px;
+                    padding:16px 18px; margin:12px 0;">
+            <div style="font-size:14px; font-weight:800; color:#B91C1C; margin-bottom:8px;">
+                ⚠️ {int(_rounds)}회차까지 이어질 경우
+            </div>
+            <div style="font-size:13px; color:#111827; line-height:1.7;">
+                필요 총자금: <b>{total_needed:,.0f}원</b> (1회차 매수금액 대비 <b>{multiple_of_initial:.1f}배</b>)<br>
+                이 시점 매수단가 기준 <b>본전까지 필요한 반등률: {breakeven_needed:.1f}%</b><br>
+                하락이 {int(_rounds)}회차를 넘어서거나 이 종목이 상장폐지될 경우, 위 금액은
+                회수 불가능한 손실이 될 수 있습니다.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    import altair as alt
+    _chart_df = df[["회차", "누적투자금액"]].copy()
+    _log_scale = st.checkbox(
+        "차트를 로그 스케일로 보기 (회차가 늘수록 금액 차이가 커서 보기 어려울 때)",
+        key=f"mg_log_{code}"
+    )
+    _y_scale = alt.Scale(type="log") if _log_scale else alt.Scale(type="linear")
+    _bar = alt.Chart(_chart_df).mark_bar(color="#DC2626").encode(
+        x=alt.X("회차:O", title="회차"),
+        y=alt.Y("누적투자금액:Q", title="누적 투자금액(원)", scale=_y_scale,
+                axis=alt.Axis(format=",.0f")),
+        tooltip=[
+            alt.Tooltip("회차:O", title="회차"),
+            alt.Tooltip("누적투자금액:Q", title="누적 투자금액(원)", format=",.0f"),
+        ]
+    ).properties(height=260)
+    st.altair_chart(_bar, use_container_width=True)
+
+    _display_df = df.copy()
+    _display_df["매수단가"] = _display_df["매수단가"].map(lambda v: f"{v:,.0f}원")
+    _display_df["시작가대비"] = _display_df["시작가대비"].map(lambda v: f"{v:.1f}%")
+    _display_df["이번회차매수금액"] = _display_df["이번회차매수금액"].map(lambda v: f"{v:,.0f}원")
+    _display_df["누적투자금액"] = _display_df["누적투자금액"].map(lambda v: f"{v:,.0f}원")
+    _display_df["평단가"] = _display_df["평단가"].map(lambda v: f"{v:,.0f}원")
+    _display_df["본전필요반등률"] = _display_df["본전필요반등률"].map(lambda v: f"{v:.1f}%")
+    _display_df["목표필요반등률"] = _display_df["목표필요반등률"].map(lambda v: f"{v:.1f}%")
+    _display_df = _display_df.rename(columns={
+        "시작가대비": "1회차 대비 하락률",
+        "이번회차매수금액": "이번 회차 매수금액",
+        "누적투자금액": "누적 투자금액",
+        "본전필요반등률": "본전 필요 반등률",
+        "목표필요반등률": f"목표({_target:.0f}%) 필요 반등률",
+    })
+    st.dataframe(_display_df, use_container_width=True, hide_index=True)
+
+    st.caption(
+        "🔎 이 계산은 입력한 조건(하락률·배율)이 그대로 반복된다는 가정 아래의 산술 시뮬레이션입니다. "
+        "실제 주가는 이렇게 규칙적으로 움직이지 않으며, 특히 개별 종목은 지수와 달리 상장폐지로 0원까지 "
+        "떨어질 수 있어 '언젠가 반등한다'는 전제 자체가 성립하지 않을 수 있습니다. 투자 조언이 아니며, "
+        "투자 판단과 그 결과는 본인 책임입니다."
+    )
+
+
 def render_ai_probability():
     """[신규 탭 뼈대 — 2026-08-18] "AI 확률분석"
 
@@ -10497,6 +10670,9 @@ def render_ai_probability():
         cached['per_ai'], cached['pbr_ai'], cached['roe_ai'], cached['debt_ai'],
         cached['drop_pct_ai'], cached['div_ai'], ""
     )
+
+    # ── 마틴게일(물타기) 시뮬레이터 — 이 탭의 세 번째 섹션 ─────────────────
+    render_martingale_simulator(code, current_price)
 
 
 def render_fnguide():
@@ -11105,14 +11281,15 @@ def render_market_pulse():
                 "국내": ("#334155", "#F1F5F9"),
                 "해외": ("#7C3AED", "#F5F3FF"),
             }
-            # ── [2026-08-24 추가] 국내/해외 번갈아 배치 ──────────────────────
-            # Gemini가 반환하는 topics 순서는 국내/해외가 뒤섞여 랜덤하게 나온다.
-            # "국내 → 해외 → 국내 → 해외..." 순으로 보이도록, 각 region 내에서는
-            # 원래(=AI가 매긴 중요도) 순서를 그대로 유지한 채 교대로 재배치한다.
-            # 한쪽이 먼저 소진되면 남은 쪽을 이어서 붙인다.
+            # ── [2026-08-28 수정] 국내/해외 번갈아 배치 → 그룹 배치로 변경 ──────
+            # 기존에는 "국내 → 해외 → 국내 → 해외..."로 교대 배치했는데, 실제로
+            # 보면 국내/해외가 한 줄씩 번갈아 섞여 나와 오히려 구분이 어렵다는
+            # 피드백을 받았다. 이제는 각 region 내에서 원래(=AI가 매긴 중요도)
+            # 순서를 유지한 채, 국내 토픽을 먼저 전부 보여주고 그 다음에 해외
+            # 토픽을 이어서 보여주도록 그룹으로 묶는다.
             _domestic = [t for t in topics if t.get("region", "국내") == "국내"]
             _overseas = [t for t in topics if t.get("region", "국내") == "해외"]
-            topics = [t for pair in zip_longest(_domestic, _overseas) for t in pair if t is not None]
+            topics = _domestic + _overseas
             for t in topics:
                 impact = t.get("impact", "중립")
                 color, bg = impact_style.get(impact, impact_style["중립"])
