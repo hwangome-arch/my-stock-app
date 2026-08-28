@@ -10334,12 +10334,27 @@ def render_martingale_simulator(code, current_price):
         unsafe_allow_html=True
     )
 
+    # 💬 [자동 콤마 포맷] 목표가 입력란(aiprob_target_input)과 동일한 패턴 —
+    # number_input은 콤마 표기를 지원하지 않아서 "100000"처럼 읽기 불편하게
+    # 표시된다. text_input + on_change로 값이 바뀔 때마다 숫자만 추출해
+    # "100,000" 형태로 다시 저장한다. (st.form 안의 on_change는 폼 제출 시점에
+    # 실행되므로, "시뮬레이션 실행" 버튼을 누르면 콤마가 반영된 채로 다시 표시된다.)
+    _mg_amount_key = f"mg_initial_{code}"
+    if _mg_amount_key not in st.session_state:
+        st.session_state[_mg_amount_key] = "100,000"
+
+    def _fmt_mg_amount(k=_mg_amount_key):
+        digits = re.sub(r"[^\d]", "", str(st.session_state.get(k, "")))
+        st.session_state[k] = f"{int(digits):,}" if digits else ""
+
     with st.form(f"martingale_form_{code}", border=False):
         c1, c2, c3 = st.columns(3)
         with c1:
-            initial_amount = st.number_input(
-                "1회차 매수금액 (원)", min_value=10000, value=100000, step=10000,
-                key=f"mg_initial_{code}"
+            st.text_input(
+                "1회차 매수금액 (원)",
+                key=_mg_amount_key,
+                on_change=_fmt_mg_amount,
+                placeholder="예: 100,000"
             )
         with c2:
             multiplier = st.number_input(
@@ -10363,6 +10378,15 @@ def render_martingale_simulator(code, current_price):
                 key=f"mg_rounds_{code}"
             )
         run_btn = st.form_submit_button("📊 시뮬레이션 실행", use_container_width=True)
+
+    # 콤마 포함 텍스트("100,000")에서 숫자만 뽑아 실제 계산용 정수로 변환.
+    # 값이 비어있거나 이상하면(0원 등) 기본값 10만 원으로 대체해 계산이 죽지 않게 한다.
+    try:
+        initial_amount = int(re.sub(r"[^\d]", "", st.session_state.get(_mg_amount_key, "")))
+    except Exception:
+        initial_amount = 0
+    if initial_amount < 10000:
+        initial_amount = 100000
 
     # 폼 제출 시 결과를 세션에 저장해두고, 다른 위젯(로그스케일 체크박스 등) 조작으로
     # 페이지가 다시 실행되더라도(=폼 재제출 없이도) 마지막 계산 결과가 계속 보이게 한다.
