@@ -10336,9 +10336,10 @@ def render_martingale_simulator(code, current_price):
 
     # 💬 [자동 콤마 포맷] 목표가 입력란(aiprob_target_input)과 동일한 패턴 —
     # number_input은 콤마 표기를 지원하지 않아서 "100000"처럼 읽기 불편하게
-    # 표시된다. text_input + on_change로 값이 바뀔 때마다 숫자만 추출해
-    # "100,000" 형태로 다시 저장한다. (st.form 안의 on_change는 폼 제출 시점에
-    # 실행되므로, "시뮬레이션 실행" 버튼을 누르면 콤마가 반영된 채로 다시 표시된다.)
+    # 표시된다. text_input에서 숫자만 추출해 "100,000" 형태로 다시 저장한다.
+    # (이 입력란은 st.form 안에 있어서 text_input 자체에는 on_change 콜백을
+    # 걸 수 없다 — 대신 아래 form_submit_button의 on_click 콜백에서 포맷하며,
+    # "시뮬레이션 실행" 버튼을 누르면 콤마가 반영된 채로 다시 표시된다.)
     _mg_amount_key = f"mg_initial_{code}"
     if _mg_amount_key not in st.session_state:
         st.session_state[_mg_amount_key] = "100,000"
@@ -10350,10 +10351,16 @@ def render_martingale_simulator(code, current_price):
     with st.form(f"martingale_form_{code}", border=False):
         c1, c2, c3 = st.columns(3)
         with c1:
+            # ⚠️ [버그 수정: StreamlitInvalidFormCallbackError]
+            # st.form 내부의 위젯에는 on_change/on_click 콜백을 걸 수 없다
+            # (st.form_submit_button만 예외). 예전에는 이 text_input에
+            # on_change=_fmt_mg_amount를 걸어 입력할 때마다 콤마를 자동
+            # 포맷했는데, 폼 안이라 앱이 렌더링되자마자 즉시 예외를 던지며
+            # 죽었다. 콤마 포맷은 아래 "폼 제출(run_btn) 시점"으로 옮겨서,
+            # 실행 버튼을 누르면 값이 콤마 포맷으로 다시 표시되도록 한다.
             st.text_input(
                 "1회차 매수금액 (원)",
                 key=_mg_amount_key,
-                on_change=_fmt_mg_amount,
                 placeholder="예: 100,000"
             )
         with c2:
@@ -10377,7 +10384,19 @@ def render_martingale_simulator(code, current_price):
                 "최대 회차 (자금 한도)", min_value=2, max_value=15, value=6, step=1,
                 key=f"mg_rounds_{code}"
             )
-        run_btn = st.form_submit_button("📊 시뮬레이션 실행", use_container_width=True)
+        # ⚠️ [버그 수정: StreamlitInvalidFormCallbackError]
+        # st.form 안에서 콜백(on_change/on_click)이 허용되는 위젯은
+        # st.form_submit_button 뿐이다. 예전에는 위 text_input에
+        # on_change=_fmt_mg_amount를 걸었는데, 폼 안이라 렌더링 즉시
+        # 예외가 발생했다. 콤마 자동 포맷 콜백을 여기 submit 버튼의
+        # on_click으로 옮긴다 — 콜백은 스크립트가 다시 실행되기 "전"에
+        # 실행되므로, text_input이 아직 이번 rerun에서 인스턴스화되지
+        # 않은 시점에 안전하게 session_state를 갱신할 수 있다.
+        run_btn = st.form_submit_button(
+            "📊 시뮬레이션 실행",
+            use_container_width=True,
+            on_click=_fmt_mg_amount,
+        )
 
     # 콤마 포함 텍스트("100,000")에서 숫자만 뽑아 실제 계산용 정수로 변환.
     # 값이 비어있거나 이상하면(0원 등) 기본값 10만 원으로 대체해 계산이 죽지 않게 한다.
