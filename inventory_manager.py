@@ -10360,6 +10360,53 @@ def render_martingale_simulator(code, current_price):
         digits = re.sub(r"[^\d]", "", str(st.session_state.get(k, "")))
         st.session_state[k] = f"{int(digits):,}" if digits else ""
 
+    # [신규] 예산(총 투자 한도) — 회차가 늘어날수록 필요 자금이 커지는데,
+    # "내가 실제로 쓸 수 있는 돈은 이만큼"이라는 한도를 넣으면 몇 회차부터
+    # 예산이 부족해지는지 바로 보여줄 수 있다. 선택 입력이라 기본값은 빈 문자열
+    # (비워두면 예산 제한 없이 기존처럼 회차 한도까지만 계산).
+    _mg_budget_key = f"mg_budget_{code}"
+    if _mg_budget_key not in st.session_state:
+        st.session_state[_mg_budget_key] = ""
+
+    def _fmt_mg_budget(k=_mg_budget_key):
+        digits = re.sub(r"[^\d]", "", str(st.session_state.get(k, "")))
+        st.session_state[k] = f"{int(digits):,}" if digits else ""
+
+    # [신규] "예산에 맞춰 1회차 매수금액 자동 계산" 토글. 체크하면 사용자가
+    # 1회차 매수금액을 직접 입력하지 않아도, 예산·배율·최대회차로 역산해서
+    # 마지막 회차까지 정확히 예산을 다 쓰도록 1회차 금액을 자동으로 채운다.
+    _mg_auto_key = f"mg_auto_budget_{code}"
+    if _mg_auto_key not in st.session_state:
+        st.session_state[_mg_auto_key] = False
+
+    def _fmt_mg_inputs():
+        # form_submit_button의 on_click은 콜백 하나만 받으므로, 매수금액과
+        # 예산 두 입력란을 함께 포맷하는 래퍼. "예산 자동계산" 모드가 켜져
+        # 있으면 1회차 매수금액은 사용자가 입력한 값 대신 예산 역산값으로
+        # 덮어쓴다. 이 콜백은 폼 제출 시 rerun이 시작되기 "전"에 실행되므로
+        # (=text_input이 아직 이번 rerun에서 인스턴스화되지 않은 시점)
+        # session_state를 안전하게 갱신할 수 있다.
+        _fmt_mg_budget()
+        if st.session_state.get(_mg_auto_key, False):
+            _budget_digits = re.sub(r"[^\d]", "", str(st.session_state.get(_mg_budget_key, "")))
+            _budget_val = int(_budget_digits) if _budget_digits else None
+            _mult_val = st.session_state.get(f"mg_mult_{code}", 2.0)
+            _rounds_val = int(st.session_state.get(f"mg_rounds_{code}", 6))
+            if _budget_val and _mult_val and _rounds_val:
+                # 등비수열 합: 1회차*mult^0 + 1회차*mult^1 + ... + 1회차*mult^(N-1) = 예산
+                if abs(_mult_val - 1.0) < 1e-9:
+                    _ratio_sum = float(_rounds_val)
+                else:
+                    _ratio_sum = (_mult_val ** _rounds_val - 1) / (_mult_val - 1)
+                if _ratio_sum > 0:
+                    _computed = max(1, int(round(_budget_val / _ratio_sum)))
+                    st.session_state[_mg_amount_key] = f"{_computed:,}"
+            # 예산이 비어있으면 자동계산을 건너뛰고 기존 입력값 포맷만 유지
+            else:
+                _fmt_mg_amount()
+        else:
+            _fmt_mg_amount()
+
     with st.form(f"martingale_form_{code}", border=False):
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -10373,7 +10420,8 @@ def render_martingale_simulator(code, current_price):
             st.text_input(
                 "1회차 매수금액 (원)",
                 key=_mg_amount_key,
-                placeholder="기본값: 현재가 1주 기준"
+                placeholder="기본값: 현재가 1주 기준",
+                disabled=st.session_state.get(_mg_auto_key, False),
             )
         with c2:
             multiplier = st.number_input(
@@ -10385,7 +10433,7 @@ def render_martingale_simulator(code, current_price):
                 "추가매수 하락 기준 (%)", min_value=1.0, max_value=50.0, value=10.0, step=1.0,
                 key=f"mg_drop_{code}"
             )
-        c4, c5 = st.columns(2)
+        c4, c5, c6 = st.columns(3)
         with c4:
             target_profit_pct = st.number_input(
                 "목표 수익률 (평단가 대비, %)", min_value=1.0, max_value=100.0, value=5.0, step=1.0,
@@ -10396,6 +10444,18 @@ def render_martingale_simulator(code, current_price):
                 "최대 회차 (자금 한도)", min_value=2, max_value=15, value=6, step=1,
                 key=f"mg_rounds_{code}"
             )
+        with c6:
+            # [신규] 예산 한도(선택). 비워두면 예산 제한 없이 max_rounds까지만 계산.
+            st.text_input(
+                "총 예산 한도 (원, 선택)",
+                key=_mg_budget_key,
+                placeholder="예: 5,000,000"
+            )
+        st.checkbox(
+            "💡 예산에 맞춰 1회차 매수금액 자동 계산 "
+            "(체크하면 위 1회차 매수금액 입력은 무시되고, 예산·배율·최대회차 기준으로 역산됩니다)",
+            key=_mg_auto_key
+        )
         # ⚠️ [버그 수정: StreamlitInvalidFormCallbackError]
         # st.form 안에서 콜백(on_change/on_click)이 허용되는 위젯은
         # st.form_submit_button 뿐이다. 예전에는 위 text_input에
@@ -10407,7 +10467,7 @@ def render_martingale_simulator(code, current_price):
         run_btn = st.form_submit_button(
             "📊 시뮬레이션 실행",
             use_container_width=True,
-            on_click=_fmt_mg_amount,
+            on_click=_fmt_mg_inputs,
         )
 
     # 콤마 포함 텍스트("100,000")에서 숫자만 뽑아 실제 계산용 정수로 변환.
@@ -10419,16 +10479,29 @@ def render_martingale_simulator(code, current_price):
     if initial_amount < 10000:
         initial_amount = 100000
 
+    # [신규] 예산 한도 파싱. 선택 입력이라 비어있으면 None(제한 없음)으로 처리.
+    try:
+        _budget_digits = re.sub(r"[^\d]", "", st.session_state.get(_mg_budget_key, ""))
+        budget_amount = int(_budget_digits) if _budget_digits else None
+    except Exception:
+        budget_amount = None
+
     # 폼 제출 시 결과를 세션에 저장해두고, 다른 위젯(로그스케일 체크박스 등) 조작으로
     # 페이지가 다시 실행되더라도(=폼 재제출 없이도) 마지막 계산 결과가 계속 보이게 한다.
     result_key = f"mg_result_{code}"
     if run_btn:
-        st.session_state[result_key] = (initial_amount, multiplier, drop_pct, target_profit_pct, max_rounds)
+        st.session_state[result_key] = (initial_amount, multiplier, drop_pct, target_profit_pct, max_rounds, budget_amount)
 
     if result_key not in st.session_state:
         return
 
-    _init, _mult, _drop, _target, _rounds = st.session_state[result_key]
+    _stored = st.session_state[result_key]
+    if len(_stored) == 6:
+        _init, _mult, _drop, _target, _rounds, _budget = _stored
+    else:
+        # 예산 필드 추가 전(구버전)에 저장된 세션 데이터와의 호환 — 예산 없음으로 처리.
+        _init, _mult, _drop, _target, _rounds = _stored
+        _budget = None
     df = _calculate_martingale_rounds(current_price, _init, _mult, _drop, _target, int(_rounds))
     if df.empty:
         st.warning("계산에 필요한 값이 올바르지 않습니다. 입력값을 다시 확인해주세요.")
@@ -10438,6 +10511,32 @@ def render_martingale_simulator(code, current_price):
     total_needed = last["누적투자금액"]
     multiple_of_initial = total_needed / _init if _init else 0
     breakeven_needed = last["본전필요반등률"]
+
+    # [신규] 예산 대비 상태 계산 — 누적 투자금액이 예산을 넘어서는 첫 회차를 찾는다.
+    # (자동계산 모드는 정수 원 단위로 반올림하기 때문에 마지막 회차에서 예산을
+    # 1~2원 정도 근소하게 넘을 수 있다 — 이런 반올림 오차까지 "초과"로 표시되지
+    # 않도록 약간의 허용치를 둔다.)
+    _budget_tolerance = max(1.0, _budget * 0.0005) if _budget else 0
+    _budget_exceed_round = None
+    if _budget:
+        _over = df[df["누적투자금액"] > _budget + _budget_tolerance]
+        if not _over.empty:
+            _budget_exceed_round = int(_over.iloc[0]["회차"])
+
+    if _budget:
+        if _budget_exceed_round is None:
+            _budget_html = (
+                f"설정한 예산: <b>{_budget:,.0f}원</b> — "
+                f"✅ {int(_rounds)}회차까지 이 예산 안에서 모두 대응 가능합니다.<br>"
+            )
+        else:
+            _budget_html = (
+                f"설정한 예산: <b>{_budget:,.0f}원</b> — "
+                f"⚠️ <b>{_budget_exceed_round}회차부터 예산을 초과</b>합니다 "
+                f"(그 이전 {_budget_exceed_round - 1}회차까지만 이 예산으로 대응 가능).<br>"
+            )
+    else:
+        _budget_html = ""
 
     st.markdown(
         f"""
@@ -10449,6 +10548,7 @@ def render_martingale_simulator(code, current_price):
             <div style="font-size:13px; color:#111827; line-height:1.7;">
                 필요 총자금: <b>{total_needed:,.0f}원</b> (1회차 매수금액 대비 <b>{multiple_of_initial:.1f}배</b>)<br>
                 이 시점 매수단가 기준 <b>본전까지 필요한 반등률: {breakeven_needed:.1f}%</b><br>
+                {_budget_html}
                 하락이 {int(_rounds)}회차를 넘어서거나 이 종목이 상장폐지될 경우, 위 금액은
                 회수 불가능한 손실이 될 수 있습니다.
             </div>
@@ -10473,9 +10573,24 @@ def render_martingale_simulator(code, current_price):
             alt.Tooltip("누적투자금액:Q", title="누적 투자금액(원)", format=",.0f"),
         ]
     ).properties(height=260)
-    st.altair_chart(_bar, use_container_width=True)
+    if _budget:
+        # [신규] 설정한 예산을 점선으로 표시해 어느 회차부터 막대가 선을
+        # 넘는지 한눈에 보이게 한다.
+        _budget_rule = alt.Chart(pd.DataFrame({"예산": [_budget]})).mark_rule(
+            color="#111827", strokeDash=[4, 4], size=2
+        ).encode(y=alt.Y("예산:Q", scale=_y_scale))
+        st.altair_chart(_bar + _budget_rule, use_container_width=True)
+    else:
+        st.altair_chart(_bar, use_container_width=True)
 
     _display_df = df.copy()
+    if _budget:
+        # [신규] 예산 설정 시, 회차별로 그 시점 누적 투자금액이 예산 안에
+        # 드는지 한눈에 보이는 컬럼을 추가한다. (순서상 아래 map() 포맷팅으로
+        # 숫자가 문자열로 바뀌기 전에 원본 누적투자금액으로 먼저 계산해둔다.)
+        _display_df["예산상태"] = _display_df["누적투자금액"].map(
+            lambda v: "✅ 가능" if v <= _budget + _budget_tolerance else "⚠️ 예산초과"
+        )
     _display_df["매수단가"] = _display_df["매수단가"].map(lambda v: f"{v:,.0f}원")
     _display_df["시작가대비"] = _display_df["시작가대비"].map(lambda v: f"{v:.1f}%")
     _display_df["이번회차매수금액"] = _display_df["이번회차매수금액"].map(lambda v: f"{v:,.0f}원")
