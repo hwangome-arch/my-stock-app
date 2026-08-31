@@ -10342,7 +10342,19 @@ def render_martingale_simulator(code, current_price):
     # "시뮬레이션 실행" 버튼을 누르면 콤마가 반영된 채로 다시 표시된다.)
     _mg_amount_key = f"mg_initial_{code}"
     if _mg_amount_key not in st.session_state:
-        st.session_state[_mg_amount_key] = "100,000"
+        # [수정] 예전에는 종목과 무관하게 무조건 "100,000"을 기본값으로 뒀는데,
+        # 종목별 가격 스케일이 천차만별이라(수천원짜리 종목엔 과하게 크고,
+        # 수십만원짜리 종목엔 1주도 안 되는 애매한 값이 됨) 실사용성이 떨어졌다.
+        # 이제 해당 종목의 현재가를 1회차 매수금액 기본값으로 사용해 "1주 매수
+        # 기준으로 물타기하면 어떻게 되는지"를 바로 확인할 수 있게 한다.
+        # (current_price가 없거나 이상한 값이면 기존처럼 10만 원으로 폴백)
+        try:
+            _default_amount = int(round(current_price))
+        except Exception:
+            _default_amount = 0
+        if _default_amount < 1:
+            _default_amount = 100000
+        st.session_state[_mg_amount_key] = f"{_default_amount:,}"
 
     def _fmt_mg_amount(k=_mg_amount_key):
         digits = re.sub(r"[^\d]", "", str(st.session_state.get(k, "")))
@@ -10361,7 +10373,7 @@ def render_martingale_simulator(code, current_price):
             st.text_input(
                 "1회차 매수금액 (원)",
                 key=_mg_amount_key,
-                placeholder="예: 100,000"
+                placeholder="기본값: 현재가 1주 기준"
             )
         with c2:
             multiplier = st.number_input(
