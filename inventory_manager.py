@@ -7673,10 +7673,10 @@ def calc_trend_score(df_price):
     본연의 역할에만 집중한다."""
     try:
         if df_price is None or df_price.empty:
-            return 100.0
+            return 50.0
         closes = df_price["Close"].dropna()
         if len(closes) < 20:
-            return 100.0
+            return 50.0
 
         ma5 = closes.tail(5).mean()
         ma20 = closes.tail(20).mean()
@@ -7686,16 +7686,28 @@ def calc_trend_score(df_price):
         gap_short = (ma5 - ma20) / ma20 * 100 if ma20 else 0
         gap_long = (ma20 - ma60) / ma60 * 100 if ma60 else 0
         align_pct = gap_short + gap_long
-        s_align = _lerp_score(align_pct, [(-8, 13), (0, 52), (3, 91), (8, 130)])
+        # ⚠️ [2026-09 앵커 재조정: 더 엄격하게] 기존 [(-8,13),(0,52),(3,91),(8,130)]는
+        # align_pct=0(=사실상 무추세, 5/20/60일선이 거의 겹친 상태)에서도 52/130점(40%)을
+        # 주고, align_pct=3%(그렇게 강하지 않은 정배열)만 돼도 91/130점(70%)까지 올라가서
+        # "추세가 딱히 없는" 종목도 이미 절반 가까운 점수를 챙겨가는 문제가 있었다.
+        # 만점(130)·최저점(13) 자체는 유지하되(=200점 만점/전체 1000점 중 20% 비중은
+        # 그대로), 무추세 지점의 배점을 30점(23%)으로 낮추고, 91점에 해당하던 앵커를
+        # align_pct=3%→4%로 밀어 같은 점수를 받기 위한 문턱을 높였다. 최고점(130)도
+        # align_pct=8%→10%로 밀어, 진짜 뚜렷한 정배열이어야 만점에 가까워지게 했다.
+        s_align = _lerp_score(align_pct, [(-8, 13), (0, 30), (4, 75), (10, 130)])
 
         recent20 = closes.tail(20)
         ma20_series = closes.rolling(20).mean().reindex(recent20.index)
         above_ratio = (recent20 > ma20_series).sum() / len(recent20)
-        s_persist = _lerp_score(above_ratio, [(0, 0), (0.3, 17.5), (0.5, 35), (0.8, 70), (1.0, 70)])
+        # ⚠️ [2026-09 앵커 재조정: 더 엄격하게] 기존엔 above_ratio=0.5(20일선 위/아래를
+        # 반반, 사실상 무추세)에서도 35/70점(50%)을 줬고, 0.8만 넘으면 이미 만점(70)이라
+        # 변별력이 약했다. 0.5 지점 배점을 20점(29%)으로 낮추고, 만점 도달 지점을
+        # 0.8→1.0으로 밀어 "20일 내내 20일선 위였던" 경우에만 만점을 주도록 했다.
+        s_persist = _lerp_score(above_ratio, [(0, 0), (0.3, 10), (0.5, 20), (0.8, 50), (1.0, 70)])
 
         return round(max(0, min(200, s_align + s_persist)), 1)
     except Exception:
-        return 100.0
+        return 50.0
 
 
 def calc_volume_score(df_price, exclude_today=False):
@@ -9665,25 +9677,21 @@ def render_recommendations():
                 if st.button("🔄 새로고침해서 이어서 계산하기", key="reco_ai_stall_refresh"):
                     st.rerun()
             else:
-                # 위와 동일한 이유(정체 감지는 재실행이 계속 돼야만 작동) — 항상
-                # 보이는 새로고침 버튼을 같이 둔다.
-                _cap_col, _btn_col = st.columns([5, 1])
-                with _cap_col:
-                    # [수정] st.info(⏳ 고정 이모지) → 같은 배색의 박스를 직접 그리고
-                    # 그 안에 회전 스피너(_spin_span_html)를 넣는 방식으로 교체.
-                    st.markdown(
-                        f'<div style="display:flex; align-items:center; gap:2px; background:#EFF6FF; '
-                        f'border:1px solid #BFDBFE; border-radius:6px; padding:8px 12px; '
-                        f'margin-bottom:10px; font-size:14px; color:#1E40AF;">'
-                        f'{_spin_span_html("#1E40AF")}'
-                        f'<span>AI 종합점수를 계산하는 중입니다 ({_ai_done}/{_ai_total}건, {_ai_pct}%). '
-                        f'완료되면 결과가 한 번에 표시됩니다. 게이지가 한동안 안 움직이면 오른쪽 새로고침을 눌러주세요...</span>'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
-                with _btn_col:
-                    if st.button("🔄 새로고침", key="reco_ai_filtered_manual_refresh"):
-                        st.rerun()
+                # [수정] 사용자 요청으로 수동 새로고침 버튼 제거. 정체(stall) 감지 시에는
+                # 위 _ai_stalled 분기에서 여전히 "새로고침해서 이어서 계산하기" 버튼을
+                # 보여주므로, 진행이 실제로 멈췄을 때의 탈출구는 그대로 남아있다.
+                # [수정] st.info(⏳ 고정 이모지) → 같은 배색의 박스를 직접 그리고
+                # 그 안에 회전 스피너(_spin_span_html)를 넣는 방식으로 교체.
+                st.markdown(
+                    f'<div style="display:flex; align-items:center; gap:2px; background:#EFF6FF; '
+                    f'border:1px solid #BFDBFE; border-radius:6px; padding:8px 12px; '
+                    f'margin-bottom:10px; font-size:14px; color:#1E40AF;">'
+                    f'{_spin_span_html("#1E40AF")}'
+                    f'<span>AI 종합점수를 계산하는 중입니다 ({_ai_done}/{_ai_total}건, {_ai_pct}%). '
+                    f'완료되면 결과가 한 번에 표시됩니다...</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
             return
         elif _ai_still_loading and _bulk_scan_active:
             # "전체보기" 상태에서 [AI 점수 일괄 계산] 버튼만 눌러둔 경우 —
