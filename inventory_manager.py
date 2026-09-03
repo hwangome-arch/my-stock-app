@@ -7874,8 +7874,13 @@ def _investor_side_score(buy_days, n, net_sum, avg_volume=None):
 
     # 지속성(0~80): 기존 커브를 그대로 쓰되, 강도(0~20)를 더할 자리를 만들기 위해
     # 만점을 100→80으로 비례 축소했다 (순서/구간 경계는 기존과 동일하게 유지).
+    # ⚠️ [2026-09 앵커 재조정: 더 엄격하게] 기존엔 ratio=0.5(순매수일이 절반뿐인,
+    # 사실상 뚜렷한 수급 우위라 보기 어려운 상태)에서도 56/80점(70%)을 줬고, 0.7만
+    # 넘으면 이미 만점이라 "20일 중 14일만 순매수"해도 만점을 받는 문제가 있었다.
+    # 0.5 지점 배점을 40점(50%)으로 낮추고, 만점 도달 지점을 0.7→1.0으로 밀어
+    # "거의 매일 순매수"인 경우에만 만점을 주도록 했다.
     if net_sum > 0:
-        s_persist = _lerp_score(ratio, [(0, 24), (0.3, 32), (0.5, 56), (0.7, 80), (1.0, 80)])
+        s_persist = _lerp_score(ratio, [(0, 15), (0.3, 25), (0.5, 40), (0.8, 68), (1.0, 80)])
     else:
         s_persist = _lerp_score(ratio, [(0, 0), (0.3, 0), (0.5, 24), (0.7, 40), (1.0, 48)])
 
@@ -8113,14 +8118,18 @@ def calc_pattern_score(df_price, volume_score):
     보간에 사용해 연속적으로 채점하도록 바꿨다."""
     try:
         if df_price is None or df_price.empty or len(df_price) < 21:
-            return 50.0
+            return 40.0
         closes = df_price["Close"].dropna()
         cur = closes.iloc[-1]
         prior20_high = closes.iloc[-21:-1].max()
 
         if prior20_high > 0:
             gap_to_high = (cur - prior20_high) / prior20_high * 100
-            score_breakout = _lerp_score(gap_to_high, [(-10, 0), (0, 35), (5, 50)])
+            # ⚠️ [2026-09 앵커 재조정: 더 엄격하게] 기존엔 gap_to_high=0%(직전 20일
+            # 고점에 딱 걸친 것뿐, 실제로 돌파한 게 아님)에서도 35/50점(70%)을 줬고,
+            # 5%만 뚫으면 이미 만점이었다. 0% 지점 배점을 15점(30%)으로 낮추고,
+            # 만점 도달 지점을 5%→8%로 밀어 더 뚜렷한 돌파에만 만점을 주도록 했다.
+            score_breakout = _lerp_score(gap_to_high, [(-10, 0), (0, 15), (3, 35), (8, 50)])
         else:
             score_breakout = 0.0
 
@@ -8128,11 +8137,15 @@ def calc_pattern_score(df_price, volume_score):
 
         recent5 = closes.tail(6).diff().dropna()
         up_ratio = (recent5 > 0).sum() / len(recent5) if len(recent5) else 0.5
-        score_updays = _lerp_score(up_ratio, [(0, 0), (0.5, 10), (0.6, 20)])
+        # ⚠️ [2026-09 앵커 재조정: 더 엄격하게] 기존엔 up_ratio=0.6(5일 중 3일만
+        # 올라도)이면 이미 20/20 만점이었다. 이건 사실상 동전 던지기 수준의 신호라,
+        # 0.5 지점 배점을 8점(40%)으로 낮추고 만점 도달 지점을 0.6→1.0(5일 내내
+        # 상승)으로 밀었다.
+        score_updays = _lerp_score(up_ratio, [(0, 0), (0.5, 8), (0.7, 15), (1.0, 20)])
 
         return round(max(0, min(100, score_breakout + score_volume + score_updays)), 1)
     except Exception:
-        return 50.0
+        return 40.0
 
 
 def calc_risk_score(df_price, debt, drop_pct=None):
