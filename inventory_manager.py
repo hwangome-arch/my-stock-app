@@ -5908,23 +5908,36 @@ def render_watchlist():
         if _triggered:
             sell_signal_summary.append((_row['종목명'], _code, _triggered))
 
+    # 신호 2건 이상 겹친 종목("매도추천")이 위로 오도록 정렬 — 개수 많은 순
+    sell_signal_summary.sort(key=lambda x: len(x[2]), reverse=True)
+
     if sell_signal_summary:
         _sell_items_html = "".join(
-            f"<div style='padding:6px 0; font-size:13px; color:#334155;'>"
-            f"<b style='color:#0F172A;'>{html_lib.escape(str(_nm))}</b> ({_cd}) "
-            f"— <span style='color:#B91C1C; font-weight:700;'>매도 신호 {len(_trg)}건</span>"
-            f"<div style='margin:2px 0 0 4px; color:#64748B; font-size:12px;'>"
-            + " ・ ".join(f"{_t['icon']} {_t['label']}" for _t in _trg)
-            + "</div></div>"
+            (lambda _verdict, _vcolor: (
+                f"<div style='padding:6px 0; font-size:13px; color:#334155;'>"
+                f"<b style='color:#0F172A;'>{html_lib.escape(str(_nm))}</b> ({_cd}) "
+                f"— <span style='color:{_vcolor}; font-weight:700;'>{_verdict}</span>"
+                f"<div style='margin:2px 0 0 4px; color:#64748B; font-size:12px;'>"
+                + " ・ ".join(f"{_t['icon']} {_t['label']}" for _t in _trg)
+                + "</div></div>"
+            ))(*(("🔴 매도추천", "#DC2626") if len(_trg) >= 2 else (f"🔔 매도 신호 {len(_trg)}건", "#B91C1C")))
             for _nm, _cd, _trg in sell_signal_summary
+        )
+        _reco_count = sum(1 for _, _, _trg in sell_signal_summary if len(_trg) >= 2)
+        _header_txt = (
+            f"🔴 매도추천 {_reco_count}건 · 매도 신호 {len(sell_signal_summary) - _reco_count}건"
+            if _reco_count else f"🔔 매도 신호 감지 종목 ({len(sell_signal_summary)}건)"
         )
         st.markdown(
             f"""<div style="background:#FEF2F2; border:1px solid #FCA5A5; border-radius:8px;
                     padding:12px 16px; margin-bottom:18px;">
                 <div style="font-weight:700; font-size:13.5px; color:#B91C1C; margin-bottom:4px;">
-                    🔔 매도 신호 감지 종목 ({len(sell_signal_summary)}건)
+                    {_header_txt}
                 </div>
                 {_sell_items_html}
+                <div style="margin-top:6px; font-size:11px; color:#94A3B8;">
+                    신호 2개 이상 겹치면 '매도추천'으로 표시됩니다. 자동매매가 아닌 참고용 판단 보조 지표입니다.
+                </div>
             </div>""",
             unsafe_allow_html=True,
         )
@@ -6290,8 +6303,9 @@ def render_watchlist():
             if has_entries:
                 _label_parts.append("🎯 매수 타점  ·  " + " / ".join(_entry_parts))
             _card_sell_signals = sell_signal_map.get(code, [])
+            _is_sell_reco = len(_card_sell_signals) >= 2
             if _card_sell_signals:
-                _label_parts.append(f"🔔 매도 신호 {len(_card_sell_signals)}건")
+                _label_parts.append("🔴 매도추천" if _is_sell_reco else f"🔔 매도 신호 {len(_card_sell_signals)}건")
             exp_label = "   ┃   ".join(_label_parts) if _label_parts else "📌 보유 정보 · 매수 타점 입력 (선택)"
 
             with st.expander(exp_label):
@@ -6301,11 +6315,16 @@ def render_watchlist():
                         f"{_t['icon']} <b>{_t['label']}</b> — {html_lib.escape(_t['detail'])}</div>"
                         for _t in _card_sell_signals
                     )
+                    _box_title = (
+                        f"🔴 매도추천 — 신호 {len(_card_sell_signals)}개 동시 감지"
+                        if _is_sell_reco else
+                        f"🔔 매도 신호 ({len(_card_sell_signals)}건) — 참고용 판단 보조 지표"
+                    )
                     st.markdown(
                         f"""<div style="background:#FEF2F2; border:1px solid #FCA5A5; border-radius:8px;
                                 padding:10px 14px; margin-bottom:12px;">
                             <div style="font-weight:700; font-size:12.5px; color:#B91C1C; margin-bottom:2px;">
-                                🔔 매도 신호 ({len(_card_sell_signals)}건) — 참고용이며 매도 추천이 아닙니다
+                                {_box_title}
                             </div>
                             {_sig_lines}
                         </div>""",
