@@ -5291,8 +5291,17 @@ _SELL_SIGNAL_DEFAULTS = {
     "target_pct": 30.0,          # 매수가 대비 이 수익률(%) 이상이면 '목표가 근접' 신호
     "trail_vol_multiplier": 3.0, # 트레일링 스탑 = 종목의 최근 변동성(%) × 이 배수
     "fundamental_drop": 15.0,    # 매수시점 대비 fundamental_100이 이 점수 이상 떨어지면 신호
-    "momentum_floor": 40.0,      # momentum_100이 이 값 미만이면 '기술적 반전' 신호
+    "momentum_floor": 25.0,      # momentum_100이 이 값 미만이면 '기술적 반전' 신호
 }
+# ⚠️ [2026-09 momentum_floor 기본값 재산정] 처음엔 40으로 뒀는데, 추세·수급·AI패턴
+# 앵커를 앞서 엄격하게 재조정한 여파로 momentum_100의 '중립 기준선' 자체가 낮아졌다.
+# 실측(추세·수급·거래량·모멘텀·패턴이 전부 딱 중간값인 '완전 중립' 종목을 대입):
+#   완전 중립 종목        → momentum_100 ≈ 35.4
+#   살짝 긍정적인 흐름     → momentum_100 ≈ 50.4
+# 즉 40으로 두면 '딱히 나빠진 것 없이 그냥 평범한' 종목까지 신호가 떴다(그냥 평범함과
+# 반전은 다른데 구분이 안 됨). 완전 중립(35.4)보다 확실히 낮은 25로 낮춰서, '여러 항목이
+# 동시에 나빠져 진짜로 흐름이 꺾인' 경우에 가깝게만 걸리도록 했다.
+_SELL_SIGNAL_MOMENTUM_NEUTRAL_REF = 35.4  # 참고용: '완전 중립' 종목의 momentum_100 실측값(위 계산 근거)
 # ⚠️ [2026-09 트레일링 스탑 종목별 변동성 반영] 처음엔 트레일링 스탑을 모든 종목에
 # 똑같은 고정 %(예: -8%)로 적용했는데, 이러면 원래 하루 1~2%대로 잔잔하게 움직이는
 # 대형주는 좀처럼 안 걸려서 너무 둔감하고, 반대로 원래 하루 4~5%씩 출렁이는 종목은
@@ -5426,7 +5435,8 @@ def render_sell_signal_settings():
                        help="고정 %가 아니라 종목마다 다르게 계산돼요. 예: 변동성 1.5%인 안정적인 종목은 배수 3일 때 -4.5%(최소 -4%)가 기준선이 되고, 변동성 5%인 종목은 -15%가 기준선이 됩니다.")
             st.slider("🔻 모멘텀 통합점수(점) 미만이면 신호", min_value=10.0, max_value=60.0,
                        value=float(st.session_state.get("sell_sig_momentum_floor", _SELL_SIGNAL_DEFAULTS["momentum_floor"])),
-                       step=1.0, key="sell_sig_momentum_floor")
+                       step=1.0, key="sell_sig_momentum_floor",
+                       help=f"참고로 아무 이슈 없는 '완전 중립' 종목도 momentum_100이 평균 {_SELL_SIGNAL_MOMENTUM_NEUTRAL_REF:.0f}점 정도 나와요. 그보다 높게 잡으면 평범한 종목도 자주 걸리고, 낮게 잡을수록 진짜 뚜렷하게 나빠진 종목만 잡습니다.")
 
 
 def render_watchlist_portfolio_summary(df):
