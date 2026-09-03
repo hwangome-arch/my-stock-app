@@ -5032,7 +5032,17 @@ def is_admin_user():
 # =========================
 # ⭐ 관심종목 (마이페이지, Google Sheets 저장)
 # =========================
-_WATCHLIST_COLUMNS = ["아이디", "종목코드", "종목명", "추가일", "매수가", "수량", "1차진입가", "2차진입가", "3차진입가", "고정"]
+_WATCHLIST_COLUMNS = ["아이디", "종목코드", "종목명", "추가일", "매수가", "수량", "1차진입가", "2차진입가", "3차진입가", "고정", "매수시점점수"]
+# ⚠️ [2026-09 매도 신호 기능 추가] "매수시점점수"는 매수가/수량을 저장하는 시점의
+# AI 세부점수 스냅샷(JSON 문자열: {"fundamental_100":.., "momentum_100":.., "date":".."})을
+# 담는다. 펀더멘털 악화 신호(현재 점수가 매수 시점보다 얼마나 나빠졌는지)를 판단하려면
+# "그때의 점수"가 필요한데, 기존 시트엔 이 값을 저장할 곳이 없었다. 기존 10개 컬럼
+# 뒤에 맨 끝(11번째)으로 추가해서, 이미 있는 컬럼들의 위치(인덱스)는 하나도 바뀌지
+# 않도록 했다 — 그래야 update_cell()이 컬럼 인덱스로 쓰는 다른 저장 함수들이 안전하다.
+# ⚠️ [운영 주의] 이 컬럼은 실제 구글시트(watchlist 탭)의 K열에 헤더 "매수시점점수"를
+# 직접 추가해줘야 저장이 정상 동작한다. 컬럼을 추가하기 전까지는 _load_all_watchlist()가
+# 항상 빈 문자열로 채워서 읽기는 에러 없이 되지만(펀더멘털 신호만 계산 불가), 쓰기
+# (save_buy_snapshot)는 시트에 실제 K열이 있어야 정상적으로 그 자리에 기록된다.
 
 @st.cache_data(ttl=30, show_spinner=False)
 def _load_all_watchlist():
@@ -5073,7 +5083,7 @@ def add_to_watchlist(username, code, name):
     new_row = [
         username, code, name,
         datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "", "", "", "", "", "",
+        "", "", "", "", "", "", "",
     ]
     def _write():
         ws = _get_worksheet("watchlist")
@@ -5116,9 +5126,24 @@ def remove_from_watchlist(username, code):
     else:
         st.error("일시적인 통신 오류로 관심종목 삭제에 실패했습니다. 잠시 후 다시 시도해주세요.")
 
-def update_watchlist_holding(username, code, buy_price, qty):
-    """관심종목 항목에 매수가/수량(보유 정보)을 저장."""
+def update_watchlist_holding(username, code, buy_price, qty, snapshot=None):
+    """관심종목 항목에 매수가/수량(보유 정보)을 저장.
+
+    ⚠️ [2026-09 매도 신호 기능 추가] snapshot(dict, 예: {"fundamental_100":72.3,
+    "momentum_100":58.1})을 넘기면 "매수시점점수" 컬럼에 JSON 문자열로 같이 저장한다.
+    매도 신호 중 '펀더멘털 악화(매수 시점 대비 점수 하락)'를 판단하려면 이 스냅샷이
+    필요하다. buy_price가 0(초기화)이면 snapshot 여부와 무관하게 스냅샷도 같이 지운다
+    — 보유를 초기화했는데 예전 매수 시점 점수만 남아있으면 다음에 다시 매수 정보를
+    입력할 때 혼란을 줄 수 있어서다."""
     code = normalize_kr_code(code)
+    snapshot_json = ""
+    if buy_price and snapshot:
+        try:
+            snapshot_payload = dict(snapshot)
+            snapshot_payload["date"] = datetime.datetime.now().strftime("%Y-%m-%d")
+            snapshot_json = json.dumps(snapshot_payload, ensure_ascii=False)
+        except Exception:
+            snapshot_json = ""
 
     def _do():
         ws = _get_worksheet("watchlist")
@@ -5126,6 +5151,7 @@ def update_watchlist_holding(username, code, buy_price, qty):
         for row_idx in row_indices:
             ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("매수가") + 1, str(buy_price) if buy_price else "")
             ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("수량") + 1, str(qty) if qty else "")
+            ws.update_cell(row_idx, _WATCHLIST_COLUMNS.index("매수시점점수") + 1, snapshot_json)
         return True
 
     ok = call_with_timeout(_do, timeout=12)
@@ -5243,6 +5269,134 @@ def render_mini_sparkline_svg(prices, width=76, height=28):
         f"<circle cx='{last_x}' cy='{last_y}' r='2' fill='{color}'/>"
         f"</svg>"
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 🔔 [2026-09 추가] 매도 신호 (4종 복합) ─ "언제 살까"는 이미 여러 기능이 있었는데
+# "언제 팔까"에 대응하는 기능이 없어서 추가했다. 아래 4개를 각각 독립적으로 판단해서
+# 겹치는 개수만큼 신호 강도로 본다(1개만 걸리면 참고, 여러 개 동시에 걸리면 더 눈여겨볼
+# 만하다는 뜻 — 어느 하나도 "무조건 팔아라"를 의미하진 않는다).
+#   1) 목표가 근접/도달: 매수가 대비 수익률이 사용자가 정한 목표%를 넘었는지
+#   2) 트레일링 스탑: 관심종목에 추가한 시점 이후의 최고 종가 대비 현재가가
+#      사용자가 정한 %만큼 하락했는지 (수익을 어느 정도 지키고 싶을 때 참고)
+#   3) 펀더멘털 악화: 보유 정보를 저장한 시점(매수시점점수 스냅샷)의
+#      fundamental_100(재무+밸류 환산 0~100) 대비 지금 얼마나 떨어졌는지
+#   4) 기술적 반전: 지금 momentum_100(추세+수급+거래량+모멘텀+패턴+리스크 환산
+#      0~100)이 사용자가 정한 기준 아래로 떨어졌는지
+#
+# 사용자가 정한 임계값은 st.session_state에 저장해 종목마다 공통 적용한다(종목별로
+# 다르게 두면 설정이 너무 많아져 관리가 안 됨 — 우선은 공통 기준 하나로 시작).
+# ═══════════════════════════════════════════════════════════════════════
+_SELL_SIGNAL_DEFAULTS = {
+    "target_pct": 30.0,        # 매수가 대비 이 수익률(%) 이상이면 '목표가 근접' 신호
+    "trail_pct": 8.0,          # 추가일 이후 고점 대비 이 %만큼 하락하면 '트레일링 스탑' 신호
+    "fundamental_drop": 15.0,  # 매수시점 대비 fundamental_100이 이 점수 이상 떨어지면 신호
+    "momentum_floor": 40.0,    # momentum_100이 이 값 미만이면 '기술적 반전' 신호
+}
+
+def _get_sell_signal_settings():
+    """사용자가 조정한 매도 신호 임계값을 session_state에서 읽어온다(없으면 기본값)."""
+    return {
+        k: float(st.session_state.get(f"sell_sig_{k}", v))
+        for k, v in _SELL_SIGNAL_DEFAULTS.items()
+    }
+
+def evaluate_sell_signals(code, buy_price, added_date_str, snapshot_raw, current_price, detail, settings=None):
+    """보유 중인 종목 1개에 대해 4개 매도 신호를 각각 평가한다.
+
+    Returns: (triggered: list[dict{"icon","label","detail"}], total_checked: int)
+    detail이 None이거나(AI 점수 계산 실패) current_price가 없으면 계산 가능한 항목만 평가하고
+    나머지는 조용히 건너뛴다(에러를 띄우지 않음 — 매도 신호는 참고용 부가 기능이라 이것
+    때문에 카드 렌더링 전체가 막히면 안 된다)."""
+    if not buy_price or buy_price <= 0 or not current_price or current_price <= 0:
+        return [], 0
+
+    s = settings or _get_sell_signal_settings()
+    triggered = []
+    checked = 0
+
+    # ① 목표가 근접/도달
+    ret_pct = (current_price - buy_price) / buy_price * 100
+    checked += 1
+    if ret_pct >= s["target_pct"]:
+        triggered.append({
+            "icon": "🎯", "label": "목표 수익률 도달",
+            "detail": f"매수가 대비 {ret_pct:+.1f}% (목표 {s['target_pct']:.0f}%)",
+        })
+
+    # ② 트레일링 스탑 (추가일 이후 고점 대비 하락)
+    try:
+        df_price = fetch_price_history_for_score(code)
+        if df_price is not None and not df_price.empty and added_date_str:
+            added_dt = pd.to_datetime(str(added_date_str)[:10], errors="coerce")
+            if pd.notna(added_dt):
+                since_added = df_price[df_price.index >= added_dt]
+                closes_since = since_added["Close"].dropna() if not since_added.empty else df_price["Close"].dropna()
+                if not closes_since.empty:
+                    peak = closes_since.max()
+                    if peak > 0:
+                        drawdown_pct = (current_price - peak) / peak * 100
+                        checked += 1
+                        if drawdown_pct <= -s["trail_pct"]:
+                            triggered.append({
+                                "icon": "📉", "label": "고점 대비 하락(트레일링 스탑)",
+                                "detail": f"보유 후 고점 {peak:,.0f}원 대비 {drawdown_pct:.1f}% (기준 -{s['trail_pct']:.0f}%)",
+                            })
+    except Exception:
+        pass
+
+    # ③ 펀더멘털 악화 (매수시점 스냅샷 대비)
+    if snapshot_raw and detail:
+        try:
+            snap = json.loads(snapshot_raw)
+            snap_fundamental = snap.get("fundamental_100")
+            cur_fundamental = detail.get("fundamental_100")
+            if snap_fundamental is not None and cur_fundamental is not None:
+                drop = float(snap_fundamental) - float(cur_fundamental)
+                checked += 1
+                if drop >= s["fundamental_drop"]:
+                    triggered.append({
+                        "icon": "📊", "label": "펀더멘털 악화",
+                        "detail": f"매수 시점 기업체력 {float(snap_fundamental):.0f}점 → 현재 {float(cur_fundamental):.0f}점 ({drop:.0f}점 하락)",
+                    })
+        except Exception:
+            pass
+
+    # ④ 기술적 반전 (현재 모멘텀 통합점수)
+    if detail and detail.get("momentum_100") is not None:
+        cur_momentum = detail["momentum_100"]
+        checked += 1
+        if cur_momentum < s["momentum_floor"]:
+            triggered.append({
+                "icon": "🔻", "label": "기술적 반전",
+                "detail": f"모멘텀 통합점수 {cur_momentum:.0f}점 (기준 {s['momentum_floor']:.0f}점 미만)",
+            })
+
+    return triggered, checked
+
+
+def render_sell_signal_settings():
+    """매도 신호 4종의 임계값을 사용자가 직접 조절하는 설정 패널.
+    값은 session_state에만 저장되며(계정 간 공용 아님), 새로고침·재로그인 시 기본값으로
+    돌아간다 — 워치리스트 시트에 영구 저장하려면 별도 컬럼이 더 필요해서 우선은 세션
+    범위로 시작한다."""
+    with st.expander("🔔 매도 신호 기준 설정", expanded=False):
+        st.caption("보유 종목마다 아래 4가지 기준을 각각 확인해, 겹치는 만큼 카드에 '매도 신호 N건'으로 표시합니다. 어느 하나도 매도 추천이 아니라 참고용 신호입니다.")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.slider("🎯 목표 수익률(%) 이상이면 신호", min_value=5.0, max_value=100.0,
+                       value=float(st.session_state.get("sell_sig_target_pct", _SELL_SIGNAL_DEFAULTS["target_pct"])),
+                       step=1.0, key="sell_sig_target_pct")
+            st.slider("📊 펀더멘털 악화(점) 이상이면 신호", min_value=5.0, max_value=50.0,
+                       value=float(st.session_state.get("sell_sig_fundamental_drop", _SELL_SIGNAL_DEFAULTS["fundamental_drop"])),
+                       step=1.0, key="sell_sig_fundamental_drop")
+        with c2:
+            st.slider("📉 고점 대비 하락(트레일링 스탑, %) 이상이면 신호", min_value=3.0, max_value=30.0,
+                       value=float(st.session_state.get("sell_sig_trail_pct", _SELL_SIGNAL_DEFAULTS["trail_pct"])),
+                       step=1.0, key="sell_sig_trail_pct")
+            st.slider("🔻 모멘텀 통합점수(점) 미만이면 신호", min_value=10.0, max_value=60.0,
+                       value=float(st.session_state.get("sell_sig_momentum_floor", _SELL_SIGNAL_DEFAULTS["momentum_floor"])),
+                       step=1.0, key="sell_sig_momentum_floor")
 
 
 def render_watchlist_portfolio_summary(df):
@@ -5434,6 +5588,7 @@ def render_watchlist():
         return
 
     render_watchlist_portfolio_summary(watchlist_df)
+    render_sell_signal_settings()
 
     # 고정(즐겨찾기)한 종목이 먼저 오도록 정렬 (안정 정렬이라 같은 그룹 내 원래 순서는 유지)
     watchlist_df = watchlist_df.assign(_pinned=(watchlist_df["고정"] == "Y")).sort_values(
@@ -5468,6 +5623,7 @@ def render_watchlist():
     # 대기시간을 크게 줄임(종목당 작업 1개로 합쳐서 스레드풀 워커도 절반만 씀).
     wl_price_cache = {}
     ai_score_cache = {}
+    ai_detail_cache = {}
     sparkline_cache = {}
     hit_prob_cache = {}
     _wl_codes = list(dict.fromkeys(watchlist_df['종목코드'].tolist()))
@@ -5508,14 +5664,19 @@ def render_watchlist():
         market = _wl_market_map.get(code)
         price_info = fetch_live_price_change(code)
         spark = fetch_watchlist_sparkline_prices(code, market)
-        ai_score = get_ai_total_score(code, screener_df=screener_df)
+        # ⚠️ [2026-09 매도 신호 기능 추가] 총점만 쓰던 get_ai_total_score 대신
+        # get_ai_detailed_score를 호출해 fundamental_100/momentum_100까지 한 번의
+        # 조회로 같이 받아온다(총점은 detail["total"]에서 꺼내 쓰면 되므로 네트워크
+        # 조회가 늘어나지 않는다).
+        ai_detail = get_ai_detailed_score(code, screener_df=screener_df)
+        ai_score = ai_detail["total"] if ai_detail else None
         hit_prob_html = ""
         if code in _hp_targets:
             _mh, _tp, _ts = _hp_targets[code]
             _hp_res = estimate_target_hit_probability(code, _mh, _tp)
             if _hp_res:
                 hit_prob_html = _format_hit_probability_badge(_hp_res, _tp, _ts)
-        return code, price_info, spark, ai_score, hit_prob_html
+        return code, price_info, spark, ai_score, hit_prob_html, ai_detail
 
     if _wl_codes:
         # [저장 버튼 클릭 시 멈춤 대응] render_async_multi의 자동 폴링(0.4초 간격)은
@@ -5532,7 +5693,7 @@ def render_watchlist():
         _wl_cache_key = "_wl_prefetch_cache"
         _wl_cache = st.session_state.setdefault(
             _wl_cache_key,
-            {"results": {"price": {}, "spark": {}, "ai": {}, "hitprob": {}}, "ts": {}},
+            {"results": {"price": {}, "spark": {}, "ai": {}, "hitprob": {}, "detail": {}}, "ts": {}},
         )
         _wl_now = time.time()
 
@@ -5548,14 +5709,15 @@ def render_watchlist():
                 return {c: submit_with_ctx(_wl_executor, _wl_prefetch_one, c) for c in _wl_missing_codes}
 
             def _collect_wl_results(futures):
-                out = {"price": {}, "spark": {}, "ai": {}, "hitprob": {}}
+                out = {"price": {}, "spark": {}, "ai": {}, "hitprob": {}, "detail": {}}
                 for _code, f in futures.items():
                     if f.done():
                         try:
-                            _c, _price_info, _spark, _ai_score, _hp_html = f.result(timeout=0.1)
+                            _c, _price_info, _spark, _ai_score, _hp_html, _ai_detail = f.result(timeout=0.1)
                             out["price"][_c] = _price_info
                             out["spark"][_c] = _spark
                             out["ai"][_c] = _ai_score
+                            out["detail"][_c] = _ai_detail
                             if _hp_html:
                                 out["hitprob"][_c] = _hp_html
                         except Exception:
@@ -5566,14 +5728,14 @@ def render_watchlist():
                 job_key="watchlist_prefetch_new",
                 submit_fn=_submit_wl_jobs,
                 collect_fn=_collect_wl_results,
-                default_result={"price": {}, "spark": {}, "ai": {}, "hitprob": {}},
+                default_result={"price": {}, "spark": {}, "ai": {}, "hitprob": {}, "detail": {}},
                 spinner_text=f"신규 관심종목 {len(_wl_missing_codes)}건 시세 조회 중...",
                 overall_timeout=15,
             )
             if not _wl_ready:
                 return  # 처음 보는 종목이라 보여줄 게 없을 때만 대기
 
-            for _key in ("price", "spark", "ai", "hitprob"):
+            for _key in ("price", "spark", "ai", "hitprob", "detail"):
                 _wl_cache["results"][_key].update(_wl_new_results.get(_key, {}))
             for _c in _wl_missing_codes:
                 _wl_cache["ts"][_c] = _wl_now
@@ -5592,10 +5754,11 @@ def render_watchlist():
             f = _wl_bg_jobs[c]
             if f.done():
                 try:
-                    _c, _price_info, _spark, _ai_score, _hp_html = f.result(timeout=0.1)
+                    _c, _price_info, _spark, _ai_score, _hp_html, _ai_detail = f.result(timeout=0.1)
                     _wl_cache["results"]["price"][_c] = _price_info
                     _wl_cache["results"]["spark"][_c] = _spark
                     _wl_cache["results"]["ai"][_c] = _ai_score
+                    _wl_cache["results"]["detail"][_c] = _ai_detail
                     if _hp_html:
                         _wl_cache["results"]["hitprob"][_c] = _hp_html
                     _wl_cache["ts"][_c] = time.time()
@@ -5605,7 +5768,7 @@ def render_watchlist():
 
         # 관심종목에서 삭제된 종목의 캐시/백그라운드 작업은 정리(메모리 누적 방지)
         _wl_codes_set = set(_wl_codes)
-        for _key in ("price", "spark", "ai", "hitprob"):
+        for _key in ("price", "spark", "ai", "hitprob", "detail"):
             _wl_cache["results"][_key] = {
                 c: v for c, v in _wl_cache["results"][_key].items() if c in _wl_codes_set
             }
@@ -5614,6 +5777,7 @@ def render_watchlist():
         wl_price_cache = _wl_cache["results"]["price"]
         sparkline_cache = _wl_cache["results"]["spark"]
         ai_score_cache = _wl_cache["results"]["ai"]
+        ai_detail_cache = _wl_cache["results"]["detail"]
         hit_prob_cache = _wl_cache["results"]["hitprob"]
 
 
@@ -5689,6 +5853,48 @@ def render_watchlist():
                     다음 매수 타점까지 (가까운 순, 최대 10건)
                 </div>
                 {_pending_html}
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+    # ── 보유 종목 전체의 매도 신호 사전 계산 (상단 요약 + 카드 배지에 공용 사용) ──
+    _sell_sig_settings = _get_sell_signal_settings()
+    sell_signal_summary = []  # [(종목명, 종목코드, [triggered,...]), ...]
+    sell_signal_map = {}      # 종목코드 -> [triggered,...]  (카드 렌더링에서 재계산 없이 재사용)
+    for _, _row in watchlist_df.iterrows():
+        _code = _row['종목코드']
+        _buy_val = _parse_entry(_row.get('매수가'))
+        if not _buy_val:
+            continue
+        _live_price, _chg_pct, _chg_amt = wl_price_cache.get(_code, (None, None, None))
+        if _live_price is None or _live_price <= 0:
+            continue
+        _detail = ai_detail_cache.get(_code)
+        _triggered, _checked = evaluate_sell_signals(
+            _code, _buy_val, _row.get('추가일'), _row.get('매수시점점수'), _live_price, _detail,
+            settings=_sell_sig_settings,
+        )
+        sell_signal_map[_code] = _triggered
+        if _triggered:
+            sell_signal_summary.append((_row['종목명'], _code, _triggered))
+
+    if sell_signal_summary:
+        _sell_items_html = "".join(
+            f"<div style='padding:6px 0; font-size:13px; color:#334155;'>"
+            f"<b style='color:#0F172A;'>{html_lib.escape(str(_nm))}</b> ({_cd}) "
+            f"— <span style='color:#B91C1C; font-weight:700;'>매도 신호 {len(_trg)}건</span>"
+            f"<div style='margin:2px 0 0 4px; color:#64748B; font-size:12px;'>"
+            + " ・ ".join(f"{_t['icon']} {_t['label']}" for _t in _trg)
+            + "</div></div>"
+            for _nm, _cd, _trg in sell_signal_summary
+        )
+        st.markdown(
+            f"""<div style="background:#FEF2F2; border:1px solid #FCA5A5; border-radius:8px;
+                    padding:12px 16px; margin-bottom:18px;">
+                <div style="font-weight:700; font-size:13.5px; color:#B91C1C; margin-bottom:4px;">
+                    🔔 매도 신호 감지 종목 ({len(sell_signal_summary)}건)
+                </div>
+                {_sell_items_html}
             </div>""",
             unsafe_allow_html=True,
         )
@@ -6053,9 +6259,28 @@ def render_watchlist():
                 _label_parts.append(f"💰 보유중  ·  {wl_qty_val:,.0f}주  ·  매수가 {wl_buy_val:,.0f}원{eval_amount_txt}{pnl_header_txt}")
             if has_entries:
                 _label_parts.append("🎯 매수 타점  ·  " + " / ".join(_entry_parts))
+            _card_sell_signals = sell_signal_map.get(code, [])
+            if _card_sell_signals:
+                _label_parts.append(f"🔔 매도 신호 {len(_card_sell_signals)}건")
             exp_label = "   ┃   ".join(_label_parts) if _label_parts else "📌 보유 정보 · 매수 타점 입력 (선택)"
 
             with st.expander(exp_label):
+                if _card_sell_signals:
+                    _sig_lines = "".join(
+                        f"<div style='padding:3px 0; font-size:12.5px; color:#7F1D1D;'>"
+                        f"{_t['icon']} <b>{_t['label']}</b> — {html_lib.escape(_t['detail'])}</div>"
+                        for _t in _card_sell_signals
+                    )
+                    st.markdown(
+                        f"""<div style="background:#FEF2F2; border:1px solid #FCA5A5; border-radius:8px;
+                                padding:10px 14px; margin-bottom:12px;">
+                            <div style="font-weight:700; font-size:12.5px; color:#B91C1C; margin-bottom:2px;">
+                                🔔 매도 신호 ({len(_card_sell_signals)}건) — 참고용이며 매도 추천이 아닙니다
+                            </div>
+                            {_sig_lines}
+                        </div>""",
+                        unsafe_allow_html=True,
+                    )
                 with st.container(key=f"wl_inputs_row_{code}"):
                     ec1, ec2, ec_btns = st.columns([1.3, 1, 1.3])
                     with ec1:
@@ -6077,7 +6302,15 @@ def render_watchlist():
                             bcol1, bcol2 = st.columns(2)
                             with bcol1:
                                 if st.button("저장", key=f"wl_save_{code}", use_container_width=True):
-                                    update_watchlist_holding(username, code, new_buy, new_qty)
+                                    _save_detail = ai_detail_cache.get(code)
+                                    _snapshot = (
+                                        {
+                                            "fundamental_100": _save_detail.get("fundamental_100"),
+                                            "momentum_100": _save_detail.get("momentum_100"),
+                                        }
+                                        if _save_detail else None
+                                    )
+                                    update_watchlist_holding(username, code, new_buy, new_qty, snapshot=_snapshot)
                                     st.rerun()
                             with bcol2:
                                 if st.button("↺", key=f"wl_reset_btn_{code}", use_container_width=True, help="매수가·수량 초기화"):
@@ -7422,10 +7655,24 @@ def get_ai_total_score(code, screener_df=None):
     ⚠️ [세분화 리뉴얼] 배점 체계를 4항목(건전성/성장성/수익성/배당) 뭉뚱그린 점수에서
     8항목(추세/수급/거래량/재무/밸류/모멘텀/AI패턴/리스크) 세부 배점으로 교체했다
     (calc_ai_scores_detailed). '왜 이 점수인지' 항목별로 바로 보이도록 하기 위함."""
+    detail = get_ai_detailed_score(code, screener_df=screener_df)
+    return detail["total"] if detail else None
+
+
+def get_ai_detailed_score(code, screener_df=None):
+    """get_ai_total_score와 동일한 입력조회 경로를 쓰되, 총점 하나만이 아니라
+    calc_ai_scores_detailed()의 전체 dict(8항목 세부점수 + fundamental_100/momentum_100
+    포함)를 그대로 반환한다.
+
+    ⚠️ [2026-09 매도 신호 기능 추가] 관심종목의 '매도 신호' 판단에는 총점 하나만으로는
+    부족하고 fundamental_100(펀더멘털 악화 판단용)·momentum_100(기술적 반전 판단용)
+    세부값이 필요해서 이 함수를 분리했다. 내부적으로 하는 네트워크 조회는
+    get_ai_total_score와 완전히 동일하므로, 총점과 세부점수를 둘 다 쓰는 화면에서는
+    이 함수 하나만 호출하고 ["total"]로 총점을 꺼내 쓰면 중복 조회를 피할 수 있다."""
     try:
         df_annual_ai, _, _ = fetch_financial_data(code)
         per_ai, pbr_ai, roe_ai, debt_ai, drop_pct_ai, div_ai = get_ai_diagnosis_inputs(code, df_annual_ai, screener_df=screener_df)
-        return calc_ai_scores_detailed(code, per_ai, pbr_ai, roe_ai, debt_ai, drop_pct_ai, div_ai, df_annual=df_annual_ai)["total"]
+        return calc_ai_scores_detailed(code, per_ai, pbr_ai, roe_ai, debt_ai, drop_pct_ai, div_ai, df_annual=df_annual_ai)
     except Exception:
         return None
 
