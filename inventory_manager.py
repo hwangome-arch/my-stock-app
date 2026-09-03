@@ -5288,11 +5288,20 @@ def render_mini_sparkline_svg(prices, width=76, height=28):
 # 다르게 두면 설정이 너무 많아져 관리가 안 됨 — 우선은 공통 기준 하나로 시작).
 # ═══════════════════════════════════════════════════════════════════════
 _SELL_SIGNAL_DEFAULTS = {
-    "target_pct": 30.0,        # 매수가 대비 이 수익률(%) 이상이면 '목표가 근접' 신호
-    "trail_pct": 8.0,          # 추가일 이후 고점 대비 이 %만큼 하락하면 '트레일링 스탑' 신호
-    "fundamental_drop": 15.0,  # 매수시점 대비 fundamental_100이 이 점수 이상 떨어지면 신호
-    "momentum_floor": 40.0,    # momentum_100이 이 값 미만이면 '기술적 반전' 신호
+    "target_pct": 30.0,          # 매수가 대비 이 수익률(%) 이상이면 '목표가 근접' 신호
+    "trail_vol_multiplier": 3.0, # 트레일링 스탑 = 종목의 최근 변동성(%) × 이 배수
+    "fundamental_drop": 15.0,    # 매수시점 대비 fundamental_100이 이 점수 이상 떨어지면 신호
+    "momentum_floor": 40.0,      # momentum_100이 이 값 미만이면 '기술적 반전' 신호
 }
+# ⚠️ [2026-09 트레일링 스탑 종목별 변동성 반영] 처음엔 트레일링 스탑을 모든 종목에
+# 똑같은 고정 %(예: -8%)로 적용했는데, 이러면 원래 하루 1~2%대로 잔잔하게 움직이는
+# 대형주는 좀처럼 안 걸려서 너무 둔감하고, 반대로 원래 하루 4~5%씩 출렁이는 종목은
+# 추세 반전이 아니라 그냥 평소 변동성만으로도 자꾸 걸려서 너무 민감했다. 그래서
+# calc_risk_score가 이미 쓰고 있는 '최근 21일 일별 등락률 표준편차'를 그대로 재사용해
+# 종목마다 실제 하락 기준(%)을 자동으로 다르게 계산한다. 사용자는 그 위에 곱해지는
+# '민감도 배수' 하나만 조절하면 되므로, 다이얼은 하나인데 결과는 종목별로 달라진다.
+_TRAIL_STOP_MIN_PCT = 4.0   # 변동성이 매우 낮아도 최소 이 %는 하락해야 신호(너무 민감 방지)
+_TRAIL_STOP_MAX_PCT = 25.0  # 변동성이 매우 커도 이 %를 넘게 벌리지 않음(너무 둔감 방지)
 
 def _get_sell_signal_settings():
     """사용자가 조정한 매도 신호 임계값을 session_state에서 읽어온다(없으면 기본값)."""
@@ -5300,6 +5309,24 @@ def _get_sell_signal_settings():
         k: float(st.session_state.get(f"sell_sig_{k}", v))
         for k, v in _SELL_SIGNAL_DEFAULTS.items()
     }
+
+def _calc_trailing_stop_pct(df_price, multiplier):
+    """df_price(최근 1년 일봉)로 최근 21일 일별 등락률 표준편차(=리스크 점수와 동일 지표)를
+    구해 multiplier를 곱한 뒤 [_TRAIL_STOP_MIN_PCT, _TRAIL_STOP_MAX_PCT] 범위로 클립한다.
+    Returns: (trail_pct, ret_std) — ret_std는 UI에 '근거'로 같이 보여주기 위해 함께 반환.
+    데이터가 부족하면 (기본 8%, None)으로 폴백."""
+    try:
+        closes = df_price["Close"].dropna() if df_price is not None and not df_price.empty else None
+        if closes is None or len(closes) < 6:
+            return 8.0, None
+        daily_ret = closes.tail(21).pct_change().dropna() * 100
+        if len(daily_ret) < 5:
+            return 8.0, None
+        ret_std = float(daily_ret.std())
+        trail_pct = max(_TRAIL_STOP_MIN_PCT, min(_TRAIL_STOP_MAX_PCT, ret_std * multiplier))
+        return trail_pct, ret_std
+    except Exception:
+        return 8.0, None
 
 def evaluate_sell_signals(code, buy_price, added_date_str, snapshot_raw, current_price, detail, settings=None):
     """보유 중인 종목 1개에 대해 4개 매도 신호를 각각 평가한다.
@@ -5324,9 +5351,10 @@ def evaluate_sell_signals(code, buy_price, added_date_str, snapshot_raw, current
             "detail": f"매수가 대비 {ret_pct:+.1f}% (목표 {s['target_pct']:.0f}%)",
         })
 
-    # ② 트레일링 스탑 (추가일 이후 고점 대비 하락)
+    # ② 트레일링 스탑 (추가일 이후 고점 대비 하락, 기준선은 종목별 변동성에 따라 자동 계산)
     try:
         df_price = fetch_price_history_for_score(code)
+        trail_pct, ret_std = _calc_trailing_stop_pct(df_price, s["trail_vol_multiplier"])
         if df_price is not None and not df_price.empty and added_date_str:
             added_dt = pd.to_datetime(str(added_date_str)[:10], errors="coerce")
             if pd.notna(added_dt):
@@ -5337,10 +5365,11 @@ def evaluate_sell_signals(code, buy_price, added_date_str, snapshot_raw, current
                     if peak > 0:
                         drawdown_pct = (current_price - peak) / peak * 100
                         checked += 1
-                        if drawdown_pct <= -s["trail_pct"]:
+                        if drawdown_pct <= -trail_pct:
+                            _vol_note = f", 이 종목 최근 변동성 {ret_std:.1f}%×{s['trail_vol_multiplier']:.1f}배" if ret_std is not None else ""
                             triggered.append({
                                 "icon": "📉", "label": "고점 대비 하락(트레일링 스탑)",
-                                "detail": f"보유 후 고점 {peak:,.0f}원 대비 {drawdown_pct:.1f}% (기준 -{s['trail_pct']:.0f}%)",
+                                "detail": f"보유 후 고점 {peak:,.0f}원 대비 {drawdown_pct:.1f}% (이 종목 기준 -{trail_pct:.1f}%{_vol_note})",
                             })
     except Exception:
         pass
@@ -5391,9 +5420,10 @@ def render_sell_signal_settings():
                        value=float(st.session_state.get("sell_sig_fundamental_drop", _SELL_SIGNAL_DEFAULTS["fundamental_drop"])),
                        step=1.0, key="sell_sig_fundamental_drop")
         with c2:
-            st.slider("📉 고점 대비 하락(트레일링 스탑, %) 이상이면 신호", min_value=3.0, max_value=30.0,
-                       value=float(st.session_state.get("sell_sig_trail_pct", _SELL_SIGNAL_DEFAULTS["trail_pct"])),
-                       step=1.0, key="sell_sig_trail_pct")
+            st.slider("📉 트레일링 스탑 민감도 (종목 변동성 × N배)", min_value=1.5, max_value=6.0,
+                       value=float(st.session_state.get("sell_sig_trail_vol_multiplier", _SELL_SIGNAL_DEFAULTS["trail_vol_multiplier"])),
+                       step=0.5, key="sell_sig_trail_vol_multiplier",
+                       help="고정 %가 아니라 종목마다 다르게 계산돼요. 예: 변동성 1.5%인 안정적인 종목은 배수 3일 때 -4.5%(최소 -4%)가 기준선이 되고, 변동성 5%인 종목은 -15%가 기준선이 됩니다.")
             st.slider("🔻 모멘텀 통합점수(점) 미만이면 신호", min_value=10.0, max_value=60.0,
                        value=float(st.session_state.get("sell_sig_momentum_floor", _SELL_SIGNAL_DEFAULTS["momentum_floor"])),
                        step=1.0, key="sell_sig_momentum_floor")
