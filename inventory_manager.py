@@ -8753,9 +8753,15 @@ def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=
     fundamental_max = 300
     fundamental_100 = round(max(0, min(100, fundamental / fundamental_max * 100)), 1)
 
-    momentum_combined = round(trend + flow + volume + momentum + pattern + risk, 1)
+    # ⚠️ [2026-09 점검용 추가] 리스크 감점(-80)이 겹치면 trend+flow+volume+momentum+
+    # pattern+risk의 합이 이론상 0 미만으로 내려갈 수 있는데, 기존엔 바로 0~700으로
+    # 클램핑해버려서 "모멘텀이 진짜 마이너스로 나쁜 종목"과 "그냥 0점대로 약한 종목"이
+    # 화면상 똑같이 0~낮은 점수로 보였다. 클램핑 전 raw 값을 momentum_score_raw로
+    # 별도 보존해서, 실제로 음수가 얼마나 자주 나오는지 debug로 확인할 수 있게 한다
+    # (클램핑된 momentum_score/momentum_100은 화면 표시용으로 그대로 유지).
+    momentum_combined_raw = round(trend + flow + volume + momentum + pattern + risk, 1)
     momentum_combined_max = 700
-    momentum_combined = max(0.0, min(momentum_combined_max, momentum_combined))
+    momentum_combined = max(0.0, min(momentum_combined_max, momentum_combined_raw))
     momentum_combined_100 = round(momentum_combined / momentum_combined_max * 100, 1)
 
     return {
@@ -8771,6 +8777,7 @@ def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=
         # ── 기업체력 / 모멘텀 분리 점수 (신규) ──
         "fundamental_score": fundamental, "fundamental_max": fundamental_max, "fundamental_100": fundamental_100,
         "momentum_score": momentum_combined, "momentum_score_max": momentum_combined_max, "momentum_100": momentum_combined_100,
+        "momentum_score_raw": momentum_combined_raw,  # 클램핑 전 원본값 (0 미만/700 초과 여부 점검용)
         "debug": _ai_score_debug_info(df_price, kospi_closes, debt, drop_pct),
     }
 
@@ -9470,7 +9477,7 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         "재무":   "수익성(0~60: ROE+영업이익률+순이익률) + 성장성(0~70: 매출·영업이익·EPS 증가율) + 건전성(0~50: 부채비율)을 더합니다. 돈을 잘 벌고, 성장하고, 빚이 적을수록 높습니다.",
         "밸류":   "PER(0~50) + PBR(0~30) + PEG 근사(PER÷ROE, 0~20) + 배당수익률(0~20)을 더합니다. 이익·자산 대비 저평가돼 있고 배당이 높을수록 높습니다.",
         "모멘텀": "5일(0~20) + 20일(0~40) + 60일(0~20) 수익률 + 코스피 대비 상대강도 RS 보너스(0~20)를 더합니다. 단기·중기·장기 모두 오르는 중이고 지수보다 잘 버틸수록 높습니다.",
-        "AI패턴": "⚠️ 과거 급등 사례에서 흔히 보이는 규칙(저항선 돌파·거래량 동반·최근 상승 우위)을 조합한 근사 휴리스틱입니다. 실제 유사도 검색이나 매매 신호가 아닙니다.",
+        "패턴점수": "⚠️ 과거 급등 사례에서 흔히 보이는 규칙(저항선 돌파·거래량 동반·최근 상승 우위)을 조합한 근사 휴리스틱입니다. 실제 AI 유사도 검색이나 매매 신호가 아닙니다.",
         "리스크": "감점 전용 항목입니다. 일별 등락률 변동성(0~30) + 부채비율(0~20, 60% 이하는 감점 없음) + 52주 고점대비 하락폭(0~20) + 최근 연속 하락일수(0~10)를 감점으로 뺍니다.",
     }
 
@@ -9494,15 +9501,23 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
             '</div></div>'
         )
 
+    # ── [2026-09 카드 배치 변경] 2열 그리드는 리스트 순서대로 좌→우, 위→아래로
+    # 채워진다(홀수번째=왼쪽 열, 짝수번째=오른쪽 열). 아래 순서로 두면
+    #   왼쪽 열: 밸류 → 재무 → 패턴점수 → 리스크
+    #   오른쪽 열: 추세 → 거래량 → 수급 → 모멘텀
+    # 으로 배치된다. ⚠️ 이건 순수하게 화면 배치 순서일 뿐, 기업체력(재무+밸류)/
+    # 모멘텀(추세+수급+거래량+모멘텀+패턴점수+리스크) 점수 계산 로직과는 무관하다
+    # — 패턴점수·리스크는 실제로는 모멘텀 계산에 들어가지만, 여기서는 사용자가
+    # 요청한 배치대로 왼쪽 열에 둔다.
     categories = [
-        ("📈", "추세",     detailed["trend"],     detailed["trend_max"],     0),
-        ("💰", "수급",     detailed["flow"],       detailed["flow_max"],       0),
-        ("📊", "거래량",   detailed["volume"],     detailed["volume_max"],     0),
-        ("💹", "재무",     detailed["financial"],  detailed["financial_max"],  0),
         ("📉", "밸류",     detailed["valuation"],  detailed["valuation_max"],  0),
-        ("🚀", "모멘텀",   detailed["momentum"],   detailed["momentum_max"],   0),
-        ("🔥", "AI패턴",   detailed["pattern"],    detailed["pattern_max"],    0),
+        ("📈", "추세",     detailed["trend"],     detailed["trend_max"],     0),
+        ("💹", "재무",     detailed["financial"],  detailed["financial_max"],  0),
+        ("📊", "거래량",   detailed["volume"],     detailed["volume_max"],     0),
+        ("🔥", "패턴점수", detailed["pattern"],    detailed["pattern_max"],    0),
+        ("💰", "수급",     detailed["flow"],       detailed["flow_max"],       0),
         ("⚠️", "리스크",   detailed["risk"],       detailed["risk_max"],       detailed["risk_min"]),
+        ("🚀", "모멘텀",   detailed["momentum"],   detailed["momentum_max"],   0),
     ]
 
     def _tooltip_label(icon, label):
@@ -9528,10 +9543,10 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
     # 배지로 요약한다 — 항목별 8줄짜리 막대를 다 안 봐도 강점/약점이 바로 보이게.
     _STRONG_LABEL = {"추세": "추세 강함", "수급": "수급 양호", "거래량": "거래량 활발",
                       "재무": "재무 안정적", "밸류": "밸류 매력적", "모멘텀": "모멘텀 강함",
-                      "AI패턴": "패턴 긍정적", "리스크": "리스크 낮음"}
+                      "패턴점수": "패턴 긍정적", "리스크": "리스크 낮음"}
     _WEAK_LABEL = {"추세": "추세 약함", "수급": "수급 부진", "거래량": "거래량 저조",
                     "재무": "재무 부담", "밸류": "밸류 부담", "모멘텀": "모멘텀 약함",
-                    "AI패턴": "패턴 약함", "리스크": "리스크 높음"}
+                    "패턴점수": "패턴 약함", "리스크": "리스크 높음"}
 
     badges = []
     for icon, label, val, max_v, min_v in categories:
@@ -9589,11 +9604,25 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         elif val_100 >= 40:  return "#D97706"
         else:                return "#DC2626"
 
+    # ⚠️ [2026-09 추가] 기업체력 = 재무(회사가 튼튼한가) + 밸류(주가가 싼가)를
+    # 그냥 합친 값이라, "탄탄한데 비싼 회사"와 "부실한데 싼 회사(밸류 트랩)"가
+    # 둘 다 비슷한 점수로 나올 수 있다. 사용자가 이 숫자를 "좋은 회사"로 오해하지
+    # 않도록, 카드 라벨에 호버 툴팁으로 구성 방식을 명시한다.
+    _FIT_HELP = {
+        "기업체력": "재무(수익성·성장성·건전성) + 밸류(저평가 매력)를 합친 값입니다. '탄탄한데 비싼 회사'와 '부실한데 싼 회사'가 비슷한 점수로 나올 수 있으니, 아래 재무·밸류 카드를 함께 확인하세요.",
+        "모멘텀":   "추세·수급·거래량·모멘텀·패턴점수·리스크를 합친 값입니다. 지금 시장에서 이 종목이 얼마나 뜨거운지를 나타내며, 회사 자체의 좋고 나쁨과는 별개입니다.",
+    }
+
     def _fit_stat_card(icon, label, val_100, color):
+        help_text = _FIT_HELP.get(label, "")
+        label_html = (
+            f'<span class="ai-tip-wrap">{icon} {label}<span class="ai-tip-icon">?</span>'
+            f'<span class="ai-tip-box">{help_text}</span></span>'
+        ) if help_text else f'{icon} {label}'
         return (
             f'<div style="flex:1; text-align:center; padding:14px 10px; background:{color}0D; '
             f'border:1px solid {color}33; border-radius:12px;">'
-            f'<div style="font-size:11.5px; color:{color}; font-weight:700; margin-bottom:6px;">{icon} {label}</div>'
+            f'<div style="font-size:11.5px; color:{color}; font-weight:700; margin-bottom:6px; display:flex; align-items:center; justify-content:center;">{label_html}</div>'
             f'<div style="font-size:32px; font-weight:800; color:{color};">'
             f'{val_100:.0f}<span style="font-size:15px; font-weight:600; color:#94A3B8;"> / 100</span></div>'
             '</div>'
@@ -9601,7 +9630,31 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
 
     fundamental_100 = detailed.get("fundamental_100", 0.0)
     momentum_100 = detailed.get("momentum_100", 0.0)
+
+    # ⚠️ [2026-09 추가] 종목 유형 사분면 분류. 이미 계산된 fundamental_100/momentum_100
+    # 두 축을 50점 기준으로 나눠서 4가지 유형 배지를 붙인다. 새로운 점수 체계를
+    # 만드는 게 아니라 기존 두 값을 재해석해서 보여주는 것뿐이라 계산 비용이 없다.
+    def _stock_type_badge(fit, mom):
+        if fit >= 50 and mom >= 50:
+            return ("#7C3AED", "#F5F3FF", "💎", "우량 강세주", "회사도 탄탄하고 주가 흐름도 강함")
+        elif fit >= 50 and mom < 50:
+            return ("#2563EB", "#EFF6FF", "🌱", "저평가 대기주", "회사는 나쁘지 않은데 주가가 아직 안 움직임")
+        elif fit < 50 and mom >= 50:
+            return ("#D97706", "#FFFBEB", "🔥", "위험 급등주", "회사는 불안한데 주가만 강하게 움직임")
+        else:
+            return ("#DC2626", "#FEF2F2", "🧊", "관망 필요", "회사도 부실하고 주가 흐름도 약함")
+
+    _type_color, _type_bg, _type_emoji, _type_label, _type_desc = _stock_type_badge(fundamental_100, momentum_100)
+    type_badge_html = (
+        f'<div style="display:flex; align-items:center; gap:6px; margin-bottom:10px; '
+        f'background:{_type_bg}; border:1px solid {_type_color}33; border-radius:8px; padding:6px 10px;">'
+        f'<span style="font-size:13px; font-weight:700; color:{_type_color};">{_type_emoji} {_type_label}</span>'
+        f'<span style="font-size:11px; color:#64748B;">— {_type_desc}</span>'
+        '</div>'
+    )
+
     split_html = (
+        type_badge_html +
         '<div style="display:flex; gap:10px; margin-bottom:12px;">'
         + _fit_stat_card("🏢", "기업체력", fundamental_100, _fit_tier_color(fundamental_100))
         + _fit_stat_card("🚀", "모멘텀", momentum_100, _fit_tier_color(momentum_100))
@@ -9625,7 +9678,7 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         + cat_cards +
         '</div>'
         '<div style="margin-top:10px; font-size:10.5px; color:#94A3B8; line-height:1.6;">'
-        '⚠️ AI패턴 점수는 과거 급등 사례에서 흔히 보이는 규칙(저항선 돌파·거래량 동반·상승 우위)을 '
+        '⚠️ 패턴점수는 과거 급등 사례에서 흔히 보이는 규칙(저항선 돌파·거래량 동반·상승 우위)을 '
         '조합한 근사치이며, 실제 유사도 검색이나 매매 신호가 아닙니다.'
         '</div>'
         '</div>'
@@ -9633,10 +9686,16 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
     st.markdown(html, unsafe_allow_html=True)
 
     debug_info = detailed.get("debug") or {}
-    if debug_info:
+    momentum_raw = detailed.get("momentum_score_raw")
+    if debug_info or momentum_raw is not None:
         with st.expander("🔍 점수 산출 원본 수치 보기 (왜 이 점수인지 확인용)"):
             for k, v in debug_info.items():
                 st.markdown(f"- **{k}**: {v}")
+            if momentum_raw is not None:
+                clamp_note = " ⚠️ 0 미만으로 클램핑됨" if momentum_raw < 0 else (
+                    " ⚠️ 700 초과로 클램핑됨" if momentum_raw > detailed.get("momentum_score_max", 700) else ""
+                )
+                st.markdown(f"- **모멘텀 raw(클램핑 전)**: {momentum_raw:.1f}{clamp_note}")
 
     scores = legacy_scores  # 아래 _build_ai_comment 호출부와의 변수명 호환
 
