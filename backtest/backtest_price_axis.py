@@ -97,6 +97,18 @@ SCORE_BUCKETS = [
 CACHE_DIR = Path(__file__).parent / "price_cache"
 OUTPUT_RAW_CSV = Path(__file__).parent / "backtest_raw_results.csv"
 OUTPUT_SUMMARY_CSV = Path(__file__).parent / "backtest_bucket_summary.csv"
+OUTPUT_SUBSCORE_CORR_CSV = Path(__file__).parent / "backtest_subscore_correlation.csv"
+OUTPUT_SUBSCORE_QUANTILE_CSV = Path(__file__).parent / "backtest_subscore_quantile.csv"
+
+# 서브점수별 분석에 쓸 컬럼 매핑 (run_backtest에서 row.update({f"sub_{k}": v ...})로 저장됨)
+SUBSCORE_COLUMNS = {
+    "추세": "sub_추세",
+    "거래량": "sub_거래량",
+    "모멘텀": "sub_모멘텀",
+    "패턴점수": "sub_패턴점수",
+    "리스크": "sub_리스크",
+}
+N_QUANTILES = 5  # 서브점수를 5분위로 나눠서 이후 수익률 비교 (Q1=하위20%, Q5=상위20%)
 
 KOSPI_TICKER = "^KS11"
 
@@ -356,6 +368,97 @@ def fetch_price_history(ticker, start, end, cache_dir=CACHE_DIR):
 
 
 # ════════════════════════════════════════════════════════════════════════
+# 서브점수별 개별 분석 — 5개 항목(추세/거래량/모멘텀/패턴/리스크)을 각각 따로 놓고
+# 이후 수익률과의 관계를 확인한다.
+#
+# 왜 필요한가: 전체 합산 점수의 상관계수가 0에 가깝게 나와도, 그 안에서 어떤
+# 항목은 양의 관계, 어떤 항목은 음의 관계를 가지면서 서로 상쇄됐을 수 있다.
+# 예를 들어 "거래량 급등 = 단기 과열 후 조정"이라면 거래량 점수는 오히려
+# 음의 상관을 보일 수 있는데, 이런 항목이 합산 점수 안에 섞여 있으면
+# 전체 상관계수만 봐서는 원인을 찾을 수 없다.
+# ════════════════════════════════════════════════════════════════════════
+
+def analyze_subscores(result_df):
+    print("\n" + "=" * 70)
+    print("🔍 서브점수별 개별 상관관계 분석 (Spearman)")
+    print("=" * 70)
+    print("전체 합산 점수 대신, 5개 항목을 각각 따로 놓고 이후 수익률과의 관계를 본다.\n")
+
+    corr_rows = []
+    for sub_name, col in SUBSCORE_COLUMNS.items():
+        if col not in result_df.columns:
+            continue
+        row = {"서브점수": sub_name}
+        for label in FORWARD_HORIZONS:
+            valid = result_df.dropna(subset=[col, label])
+            if len(valid) >= 10:
+                corr = valid[col].corr(valid[label], method="spearman")
+                row[f"{label}_상관계수"] = round(corr, 3)
+                row[f"{label}_표본수"] = len(valid)
+            else:
+                row[f"{label}_상관계수"] = np.nan
+                row[f"{label}_표본수"] = len(valid)
+        corr_rows.append(row)
+
+    corr_df = pd.DataFrame(corr_rows)
+    print(corr_df.to_string(index=False))
+    corr_df.to_csv(OUTPUT_SUBSCORE_CORR_CSV, index=False, encoding="utf-8-sig")
+    print(f"\n상관계수 저장: {OUTPUT_SUBSCORE_CORR_CSV}")
+
+    # ── 서브점수별 5분위(quintile) 수익률표 ──
+    # 상관계수 하나로는 못 잡아내는 비단조적 패턴(예: 중간이 제일 좋다, 너무 튀면
+    # 오히려 나쁘다 등)을 확인하기 위함.
+    print("\n" + "=" * 70)
+    print(f"📊 서브점수별 {N_QUANTILES}분위(quintile) 이후 수익률표")
+    print("=" * 70)
+    print("Q1=해당 항목 점수 하위 20% ~ Q5=상위 20%\n")
+
+    quantile_rows = []
+    for sub_name, col in SUBSCORE_COLUMNS.items():
+        if col not in result_df.columns:
+            continue
+        valid = result_df.dropna(subset=[col]).copy()
+        if len(valid) < N_QUANTILES * 5:  # 분위당 최소 5개는 있어야 의미 있음
+            print(f"  [{sub_name}] 표본 부족({len(valid)}개)으로 5분위 분석 스킵")
+            continue
+        try:
+            valid["quantile"] = pd.qcut(valid[col], N_QUANTILES, labels=False, duplicates="drop")
+        except ValueError:
+            print(f"  [{sub_name}] 값이 한쪽에 몰려 있어 5분위 분할 불가 → 스킵")
+            continue
+
+        for q in sorted(valid["quantile"].dropna().unique()):
+            sub = valid[valid["quantile"] == q]
+            row = {
+                "서브점수": sub_name,
+                "분위": f"Q{int(q) + 1}",
+                "표본수": len(sub),
+                "점수범위": f"{sub[col].min():.1f}~{sub[col].max():.1f}",
+            }
+            for label in FORWARD_HORIZONS:
+                s = sub[label].dropna()
+                if len(s) > 0:
+                    row[f"{label}_평균(%)"] = round(s.mean(), 2)
+                    row[f"{label}_승률(%)"] = round((s > 0).mean() * 100, 1)
+                else:
+                    row[f"{label}_평균(%)"] = np.nan
+                    row[f"{label}_승률(%)"] = np.nan
+            quantile_rows.append(row)
+
+    quantile_df = pd.DataFrame(quantile_rows)
+    if not quantile_df.empty:
+        print(quantile_df.to_string(index=False))
+        quantile_df.to_csv(OUTPUT_SUBSCORE_QUANTILE_CSV, index=False, encoding="utf-8-sig")
+        print(f"\n5분위 수익률표 저장: {OUTPUT_SUBSCORE_QUANTILE_CSV}")
+
+    print("\n⚠️ 해석 시 주의: 서브점수끼리도 서로 상관돼 있을 수 있다(예: 추세 좋은 종목이")
+    print("   모멘텀도 같이 좋기 쉬움). 여기 분석은 '단독' 상관관계이지 다른 항목을")
+    print("   통제한 순수 효과가 아니다. 진짜 원인 분리를 하려면 다중회귀 등이 필요하다.")
+
+    return corr_df, quantile_df
+
+
+# ════════════════════════════════════════════════════════════════════════
 # 백테스트 루프
 # ════════════════════════════════════════════════════════════════════════
 
@@ -468,6 +571,21 @@ def run_backtest():
     print("\n⚠️ 표본수가 적은 구간(특히 극단 구간)은 신뢰도가 낮으니 표본수도 같이 확인할 것.")
     print("⚠️ 이 결과는 가격/거래량 축만 반영한 것으로, 실제 앱의 AI 종합점수(1000점, 재무·밸류·수급 포함)와는 다르다.")
 
+    # ── 서브점수별(추세/거래량/모멘텀/패턴/리스크) 개별 상관관계 분석 ──
+    analyze_subscores(result_df)
+
 
 if __name__ == "__main__":
-    run_backtest()
+    import sys
+
+    # 이미 backtest_raw_results.csv가 있으면 (예: 이전에 전체 백테스트를 돌려놓은 경우)
+    # 네트워크 재요청 없이 서브점수 분석만 다시 돌릴 수 있다:
+    #     python backtest_price_axis.py --subscore-only
+    if "--subscore-only" in sys.argv:
+        if not OUTPUT_RAW_CSV.exists():
+            print(f"⚠️ {OUTPUT_RAW_CSV} 가 없습니다. 먼저 전체 백테스트(python backtest_price_axis.py)를 한 번 돌려주세요.")
+        else:
+            result_df = pd.read_csv(OUTPUT_RAW_CSV)
+            analyze_subscores(result_df)
+    else:
+        run_backtest()

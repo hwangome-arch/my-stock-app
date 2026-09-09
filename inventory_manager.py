@@ -8649,6 +8649,52 @@ def _ai_score_debug_info(df_price, kospi_closes=None, debt=None, drop_pct=None):
     return info
 
 
+def calc_risk_weighted_momentum_100(trend, volume, momentum, pattern, risk):
+    """⚠️ [2026-09 추가] OOS(out-of-sample) 검증을 거친 '리스크 가중 강화' 모멘텀 점수.
+
+    배경: backtest_oos_validation.py / backtest_oos_multi_split.py / backtest_oos_block_cv.py
+    로 2022-09~2025-07 기간(1440개 표본) 검증 결과, 추세·거래량·모멘텀·패턴점수 4개 항목은
+    train 구간에서 유의했던 계수가 test 구간에서 거의 다 사라진 반면(과적합/노이즈로 추정),
+    '리스크' 항목 단독은 60거래일·120거래일 forward horizon에서:
+      - 완전 비중첩 4블록 교차검증 중 3/4 블록이 일관되게 양(+)의 Spearman 상관
+        (평균 0.14~0.19, 최소값도 대부분 양수 — 2022-09~2023-04 약세장 블록만 예외)
+      - 5분위 승률이 Q1<Q2<...<Q5로 계단식 증가하는 패턴이 train/test 양쪽에서 유지
+    로 나타나 '우연이 아닐 가능성이 높은 신호'로 판단됐다. 20거래일 horizon은 부호가
+    자주 뒤집혀 신뢰도가 낮으므로 반영하지 않았다.
+
+    ⚠️ 이 함수는 momentum_100/total(기존 캘리브레이션된 지표)을 대체하지 않는다.
+    momentum_floor(기술적 반전 임계값 25.0) 등 기존 배점에 맞춰 손으로 재조정해둔
+    기준선을 건드리지 않기 위해, 별도의 참고 지표로만 추가한다. 실전 매매 판단에
+    반영하려면 60일~120일 정도의 보유 기간을 전제로 참고할 것 — 20일 이내 단기
+    관점에서는 검증되지 않았다.
+
+    가중치는 backtest_analysis_v2.py의 [실험 2] '리스크 4배 가중'과 동일한 비율
+    (추세:거래량:모멘텀:패턴:리스크 = 200:100:100:100:320, 리스크는 원본의 4배)을 쓴다.
+    각 항목을 자기 만점 기준 0~1로 정규화한 뒤 이 비율로 가중합해 0~100 스케일로
+    환산한다 (리스크는 -80~0 → (80+risk)/80 로 정규화, 0에 가까울수록=무위험일수록 1에 가까움).
+
+    반환: 0~100 (높을수록 backtest 기준 60~120일 forward 수익률과 더 강하게 연관됐던 조합)."""
+    try:
+        norm_trend = max(0.0, min(1.0, trend / 200.0))
+        norm_volume = max(0.0, min(1.0, volume / 100.0))
+        norm_momentum = max(0.0, min(1.0, momentum / 100.0))
+        norm_pattern = max(0.0, min(1.0, pattern / 100.0))
+        norm_risk = max(0.0, min(1.0, (80.0 + risk) / 80.0))
+
+        weights = {"trend": 200, "volume": 100, "momentum": 100, "pattern": 100, "risk": 320}
+        total_w = sum(weights.values())  # 820
+        weighted = (
+            norm_trend * weights["trend"]
+            + norm_volume * weights["volume"]
+            + norm_momentum * weights["momentum"]
+            + norm_pattern * weights["pattern"]
+            + norm_risk * weights["risk"]
+        )
+        return round(weighted / total_w * 100, 1)
+    except Exception:
+        return None
+
+
 def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=None, screener_df=None):
     """세분화된 AI 종합점수(0~1000). 8개 항목 배점을 그대로 합산한다.
 
@@ -8764,8 +8810,14 @@ def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=
     momentum_combined = max(0.0, min(momentum_combined_max, momentum_combined_raw))
     momentum_combined_100 = round(momentum_combined / momentum_combined_max * 100, 1)
 
+    # ⚠️ [2026-09 추가] OOS 검증된 리스크 가중 강화 점수 (60~120일 관점 참고용).
+    # 자세한 배경은 calc_risk_weighted_momentum_100() docstring 참고. 기존 momentum_100/
+    # total은 그대로 유지되며 이 값은 별도 참고 지표로만 추가된다.
+    risk_weighted_100 = calc_risk_weighted_momentum_100(trend, volume, momentum, pattern, risk)
+
     return {
         "total": total,
+        "risk_weighted_100": risk_weighted_100,  # 참고용: 60~120일 관점 리스크 가중 강화 점수 (0~100)
         "trend": trend,         "trend_max": 200,    "trend_min": 0,
         "flow": flow,           "flow_max": 200,     "flow_min": 0,
         "volume": volume,       "volume_max": 100,   "volume_min": 0,
@@ -9611,6 +9663,7 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
     _FIT_HELP = {
         "기업체력": "재무(수익성·성장성·건전성) + 밸류(저평가 매력)를 합친 값입니다. '탄탄한데 비싼 회사'와 '부실한데 싼 회사'가 비슷한 점수로 나올 수 있으니, 아래 재무·밸류 카드를 함께 확인하세요.",
         "모멘텀":   "추세·수급·거래량·모멘텀·패턴점수·리스크를 합친 값입니다. 지금 시장에서 이 종목이 얼마나 뜨거운지를 나타내며, 회사 자체의 좋고 나쁨과는 별개입니다.",
+        "리스크가중(참고)": "⚠️ 실험적 참고 지표입니다. 2022-09~2025-07 백테스트(1440표본, 비중첩 4블록 교차검증)에서 '리스크' 항목만 60~120일 forward 수익률과 꾸준히 양(+)의 상관을 보여, 리스크 비중을 4배로 높여 재계산한 값입니다. 20일 이내 단기 관점에서는 검증되지 않았고, 기존 모멘텀 점수를 대체하지 않습니다.",
     }
 
     def _fit_stat_card(icon, label, val_100, color):
@@ -9630,6 +9683,7 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
 
     fundamental_100 = detailed.get("fundamental_100", 0.0)
     momentum_100 = detailed.get("momentum_100", 0.0)
+    risk_weighted_100 = detailed.get("risk_weighted_100")  # None이면 계산 실패 → 카드 생략
 
     # ⚠️ [2026-09 추가] 종목 유형 사분면 분류. 이미 계산된 fundamental_100/momentum_100
     # 두 축을 50점 기준으로 나눠서 4가지 유형 배지를 붙인다. 새로운 점수 체계를
@@ -9658,6 +9712,8 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         '<div style="display:flex; gap:10px; margin-bottom:12px;">'
         + _fit_stat_card("🏢", "기업체력", fundamental_100, _fit_tier_color(fundamental_100))
         + _fit_stat_card("🚀", "모멘텀", momentum_100, _fit_tier_color(momentum_100))
+        + (_fit_stat_card("🔬", "리스크가중(참고)", risk_weighted_100, _fit_tier_color(risk_weighted_100))
+           if risk_weighted_100 is not None else "")
         + '</div>'
     )
 
