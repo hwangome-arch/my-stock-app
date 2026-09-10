@@ -9525,18 +9525,35 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
     # ⚠️ [2026-09 추가] "AI 종합 점수" 자체가 무엇의 합인지, 등급 구간이 어떻게
     # 나뉘는지 바로 아래 카드들(기업체력/모멘텀)만 봐서는 알기 어렵다는 피드백.
     # 카드 우측 상단 빈 공간에 독립 (?) 아이콘을 배치해, 클릭 없이 마우스만
-    # 올려도 총점 구성과 등급 기준을 바로 확인할 수 있게 한다.
+    # 올려도 총점 구성/등급 기준과 함께 "왜 이 점수인지" 확인용 원본 수치까지
+    # 바로 확인할 수 있게 한다. (예전엔 별도 클릭식 expander로 있던 내용을 통합)
+    _debug_info = detailed.get("debug") or {}
+    _momentum_raw = detailed.get("momentum_score_raw")
+    _debug_lines = [
+        f"<b>{html_lib.escape(str(k))}</b>: {html_lib.escape(str(v))}"
+        for k, v in _debug_info.items()
+    ]
+    if _momentum_raw is not None:
+        _clamp_note = " ⚠️0 미만 클램핑" if _momentum_raw < 0 else (
+            " ⚠️700 초과 클램핑" if _momentum_raw > detailed.get("momentum_score_max", 700) else ""
+        )
+        _debug_lines.append(f"<b>모멘텀 raw(클램핑 전)</b>: {_momentum_raw:.1f}{_clamp_note}")
+    _debug_html = ("<br>".join(_debug_lines)) if _debug_lines else ""
+
     TOTAL_SCORE_HELP = (
         "기업체력(재무+밸류)과 모멘텀(추세+수급+거래량+모멘텀+패턴점수+리스크)을 "
         "합쳐 1000점 만점으로 환산한 값입니다.<br>"
         "850+ 최우량 · 700+ 우량 · 550+ 양호 · 400+ 보통 · 그 미만 주의"
+        + (f'<hr style="border-color:#334155; margin:8px 0;">🔍 <b>점수 산출 원본 수치</b><br>{_debug_html}' if _debug_html else "")
     )
     # 카드 우측 상단 코너에 절대 위치로 배치할 독립 도움말 아이콘.
     # ai-tip-icon보다 살짝 크게(16px) 만들어 빈 여백에서도 잘 보이게 한다.
+    # 원본 수치가 붙으면 내용이 길어지므로, 기본 210px보다 넓은 290px로 오버라이드한다
+    # (인라인 style이 .ai-tip-box 클래스보다 우선 적용됨).
     total_score_help_icon_html = (
         '<span class="ai-tip-wrap" style="position:absolute; top:14px; right:16px;">'
         '<span class="ai-tip-icon" style="width:16px; height:16px; font-size:11px;">?</span>'
-        f'<span class="ai-tip-box" style="right:0; left:auto; bottom:auto; top:135%;">{TOTAL_SCORE_HELP}</span>'
+        f'<span class="ai-tip-box" style="right:0; left:auto; bottom:auto; top:135%; width:290px; max-height:320px; overflow-y:auto;">{TOTAL_SCORE_HELP}</span>'
         '</span>'
     )
 
@@ -9759,18 +9776,6 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         '</div>'
     )
     st.markdown(html, unsafe_allow_html=True)
-
-    debug_info = detailed.get("debug") or {}
-    momentum_raw = detailed.get("momentum_score_raw")
-    if debug_info or momentum_raw is not None:
-        with st.expander("🔍 점수 산출 원본 수치 보기 (왜 이 점수인지 확인용)"):
-            for k, v in debug_info.items():
-                st.markdown(f"- **{k}**: {v}")
-            if momentum_raw is not None:
-                clamp_note = " ⚠️ 0 미만으로 클램핑됨" if momentum_raw < 0 else (
-                    " ⚠️ 700 초과로 클램핑됨" if momentum_raw > detailed.get("momentum_score_max", 700) else ""
-                )
-                st.markdown(f"- **모멘텀 raw(클램핑 전)**: {momentum_raw:.1f}{clamp_note}")
 
     scores = legacy_scores  # 아래 _build_ai_comment 호출부와의 변수명 호환
 
