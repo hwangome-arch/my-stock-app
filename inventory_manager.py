@@ -131,6 +131,7 @@ except Exception:
 # ==================================
 
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import requests
 import gspread
@@ -156,6 +157,63 @@ _SCREENER_DF_CACHE = _get_screener_df_cache()
 # ⚙️ 페이지 설정
 # =========================
 st.set_page_config(page_title="Inventory Manager", page_icon="📦", layout="wide")
+
+# ── [UX 수정] text_input의 "Press Enter to submit form" 안내문구, 브라우저 세션당 1회만 노출 ──
+# Streamlit은 text_input에 아직 커밋 안 된(=Enter/blur 전) 변경이 있으면 입력창 바로
+# 아래에 이 안내문구를 자동으로 띄운다. 파이썬 쪽에서는 사용자가 "타이핑 중"인 순간을
+# 알 방법이 없어(키 입력마다 rerun되지 않음) 순수 Streamlit API만으로는 조건부 제어가
+# 불가능하다. 그래서 작은 JS를 심어 브라우저에서 직접 감시한다.
+# 동작: data-testid="InputInstructions" 요소가 처음 나타나면 그대로 두고(=최초 1회
+# 노출), sessionStorage에 "봤음" 플래그를 남긴다. 그 이후로 같은 요소가 다시
+# 나타나면(타이핑 중이든, 이미 값이 들어있는 입력창이든) 곧바로 숨긴다. 플래그는
+# 브라우저 탭이 열려있는 동안(세션 스토리지)만 유지되며, 탭을 새로 열거나 새로고침하면
+# 다시 한 번은 보여준다.
+# ⚠️ 완전히 없애는 게 아니라 "최초 1회 노출"을 요청받아 이렇게 구현했다. Streamlit
+# 내부 DOM 구조(data-testid)에 의존하므로, 향후 Streamlit 버전이 이 구조를 바꾸면
+# 이 스크립트는 조용히 무력화될 뿐(에러 없이 원래 동작으로 돌아감) 앱이 깨지진 않는다.
+def _inject_hide_input_hint_after_first_show():
+    try:
+        components.html(
+            """
+            <script>
+            (function() {
+                try {
+                    var doc = window.parent.document;
+                    var store = window.parent.sessionStorage;
+                    var STORAGE_KEY = "im_input_hint_shown_once";
+
+                    function handleHint(el) {
+                        if (!el || el.dataset.imHintDone === "1") return;
+                        el.dataset.imHintDone = "1";
+                        var alreadyShown = false;
+                        try { alreadyShown = store.getItem(STORAGE_KEY) === "1"; } catch (e) {}
+                        if (alreadyShown) {
+                            el.style.display = "none";
+                        } else {
+                            try { store.setItem(STORAGE_KEY, "1"); } catch (e) {}
+                        }
+                    }
+
+                    function scan() {
+                        var hints = doc.querySelectorAll('[data-testid="InputInstructions"]');
+                        for (var i = 0; i < hints.length; i++) { handleHint(hints[i]); }
+                    }
+
+                    scan();
+                    var observer = new MutationObserver(scan);
+                    observer.observe(doc.body, { childList: true, subtree: true });
+                } catch (e) {
+                    // 접근 불가 환경이면 조용히 무시 — 기존 Streamlit 기본 동작 유지
+                }
+            })();
+            </script>
+            """,
+            height=0,
+        )
+    except Exception:
+        pass  # 이 UX 편의 기능이 실패해도 앱 본 기능에는 영향 없어야 한다
+
+_inject_hide_input_hint_after_first_show()
 
 # ── [임시 디버그 스위치] 대시보드 "종목 스캔" 기능 끄기 ──────────────────────
 # 코스피/코스닥 수급 토글에서 멈추는 문제의 원인을 좁히기 위한 임시 조치.
