@@ -9522,6 +9522,24 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
         f'{grade_label}</span>'
     ) if grade_label else ""
 
+    # ⚠️ [2026-09 추가] "AI 종합 점수" 자체가 무엇의 합인지, 등급 구간이 어떻게
+    # 나뉘는지 바로 아래 카드들(기업체력/모멘텀)만 봐서는 알기 어렵다는 피드백.
+    # 카드 우측 상단 빈 공간에 독립 (?) 아이콘을 배치해, 클릭 없이 마우스만
+    # 올려도 총점 구성과 등급 기준을 바로 확인할 수 있게 한다.
+    TOTAL_SCORE_HELP = (
+        "기업체력(재무+밸류)과 모멘텀(추세+수급+거래량+모멘텀+패턴점수+리스크)을 "
+        "합쳐 1000점 만점으로 환산한 값입니다.<br>"
+        "850+ 최우량 · 700+ 우량 · 550+ 양호 · 400+ 보통 · 그 미만 주의"
+    )
+    # 카드 우측 상단 코너에 절대 위치로 배치할 독립 도움말 아이콘.
+    # ai-tip-icon보다 살짝 크게(16px) 만들어 빈 여백에서도 잘 보이게 한다.
+    total_score_help_icon_html = (
+        '<span class="ai-tip-wrap" style="position:absolute; top:14px; right:16px;">'
+        '<span class="ai-tip-icon" style="width:16px; height:16px; font-size:11px;">?</span>'
+        f'<span class="ai-tip-box" style="right:0; left:auto; bottom:auto; top:135%;">{TOTAL_SCORE_HELP}</span>'
+        '</span>'
+    )
+
     CATEGORY_HELP = {
         "추세":   "MA 정배열 강도(0~130) + 추세 지속성(0~70)을 더합니다. 이동평균선이 위로 잘 정렬돼 있고 눌림 없이 버틴 날이 많을수록 높습니다. (52주 고점 대비 위치는 '리스크' 항목에서 별도로 반영합니다.)",
         "수급":   "최근 20일간 기관·외국인 각각의 순매수일 비율(0~80)과 순매수 강도(0~20, 평균 거래량 대비 순매수 규모)를 더해 0~100점씩 채점합니다(최대 200). 두 주체 모두 꾸준히, 큰 규모로 순매수 중이면 높습니다.",
@@ -9719,7 +9737,8 @@ def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_la
 
     html = (
         TOOLTIP_CSS +
-        '<div style="background:#FAFBFF; border:1px solid #C7D2FE; border-radius:10px; padding:18px 20px; margin-top:12px;">'
+        '<div style="position:relative; background:#FAFBFF; border:1px solid #C7D2FE; border-radius:10px; padding:18px 20px; margin-top:12px;">'
+        + total_score_help_icon_html +
         '<div style="display:flex; align-items:center; gap:12px; margin-bottom:10px;">'
         '<div style="text-align:center;">'
         '<div style="font-size:32px; font-weight:900; color:' + total_color + '; line-height:1;">' + str(total) + '</div>'
