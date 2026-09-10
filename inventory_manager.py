@@ -10899,9 +10899,12 @@ def render_martingale_simulator(code, current_price):
     # [신규] "예산에 맞춰 1회차 매수금액 자동 계산" 토글. 체크하면 사용자가
     # 1회차 매수금액을 직접 입력하지 않아도, 예산·배율·최대회차로 역산해서
     # 마지막 회차까지 정확히 예산을 다 쓰도록 1회차 금액을 자동으로 채운다.
+    # [2026-09-10 수정] 기본값을 False → True로 변경. 예산 입력만으로는
+    # 체크박스를 켜야만 실제 계산에 반영되는데, 이걸 모르고 예산만 입력한 뒤
+    # 결과가 그대로라고 오인하는 사용자가 많아 기본으로 켜두기로 함.
     _mg_auto_key = f"mg_auto_budget_{code}"
     if _mg_auto_key not in st.session_state:
-        st.session_state[_mg_auto_key] = False
+        st.session_state[_mg_auto_key] = True
 
     def _fmt_mg_inputs():
         # form_submit_button의 on_click은 콜백 하나만 받으므로, 매수금액과
@@ -11062,22 +11065,23 @@ def render_martingale_simulator(code, current_price):
     else:
         _budget_html = ""
 
+    # ⚠️ [버그 수정: 박스가 회색 코드블록처럼 표시되던 문제] 아래 HTML을 들여쓰기된
+    # triple-quote 문자열로 작성하면, Streamlit 마크다운 파서가 줄 앞 공백 4칸
+    # 이상을 "코드 블록"으로 해석해서 HTML이 렌더링되지 않고 태그(</div> 등)가
+    # 그대로 텍스트로 노출된다(회색 배경의 고정폭 폰트 박스로 보임). 반드시 줄 앞
+    # 들여쓰기 없이 문자열을 이어붙여야 한다(_format_probability_fun_card와 동일 패턴).
     st.markdown(
-        f"""
-        <div style="background:#FEF2F2; border:1.5px solid #DC2626; border-radius:14px;
-                    padding:16px 18px; margin:12px 0;">
-            <div style="font-size:14px; font-weight:800; color:#B91C1C; margin-bottom:8px;">
-                ⚠️ {int(_rounds)}회차까지 이어질 경우
-            </div>
-            <div style="font-size:13px; color:#111827; line-height:1.7;">
-                필요 총자금: <b>{total_needed:,.0f}원</b> (1회차 매수금액 대비 <b>{multiple_of_initial:.1f}배</b>)<br>
-                이 시점 매수단가 기준 <b>본전까지 필요한 반등률: {breakeven_needed:.1f}%</b><br>
-                {_budget_html}
-                하락이 {int(_rounds)}회차를 넘어서거나 이 종목이 상장폐지될 경우, 위 금액은
-                회수 불가능한 손실이 될 수 있습니다.
-            </div>
-        </div>
-        """,
+        f'<div style="background:#FEF2F2; border:1.5px solid #DC2626; border-radius:14px; '
+        f'padding:16px 18px; margin:12px 0;">'
+        f'<div style="font-size:14px; font-weight:800; color:#B91C1C; margin-bottom:8px;">'
+        f'⚠️ {int(_rounds)}회차까지 이어질 경우</div>'
+        f'<div style="font-size:13px; color:#111827; line-height:1.7;">'
+        f'필요 총자금: <b>{total_needed:,.0f}원</b> (1회차 매수금액 대비 <b>{multiple_of_initial:.1f}배</b>)<br>'
+        f'이 시점 매수단가 기준 <b>본전까지 필요한 반등률: {breakeven_needed:.1f}%</b><br>'
+        f'{_budget_html}'
+        f'하락이 {int(_rounds)}회차를 넘어서거나 이 종목이 상장폐지될 경우, 위 금액은 '
+        f'회수 불가능한 손실이 될 수 있습니다.'
+        '</div></div>',
         unsafe_allow_html=True
     )
 
@@ -11087,16 +11091,35 @@ def render_martingale_simulator(code, current_price):
         "차트를 로그 스케일로 보기 (회차가 늘수록 금액 차이가 커서 보기 어려울 때)",
         key=f"mg_log_{code}"
     )
+    # 🐛 [버그 수정: 로그 스케일 체크 시 그래프가 텅 비어 보이던 문제]
+    # 막대(bar) 그래프는 항상 0에서부터 그려지는데, 로그 스케일에서는 0의 로그값이
+    # 정의되지 않아(-무한대) 막대 자체가 화면에 그려지지 않는다(Vega-Lite의 알려진
+    # 제약). 로그 스케일에서는 막대 대신 값 자체가 찍히는 점(point) + 선(line)으로
+    # 바꿔 그린다 — 로그 스케일에서도 정상적으로 값이 보인다. 선형(linear) 스케일일
+    # 때는 기존처럼 막대 그래프를 그대로 사용한다.
     _y_scale = alt.Scale(type="log") if _log_scale else alt.Scale(type="linear")
-    _bar = alt.Chart(_chart_df).mark_bar(color="#DC2626").encode(
-        x=alt.X("회차:O", title="회차"),
-        y=alt.Y("누적투자금액:Q", title="누적 투자금액(원)", scale=_y_scale,
-                axis=alt.Axis(format=",.0f")),
-        tooltip=[
-            alt.Tooltip("회차:O", title="회차"),
-            alt.Tooltip("누적투자금액:Q", title="누적 투자금액(원)", format=",.0f"),
-        ]
-    ).properties(height=260)
+    if _log_scale:
+        _bar = (
+            alt.Chart(_chart_df).mark_line(color="#DC2626", point=alt.OverlayMarkDef(size=80, filled=True)).encode(
+                x=alt.X("회차:O", title="회차"),
+                y=alt.Y("누적투자금액:Q", title="누적 투자금액(원)", scale=_y_scale,
+                        axis=alt.Axis(format=",.0f")),
+                tooltip=[
+                    alt.Tooltip("회차:O", title="회차"),
+                    alt.Tooltip("누적투자금액:Q", title="누적 투자금액(원)", format=",.0f"),
+                ]
+            ).properties(height=260)
+        )
+    else:
+        _bar = alt.Chart(_chart_df).mark_bar(color="#DC2626").encode(
+            x=alt.X("회차:O", title="회차"),
+            y=alt.Y("누적투자금액:Q", title="누적 투자금액(원)", scale=_y_scale,
+                    axis=alt.Axis(format=",.0f")),
+            tooltip=[
+                alt.Tooltip("회차:O", title="회차"),
+                alt.Tooltip("누적투자금액:Q", title="누적 투자금액(원)", format=",.0f"),
+            ]
+        ).properties(height=260)
     if _budget:
         # [신규] 설정한 예산을 점선으로 표시해 어느 회차부터 막대가 선을
         # 넘는지 한눈에 보이게 한다.
