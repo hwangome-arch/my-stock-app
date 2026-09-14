@@ -917,22 +917,36 @@ def fetch_market_index_table():
 def fetch_market_news_naver(limit=15):
     """네이버 금융 '주요뉴스' 목록에서 헤드라인/링크/언론사를 가져온다.
     AI 요약이 재료로 쓸 헤드라인 텍스트만 필요하므로 본문은 긁지 않는다
-    (저작권/부하 둘 다 고려해 목록 페이지만 사용)."""
+    (저작권/부하 둘 다 고려해 목록 페이지만 사용).
+
+    ── [Npay 증권 개편 대응] ──────────────────────────────────────────
+    기존에는 articleSubject/articleSummary/press/wdate 라는 고정 클래스명에
+    의존해 정규식으로 긁었는데, 네이버가 브랜드를 'Npay 증권'으로 바꾸면서
+    (종목명 title 순서가 바뀐 것과 같은 개편) 목록 페이지의 마크업도 함께
+    바뀌었을 가능성이 있고, 그러면 이 클래스명 매칭이 통째로 실패해 빈
+    리스트를 반환 → 화면의 '국내 주요 뉴스'와 그걸 재료로 쓰는 'AI 핫 토픽
+    요약'이 동시에 죽는다. 그래서 1차(구 클래스명) 실패 시, 뉴스 상세
+    링크 패턴(news_read.naver)만 보고 훨씬 느슨하게 제목을 긁어오는 2차
+    방식으로 재시도한다. 또한 실패 원인(상태코드/응답 길이/방식)을
+    _DEBUG_STORE에 남겨, 실제로 어느 단계에서 막히는지 바로 확인할 수 있게 한다."""
+    debug = {"status": None, "resp_len": None, "method": None, "exception": None}
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     url = "https://finance.naver.com/news/mainnews.naver"
     try:
         res = requests.get(url, headers=headers, timeout=8)
+        debug["status"] = res.status_code
         res.encoding = 'euc-kr'  # 네이버금융은 euc-kr 고정 (apparent_encoding 추측 금지 — 파일 상단 규칙 참고)
         text = res.text
-    except Exception:
+        debug["resp_len"] = len(text)
+    except Exception as e:
+        debug["exception"] = f"{type(e).__name__}: {e}"
+        _DEBUG_STORE["_market_news_debug"] = debug
         return []
 
     items = []
     try:
-        # mainnews.naver는 <dl> 블록 안에 <dt class="thumb">(썸네일, 있을 수도 없을 수도)와
-        # <dd class="articleSubject"><a href=...>제목</a></dd>,
+        # 1차: 기존(구) 마크업 — <dd class="articleSubject"><a href=...>제목</a></dd>,
         # <dd class="articleSummary">...<span class="press">언론사</span>...<span class="wdate">시간</span></dd>
-        # 형태로 반복된다. 정규식으로 가볍게 파싱 (전체 HTML 파서 의존성 추가를 피함).
         blocks = re.findall(
             r'articleSubject.*?href="([^"]+)"[^>]*>\s*(?:<[^>]+>)*\s*([^<]+?)\s*</a>.*?'
             r'class="press">([^<]*)</span>.*?class="wdate">([^<]*)</span>',
@@ -949,8 +963,38 @@ def fetch_market_news_naver(limit=15):
                 "press": press.strip(),
                 "time": wdate.strip(),
             })
+        if items:
+            debug["method"] = "legacy_class_match"
     except Exception:
-        return []
+        items = []
+
+    if not items:
+        # 2차 폴백: 클래스명이 또 바뀌어도 잘 안 깨지도록, 뉴스 상세 페이지로
+        # 연결되는 링크(news_read.naver)를 가진 <a> 태그만 훑어서 제목/링크만
+        # 확보한다. 언론사·시간은 이 방식에서는 안정적으로 못 뽑으므로 빈 값으로 둔다
+        # (AI 요약 재료로는 제목 텍스트만 있어도 충분).
+        try:
+            loose_blocks = re.findall(
+                r'<a[^>]+href="([^"]*news_read\.naver[^"]*)"[^>]*>\s*(?:<[^>]+>)*\s*([^<]{4,120}?)\s*</a>',
+                text, flags=re.S
+            )
+            seen_titles = set()
+            for href, title in loose_blocks:
+                title = html_lib.unescape(re.sub(r'\s+', ' ', title)).strip()
+                if not title or title in seen_titles:
+                    continue
+                seen_titles.add(title)
+                link = href if href.startswith("http") else f"https://finance.naver.com{href}"
+                items.append({"title": title, "link": link, "press": "", "time": ""})
+                if len(items) >= limit:
+                    break
+            if items:
+                debug["method"] = "loose_news_read_link"
+        except Exception as e:
+            debug["exception"] = f"{type(e).__name__}: {e}"
+
+    debug["items_found"] = len(items)
+    _DEBUG_STORE["_market_news_debug"] = debug
     return items
 
 
@@ -11911,6 +11955,10 @@ def render_market_pulse():
         st.info("ℹ️ AI 요약을 사용하려면 `.streamlit/secrets.toml`에 `GEMINI_API_KEY`를 추가해주세요. (Google AI Studio에서 무료 발급 가능 · 헤드라인·글로벌 지표는 아래에서 계속 확인 가능)")
     elif not headlines:
         st.warning("⚠️ 국내 뉴스 헤드라인을 불러오지 못해 AI 요약을 생성할 수 없습니다. 네이버 금융 서버 통신이 지연되고 있을 수 있습니다.")
+        _news_debug = _DEBUG_STORE.get("_market_news_debug")
+        if _news_debug:
+            with st.expander("🔧 디버그 정보 (뉴스 조회 실패 원인 확인용)"):
+                st.write(_news_debug)
     else:
         topics, error_msg = generate_ai_market_briefing(headlines, global_snapshot, us_headlines)
         if not topics:
@@ -12076,12 +12124,23 @@ def render_market_pulse():
     st.subheader("📰 국내 주요 뉴스")
     if not headlines:
         st.error("데이터를 불러올 수 없습니다. 네이버 금융 서버 통신이 지연되고 있습니다.")
+        _news_debug2 = _DEBUG_STORE.get("_market_news_debug")
+        if _news_debug2:
+            with st.expander("🔧 디버그 정보 (뉴스 조회 실패 원인 확인용)"):
+                st.write(_news_debug2)
     else:
         for h in headlines:
+            # [느슨한 폴백 방식으로 수집된 경우] 언론사/시간을 못 뽑아 빈 값일 수 있으므로,
+            # 그럴 땐 " · " 구분자가 있는 메타 줄 자체를 숨긴다.
+            meta_parts = [p for p in (h.get('press', ''), h.get('time', '')) if p]
+            meta_html = (
+                f"""<div style="font-size:12px; color:#94A3B8; margin-top:2px;">{html_lib.escape(' · '.join(meta_parts))}</div>"""
+                if meta_parts else ""
+            )
             st.markdown(f"""
                 <div style="padding:10px 4px; border-bottom:1px solid #F1F5F9;">
                     <a href="{h['link']}" target="_blank" style="font-size:14px; font-weight:600; color:#111827; text-decoration:none;">{html_lib.escape(h['title'])}</a>
-                    <div style="font-size:12px; color:#94A3B8; margin-top:2px;">{html_lib.escape(h['press'])} · {html_lib.escape(h['time'])}</div>
+                    {meta_html}
                 </div>
             """, unsafe_allow_html=True)
 
