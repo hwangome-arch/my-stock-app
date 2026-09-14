@@ -915,38 +915,89 @@ def fetch_market_index_table():
 # =========================
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_market_news_naver(limit=15):
-    """네이버 금융 '주요뉴스' 목록에서 헤드라인/링크/언론사를 가져온다.
-    AI 요약이 재료로 쓸 헤드라인 텍스트만 필요하므로 본문은 긁지 않는다
-    (저작권/부하 둘 다 고려해 목록 페이지만 사용).
+    """국내 '주요뉴스' 헤드라인/링크/언론사를 가져온다. AI 요약이 재료로 쓸
+    헤드라인 텍스트만 필요하므로 본문은 긁지 않는다(저작권/부하 둘 다 고려).
 
-    ── [Npay 증권 개편 대응] ──────────────────────────────────────────
-    기존에는 articleSubject/articleSummary/press/wdate 라는 고정 클래스명에
-    의존해 정규식으로 긁었는데, 네이버가 브랜드를 'Npay 증권'으로 바꾸면서
-    (종목명 title 순서가 바뀐 것과 같은 개편) 목록 페이지의 마크업도 함께
-    바뀌었을 가능성이 있고, 그러면 이 클래스명 매칭이 통째로 실패해 빈
-    리스트를 반환 → 화면의 '국내 주요 뉴스'와 그걸 재료로 쓰는 'AI 핫 토픽
-    요약'이 동시에 죽는다. 그래서 1차(구 클래스명) 실패 시, 뉴스 상세
-    링크 패턴(news_read.naver)만 보고 훨씬 느슨하게 제목을 긁어오는 2차
-    방식으로 재시도한다. 또한 실패 원인(상태코드/응답 길이/방식)을
-    _DEBUG_STORE에 남겨, 실제로 어느 단계에서 막히는지 바로 확인할 수 있게 한다."""
+    ── [2026-09 Npay 증권 개편 대응] ──────────────────────────────────
+    기존에는 finance.naver.com/news/mainnews.naver 페이지를 articleSubject/
+    articleSummary/press/wdate 같은 고정 클래스명으로 정규식 스크래핑했는데,
+    네이버가 증권 서비스를 stock.naver.com(Npay 증권)으로 옮기면서 그
+    페이지/마크업이 사라져 스크래핑이 통째로 실패(빈 리스트)하는 문제가
+    있었다. 브라우저 개발자도구로 실제 새 서비스가 쓰는 내부 API를 확인한
+    결과 아래 형태였다:
+        GET https://stock.naver.com/api/domestic/news/list
+            ?category=MAINNEWS&page=1&pageSize=N&date=YYYYMMDD
+            &enableFallback=true&maxDays=3
+        → {"articles": [{"officeId":"015","officeHname":"한국경제",
+                          "articleId":"0005331954","title":"...",
+                          "datetime":"2026-09-14 10:52:17", ...}, ...],
+           "date": "20260914"}
+    HTML 스크래핑보다 훨씬 안정적인 JSON API이므로 이걸 1차로 쓰고,
+    혹시 이 API도 나중에 막히거나 형식이 또 바뀌는 경우에 대비해 예전
+    finance.naver.com 스크래핑 방식(구 클래스명 → news_read.naver 느슨한
+    매칭 순)을 최종 폴백으로 남겨둔다. 실패 원인(상태코드/응답 길이/
+    성공한 방식)은 _DEBUG_STORE에 남겨 진단할 수 있게 한다."""
     debug = {"status": None, "resp_len": None, "method": None, "exception": None}
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    url = "https://finance.naver.com/news/mainnews.naver"
-    try:
-        res = requests.get(url, headers=headers, timeout=8)
-        debug["status"] = res.status_code
-        res.encoding = 'euc-kr'  # 네이버금융은 euc-kr 고정 (apparent_encoding 추측 금지 — 파일 상단 규칙 참고)
-        text = res.text
-        debug["resp_len"] = len(text)
-    except Exception as e:
-        debug["exception"] = f"{type(e).__name__}: {e}"
-        _DEBUG_STORE["_market_news_debug"] = debug
-        return []
+    ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 
     items = []
+    # ── 1차: stock.naver.com 신규 JSON API ──────────────────────────
     try:
-        # 1차: 기존(구) 마크업 — <dd class="articleSubject"><a href=...>제목</a></dd>,
-        # <dd class="articleSummary">...<span class="press">언론사</span>...<span class="wdate">시간</span></dd>
+        try:
+            from zoneinfo import ZoneInfo
+            now_kst = datetime.datetime.now(ZoneInfo("Asia/Seoul"))
+        except Exception:
+            now_kst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+        today_str = now_kst.strftime("%Y%m%d")
+
+        api_url = (
+            "https://stock.naver.com/api/domestic/news/list"
+            f"?category=MAINNEWS&page=1&pageSize={max(limit, 6)}"
+            f"&date={today_str}&enableFallback=true&maxDays=3"
+        )
+        api_headers = {
+            'User-Agent': ua,
+            'Referer': 'https://stock.naver.com/news',
+            'Accept': 'application/json, text/plain, */*',
+        }
+        res = requests.get(api_url, headers=api_headers, timeout=8)
+        debug["status"] = res.status_code
+        debug["resp_len"] = len(res.text)
+        data = res.json()
+        articles = data.get("articles", []) if isinstance(data, dict) else []
+        for a in articles[:limit]:
+            title = html_lib.unescape(str(a.get("title", "")).strip())
+            if not title:
+                continue
+            office_id = str(a.get("officeId", "")).strip()
+            article_id = str(a.get("articleId", "")).strip()
+            link = f"https://n.news.naver.com/article/{office_id}/{article_id}" if office_id and article_id else ""
+            dt_raw = str(a.get("datetime", "")).strip()
+            time_only = dt_raw.split(" ")[-1][:5] if dt_raw else ""  # "HH:MM"만 표시
+            items.append({
+                "title": title,
+                "link": link,
+                "press": str(a.get("officeHname", "")).strip(),
+                "time": time_only,
+            })
+        if items:
+            debug["method"] = "stock_naver_json_api"
+    except Exception as e:
+        debug["exception"] = f"{type(e).__name__}: {e}"
+
+    if items:
+        debug["items_found"] = len(items)
+        _DEBUG_STORE["_market_news_debug"] = debug
+        return items
+
+    # ── 2차 폴백: 예전 finance.naver.com 스크래핑 (신규 API마저 실패할 때 대비) ──
+    try:
+        legacy_url = "https://finance.naver.com/news/mainnews.naver"
+        res2 = requests.get(legacy_url, headers={'User-Agent': ua}, timeout=8)
+        res2.encoding = 'euc-kr'  # 네이버금융은 euc-kr 고정 (apparent_encoding 추측 금지 — 파일 상단 규칙 참고)
+        text = res2.text
+
+        # 2-1) 구 클래스명 매칭
         blocks = re.findall(
             r'articleSubject.*?href="([^"]+)"[^>]*>\s*(?:<[^>]+>)*\s*([^<]+?)\s*</a>.*?'
             r'class="press">([^<]*)</span>.*?class="wdate">([^<]*)</span>',
@@ -958,22 +1009,14 @@ def fetch_market_news_naver(limit=15):
                 continue
             link = href if href.startswith("http") else f"https://finance.naver.com{href}"
             items.append({
-                "title": title,
-                "link": link,
-                "press": press.strip(),
-                "time": wdate.strip(),
+                "title": title, "link": link,
+                "press": press.strip(), "time": wdate.strip(),
             })
         if items:
             debug["method"] = "legacy_class_match"
-    except Exception:
-        items = []
 
-    if not items:
-        # 2차 폴백: 클래스명이 또 바뀌어도 잘 안 깨지도록, 뉴스 상세 페이지로
-        # 연결되는 링크(news_read.naver)를 가진 <a> 태그만 훑어서 제목/링크만
-        # 확보한다. 언론사·시간은 이 방식에서는 안정적으로 못 뽑으므로 빈 값으로 둔다
-        # (AI 요약 재료로는 제목 텍스트만 있어도 충분).
-        try:
+        if not items:
+            # 2-2) news_read.naver 링크만 보고 느슨하게 제목 긁기 (최후 폴백)
             loose_blocks = re.findall(
                 r'<a[^>]+href="([^"]*news_read\.naver[^"]*)"[^>]*>\s*(?:<[^>]+>)*\s*([^<]{4,120}?)\s*</a>',
                 text, flags=re.S
@@ -989,8 +1032,9 @@ def fetch_market_news_naver(limit=15):
                 if len(items) >= limit:
                     break
             if items:
-                debug["method"] = "loose_news_read_link"
-        except Exception as e:
+                debug["method"] = "legacy_loose_fallback"
+    except Exception as e:
+        if not debug.get("exception"):
             debug["exception"] = f"{type(e).__name__}: {e}"
 
     debug["items_found"] = len(items)
