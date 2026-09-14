@@ -863,7 +863,10 @@ def fetch_market_index_table():
 
             return key, {
                 "name": meta["name"], "subtitle": meta["subtitle"],
-                "value": f"{price:,.2f}",
+                # [2026-09-14 수정] 코스피/코스닥 지수값은 소수점 둘째자리(예: 2,655.28)까지
+                # 표시했으나, 대시보드 카드에서는 가독성이 더 중요하다고 판단해 정수로
+                # 반올림한다. 등락폭/등락률은 정밀도가 의미 있는 정보라 그대로 유지.
+                "value": f"{price:,.0f}",
                 "change": f"{sign}{diff:,.2f}",
                 "change_pct": f"{sign}{diff_pct:.2f}%",
                 "status": "up" if diff > 0 else ("down" if diff < 0 else "neutral"),
@@ -885,7 +888,14 @@ def fetch_market_index_table():
             diff = price - prev
             diff_pct = diff / prev * 100 if prev else 0
             sign = "+" if diff >= 0 else ""
-            fmt = f"{price:,.1f}" if key == "usdkrw" else f"{price:,.2f}"
+            # [2026-09-14 수정] 나스닥은 지수라 정수로, 환율은 소수점 첫째자리,
+            # 금/WTI 같은 가격성 지표는 소수점 둘째자리를 그대로 유지한다.
+            if key == "usdkrw":
+                fmt = f"{price:,.1f}"
+            elif key == "nasdaq":
+                fmt = f"{price:,.0f}"
+            else:
+                fmt = f"{price:,.2f}"
             return key, {
                 "name": meta["name"], "subtitle": meta["subtitle"],
                 "value": fmt,
@@ -1121,7 +1131,16 @@ def fetch_global_market_pulse():
             if key == "ust10y":
                 price /= 10
                 diff /= 10
-            fmt = f"{price:,.1f}" if key in ("usdkrw",) else (f"{price:,.2f}%" if key == "ust10y" else f"{price:,.2f}")
+            # [2026-09-14 수정] S&P500/다우/나스닥은 지수라 정수로 반올림하고,
+            # 환율·금리·유가처럼 소수점이 의미 있는 값은 기존 포맷을 유지한다.
+            if key == "usdkrw":
+                fmt = f"{price:,.1f}"
+            elif key == "ust10y":
+                fmt = f"{price:,.2f}%"
+            elif key in ("sp500", "dow", "nasdaq"):
+                fmt = f"{price:,.0f}"
+            else:
+                fmt = f"{price:,.2f}"
             return key, {
                 "name": meta["name"], "subtitle": meta["subtitle"],
                 "value": fmt,
@@ -2008,39 +2027,15 @@ def fetch_company_info_fnguide(code):
         html = _decode_naver_html(res, fallback_encoding='euc-kr')
         name_debug["resp_len"] = len(html)
 
-        # 종목명 추출: 2026-09 Npay 증권 개편 이후 finance.naver.com/item/main.naver
-        # 페이지의 <title>이 "Npay 증권" 하나뿐인 껍데기 페이지로 바뀌어(구분자·
-        # 종목명 없음) title 기반 추출이 통째로 실패하는 사례가 있었다. 브라우저
-        # 개발자도구로 실제 Npay 증권 종목 상세 페이지가 쓰는 내부 API를 확인한 결과:
-        #   GET https://polling.finance.naver.com/api/realtime/domestic/v2/stock?itemCodes={code}
-        #   → {"datas":[{"itemCode":"112610","itemName":"씨에스윈드", ...}], ...}
-        # 이 API가 종목명을 JSON으로 직접 내려주므로 HTML/title 파싱보다 훨씬
-        # 안정적이라 1순위로 쓰고, 실패 시에만 기존 title/DOM 기반 추출로 폴백한다.
-        extracted_name = None
-        try:
-            rt_url = f"https://polling.finance.naver.com/api/realtime/domestic/v2/stock?itemCodes={code}"
-            rt_headers = {**naver_headers, 'Referer': 'https://stock.naver.com/', 'Accept': 'application/json, text/plain, */*'}
-            rt_res = requests.get(rt_url, headers=rt_headers, timeout=6)
-            rt_data = rt_res.json()
-            rt_datas = rt_data.get("datas") or []
-            if rt_datas:
-                rt_name = str(rt_datas[0].get("itemName", "")).strip()
-                if rt_name:
-                    extracted_name = rt_name
-            name_debug["polling_api_status"] = rt_res.status_code
-        except Exception as e:
-            name_debug["polling_api_exception"] = f"{type(e).__name__}: {e}"
-
+        # 종목명 추출: title 태그의 "종목명 / 사이트명" 순서가 페이지마다 뒤바뀔 수 있어
+        # (예: 'Npay 증권' 브랜드 개편 이후 일부 페이지는 사이트명이 앞에 옴),
+        # _extract_stock_name_from_naver_html()이 DOM 우선 + 사이트명 키워드 필터링으로
+        # 순서에 관계없이 실제 종목명만 뽑아내도록 처리한다.
         title_match = re.search(r'<title>(.*?)</title>', html, re.DOTALL)
         if title_match:
             name_debug["title_match"] = True
             name_debug["title_raw"] = title_match.group(1)[:100]
-        if not extracted_name:
-            # 폴백: title 태그의 "종목명 / 사이트명" 순서가 페이지마다 뒤바뀔 수 있어
-            # (예: 'Npay 증권' 브랜드 개편 이후 일부 페이지는 사이트명이 앞에 옴),
-            # _extract_stock_name_from_naver_html()이 DOM 우선 + 사이트명 키워드 필터링으로
-            # 순서에 관계없이 실제 종목명만 뽑아내도록 처리한다.
-            extracted_name = _extract_stock_name_from_naver_html(html)
+        extracted_name = _extract_stock_name_from_naver_html(html)
         if extracted_name:
             data["name"] = extracted_name
 
