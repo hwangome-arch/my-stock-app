@@ -3190,318 +3190,166 @@ def _extract_screener_current_page(res_text):
             return None
     return None
 
-def fetch_page_data(sosok, page, headers, cookies):
-    time.sleep(random.uniform(0.1, 0.3))
-    url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
+# ── [2026-09-14 전면 교체] finance.naver.com HTML 스크래핑 → stock.naver.com JSON API ──
+# 네이버 금융이 시가총액 페이지(finance.naver.com/sise/sise_market_sum.naver)를
+# Next.js SPA로 리뉴얼하면서, 서버가 내려주는 최초 HTML에는 종목 테이블이 아예
+# 없어졌다(자바스크립트가 별도 API를 호출해서 화면을 채우는 방식으로 바뀜).
+# 그 결과 예전 파서(class="tltle" 링크 + pd.read_html)는 항상 빈 껍데기 HTML만
+# 받아서 100% 파싱 실패했다 — 페이지 번호와 무관하게 응답 길이가 완전히 동일했던
+# 것(121259바이트)이 그 증거. 실제로 브라우저 개발자 도구 Network 탭에서 그
+# 자바스크립트가 호출하는 진짜 데이터 API를 확인해 아래로 교체한다.
+#
+# 새 API: https://stock.naver.com/api/domestic/market/stock/default
+#         ?tradeType=KRX&marketType=ALL&orderType=marketSum&startIdx={n}&pageSize={size}
+# - tradeType=KRX, marketType=ALL 조합으로 코스피/코스닥이 시가총액 순으로 한 번에
+#   섞여서 나온다. 예전처럼 sosok(0/1)별로 따로따로 44페이지씩 순회할 필요가 없어졌다.
+# - 응답은 종목 배열(JSON list)이고, 항목마다 sosok(0=코스피/1=코스닥), itemcode,
+#   itemname, nowPrice, per, pbr, roe, roa, dividendRate(이미 배당수익률로 계산된 값),
+#   propertyTotal(자산총계), debtTotal(부채총계), week52HighPrice 등 필요한 값이
+#   이미 다 들어있어서, 예전처럼 별도 재무제표 페이지를 또 스크래핑할 필요가 없다.
+# - startIdx를 pageSize(100)씩 늘려가며 반환 개수가 pageSize보다 작아질 때(=마지막
+#   페이지)까지 순차 요청한다. 전체 종목 수를 미리 알 방법이 없어서(응답에 총
+#   개수 필드가 없음) "받은 개수 < 요청한 개수"를 종료 조건으로 쓴다.
+_STOCK_API_PAGE_SIZE = 100
+_STOCK_API_MAX_PAGES = 60  # 안전장치: 60 * 100 = 6000종목까지 커버(KRX 전체 상장 종목 수보다 넉넉히 큼). API가 오작동해도 무한루프 방지.
+
+def _fetch_stock_default_page(headers, start_idx, page_size=_STOCK_API_PAGE_SIZE):
+    """stock.naver.com의 종목 목록 JSON API에서 한 페이지(items)를 가져온다.
+    실패 시 None을 반환하고 _DEBUG_STORE에 원인을 남긴다(기존 진단 패턴과 동일)."""
+    url = (
+        "https://stock.naver.com/api/domestic/market/stock/default"
+        f"?tradeType=KRX&marketType=ALL&orderType=marketSum&startIdx={start_idx}&pageSize={page_size}"
+    )
     try:
-        res = requests.get(url, headers=headers, cookies=cookies, timeout=10)
-        res.encoding = 'euc-kr'  # 네이버금융(finance.naver.com)은 euc-kr 고정 — apparent_encoding 추측에 의존하면 특정 종목명 바이트 패턴에서 오탐(예: 키릴 계열로 오판)해 파싱이 깨진다
-
-        # ── [진단] 상태코드가 200이 아닌 경우 원인 기록 ──────────────────────
-        # 기존에는 status_code를 전혀 확인하지 않아서, 네이버가 429/403/503 등을
-        # 줘도 그냥 파싱 실패로 뭉개져서 "왜 실패했는지"를 알 수 없었다.
+        res = requests.get(url, headers=headers, timeout=10)
         if res.status_code != 200:
-            fails = _DEBUG_STORE.setdefault("_screener_fetch_failures", [])
-            fails.append({
-                "요청": (sosok, page), "원인": f"HTTP {res.status_code}",
+            _DEBUG_STORE.setdefault("_screener_fetch_failures", []).append({
+                "요청": ("stock_api", start_idx), "원인": f"HTTP {res.status_code}",
                 "시각": datetime.datetime.now().strftime("%H:%M:%S"),
             })
-
-        # ── [진단] "실패"로는 안 잡히지만 요청한 페이지와 다른 내용이 온 경우 로그 ──
-        # 레이트리밋/캐시 등으로 엉뚱한 페이지 내용이 200 OK로 오면 기존 로직은 이걸
-        # 그냥 "성공"으로 처리해서 조용히 병합해버린다. 아직 이 불일치를 페이지 실패로
-        # 처리하지는 않는다(마크업 추정에 대한 확신이 100%가 아니라, 이 체크 때문에
-        # 정상 페이지까지 실패 처리되는 부작용을 피하려는 것). 우선 얼마나 자주
-        # 발생하는지 _DEBUG_STORE에 쌓아서 다음 스캔에서 확인한다.
-        returned_page = _extract_screener_current_page(res.text)
-        if returned_page is not None and returned_page != page:
-            mismatches = _DEBUG_STORE.setdefault("_screener_page_mismatches", [])
-            mismatches.append({
-                "요청": (sosok, page),
-                "실제응답페이지": returned_page,
+            return None
+        data = res.json()
+        if not isinstance(data, list):
+            _DEBUG_STORE.setdefault("_screener_fetch_failures", []).append({
+                "요청": ("stock_api", start_idx), "원인": f"예상치 못한 응답 형식: {type(data).__name__}",
+                "응답_일부": str(data)[:300],
                 "시각": datetime.datetime.now().strftime("%H:%M:%S"),
             })
-            # 요청한 페이지가 실제보다 커서(존재하지 않는 페이지) 마지막 페이지로
-            # 클램프되어 온 경우 → 진짜 실패가 아니라 "범위 초과"이므로 별도 표시.
-            # (사전 감지가 어떤 이유로든 빗나갔을 때를 대비한 이중 안전장치)
-            if returned_page < page:
-                _DEBUG_STORE.setdefault("_screener_overflow_pages", set()).add((sosok, page))
-
-        parsed = _parse_screener_page_html(res.text, sosok)
-        if parsed is None:
-            fails = _DEBUG_STORE.setdefault("_screener_fetch_failures", [])
-            # ── [진단] 왜 파싱이 실패했는지 원인을 눈으로 볼 수 있게 스냅샷 저장 ──
-            # HTTP 200인데도 파싱이 실패하는 건 네트워크 문제가 아니라 정규식/파싱
-            # 로직이 실제 HTML 구조와 안 맞는 경우일 가능성이 높다. 얼마나 안 맞는지
-            # 판단할 수 있도록 최소한의 단서를 남긴다: 페이지 길이, 핵심 키워드 존재
-            # 여부, class="tltle" 요구 없이 느슨하게 찾은 종목코드 개수, 실제 HTML
-            # 일부 발췌.
-            loose_codes = re.findall(r'href="/item/main\.naver\?code=(\d+)"', res.text)
-            snippet_idx = res.text.find('종목명')
-            if snippet_idx == -1:
-                snippet_idx = res.text.find('<table')
-            snippet = res.text[max(0, snippet_idx - 100): snippet_idx + 500] if snippet_idx != -1 else res.text[:500]
-            fails.append({
-                "요청": (sosok, page),
-                "원인": f"HTTP {res.status_code}, 종목테이블 파싱 실패",
-                "응답길이": len(res.text),
-                "'종목명'문자열있음": '종목명' in res.text,
-                "'tltle'문자열있음": 'tltle' in res.text,
-                "느슨한매칭_종목코드개수": len(loose_codes),
-                "html_snippet": snippet,
-                "시각": datetime.datetime.now().strftime("%H:%M:%S"),
-            })
-        return parsed
+            return None
+        return data
     except requests.exceptions.Timeout:
         _DEBUG_STORE.setdefault("_screener_fetch_failures", []).append({
-            "요청": (sosok, page), "원인": "타임아웃(10초)", "시각": datetime.datetime.now().strftime("%H:%M:%S"),
+            "요청": ("stock_api", start_idx), "원인": "타임아웃(10초)",
+            "시각": datetime.datetime.now().strftime("%H:%M:%S"),
         })
         return None
     except Exception as e:
         _DEBUG_STORE.setdefault("_screener_fetch_failures", []).append({
-            "요청": (sosok, page), "원인": f"예외: {type(e).__name__}", "시각": datetime.datetime.now().strftime("%H:%M:%S"),
+            "요청": ("stock_api", start_idx), "원인": f"예외: {type(e).__name__}: {e}",
+            "시각": datetime.datetime.now().strftime("%H:%M:%S"),
         })
         return None
 
-def _detect_screener_last_page_by_probe(headers, cookies, sosok, default_last=44):
-    """실제 마지막 페이지를 확실하게 찾기 위해, 절대 존재하지 않을 만큼 큰 페이지
-    번호(999)를 일부러 요청한다. 네이버는 이런 초과 요청에도 에러를 내지 않고
-    실제 마지막 페이지로 클램프해서 응답하며, 페이지네이터의 활성 페이지(class="on")
-    표시도 그 진짜 마지막 페이지 번호를 그대로 보여준다 — 이건 실제 진단 로그로
-    확인된 동작이다(코스닥 38~44 요청 → 매번 '실제응답페이지: 37'로 관측됨).
-    이전에 시도했던 '맨뒤(pgRR)' 링크 파싱은 마크업 추정이 틀려 항상 실패했었다."""
-    try:
-        res = requests.get(
-            f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page=999",
-            headers=headers, cookies=cookies, timeout=10
-        )
-        res.encoding = 'euc-kr'  # 네이버금융(finance.naver.com)은 euc-kr 고정 — apparent_encoding 추측에 의존하면 특정 종목명 바이트 패턴에서 오탐(예: 키릴 계열로 오판)해 파싱이 깨진다
-        detected = _extract_screener_current_page(res.text)
-        return detected if detected else default_last
-    except Exception:
-        return default_last
-
 def fetch_screener_data_generator():
-    session = requests.Session()
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://finance.naver.com/sise/sise_market_sum.naver",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+        "Referer": "https://stock.naver.com/market/stock/kr/stocklist/capitalization",
+        "Accept": "*/*",
     }
-    yield "보안 세션 접속 및 쿠키 발급 중...", 5
-    
-    try:
-        session.get("https://finance.naver.com/sise/sise_market_sum.naver", headers=headers, timeout=10)
-    except Exception:
-        pass  # 세션 워밍업 실패해도 쿠키 없이 계속 진행 (뒤에서 페이지별로 재시도됨)
-    time.sleep(0.15)
+    yield "보안 세션 접속 중...", 5
 
-    field_url = "https://finance.naver.com/sise/field_submit.naver?menu=market_sum&returnUrl=https%3A%2F%2Ffinance.naver.com%2Fsise%2Fsise_market_sum.naver&fieldIds=per&fieldIds=pbr&fieldIds=roe&fieldIds=dividend&fieldIds=property_total&fieldIds=debt_total&fieldIds=high52"
-    try:
-        session.get(field_url, headers=headers, timeout=10)
-    except Exception:
-        pass
-    cookies = session.cookies.get_dict()
-
-    # ── 실제 마지막 페이지 자동 감지 (하드코딩 44 제거) ──────────────────────
-    # 문제: range(1, 45)로 코스피/코스닥 둘 다 무조건 44페이지까지 요청했는데,
-    # 코스닥은 상장 종목 수가 더 적어서 실제 마지막 페이지가 44보다 작다(진단 결과: 37).
-    # 존재하지 않는 페이지를 요청하면 네이버가 200 OK를 주지만 종목 테이블은 비어 있어
-    # 매 스캔마다 3라운드 재시도를 다 태우고도 결국 "실패 페이지"로 잡혔다.
-    # _detect_screener_last_page_by_probe로 실제 마지막 페이지를 구하고, 그 이후
-    # 페이지는 애초에 요청 목록에서 제외한다. 1페이지 응답은 그대로 결과에 재사용.
-    _DEBUG_STORE["_screener_page_mismatches"] = []
-    _DEBUG_STORE["_screener_overflow_pages"] = set()
     _DEBUG_STORE["_screener_fetch_failures"] = []
+    _DEBUG_STORE["_screener_page_mismatches"] = []  # [호환용] 신규 API에는 해당 없음 — 항상 빈 리스트
+    _DEBUG_STORE["_screener_overflow_pages"] = set()  # [호환용] 신규 API에는 해당 없음
 
-    all_data = []
-    last_page_by_sosok = {}
-    for sosok in [0, 1]:
-        try:
-            res0 = requests.get(
-                f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page=1",
-                headers=headers, cookies=cookies, timeout=10
-            )
-            res0.encoding = 'euc-kr'  # 네이버금융 euc-kr 고정
-            df0 = _parse_screener_page_html(res0.text, sosok)
-            if df0 is not None and not df0.empty:
-                all_data.append(df0)
-        except Exception:
-            pass
-        last_page_by_sosok[sosok] = _detect_screener_last_page_by_probe(headers, cookies, sosok, default_last=44)
-        _DEBUG_STORE[f"_screener_last_page_sosok{sosok}"] = last_page_by_sosok[sosok]
+    all_items = []
+    failed_start_idxs = []
+    start_idx = 0
+    page_num = 0
+    consecutive_failures = 0
 
-    # 코스피를 전부 먼저, 코스닥을 나중에 순서대로 나열하면(기존 방식) 같은 세션
-    # 쿠키로 나가는 요청 중 코스닥 쪽이 항상 시간상 뒤에 실행되어, 네이버가 세션
-    # 단위로 누적 요청 수를 추적해 레이트리밋을 건다면 코스닥에만 실패가 몰릴 수
-    # 있다(실제로 관측된 패턴과 일치). 두 시장 페이지를 번갈아 섞어서 제출 순서상
-    # 어느 한쪽에만 부하가 쏠리지 않게 한다.
-    _urls_0 = [(0, page) for page in range(2, last_page_by_sosok[0] + 1)]
-    _urls_1 = [(1, page) for page in range(2, last_page_by_sosok[1] + 1)]
-    urls = [u for pair in zip_longest(_urls_0, _urls_1) for u in pair if u is not None]
-    total_pages = len(urls) + 2  # 이미 처리한 1페이지 2건 포함
-    completed = 2  # 위에서 이미 처리한 1페이지 2건
-    failed_pages = []
+    while page_num < _STOCK_API_MAX_PAGES:
+        page_num += 1
+        progress_pct = 10 + int(min(page_num / 30, 1.0) * 70)  # 정확한 총 페이지 수를 몰라서 30페이지 기준으로 대략 표시
+        yield f"⚡ 종목 목록 수집 중... ({len(all_items)}개 종목 확보, {page_num}번째 요청)", progress_pct
 
-    _executor = get_shared_executor()
-    processed = set()
-    future_to_url = {_executor.submit(fetch_page_data, s, p, headers, cookies): (s, p) for s, p in urls}
-    try:
-        for future in concurrent.futures.as_completed(future_to_url, timeout=35):
-            completed += 1
-            progress_pct = 10 + int((completed / total_pages) * 70)
-            yield f"⚡ 스텔스 모드 스캔 중... ({completed}/{total_pages} 페이지)", progress_pct
-            s, p = future_to_url[future]
-            processed.add((s, p))
-            try:
-                df = future.result(timeout=10)
-            except Exception:
-                df = None
-            if df is not None and not df.empty:
-                all_data.append(df)
-            else:
-                failed_pages.append((s, p))
-    except concurrent.futures.TimeoutError:
-        # 전체 상한(35초) 초과 → 아직 결과가 안 온 나머지 페이지는 실패로 간주하고 재시도 라운드로 넘김
-        for s, p in urls:
-            if (s, p) not in processed:
-                failed_pages.append((s, p))
-    finally:
-        for f in future_to_url:
-            f.cancel()
+        items = _fetch_stock_default_page(headers, start_idx, _STOCK_API_PAGE_SIZE)
+        if items is None:
+            failed_start_idxs.append(start_idx)
+            consecutive_failures += 1
+            if consecutive_failures >= 3:
+                # 같은 지점에서 3연속 실패 → 재시도해도 가망 없다고 보고 중단
+                break
+            time.sleep(1.5)
+            continue
 
-    # ── 실패한 페이지 재시도 (네이버 측 레이트리밋으로 뒷부분 페이지들이 몰려서 실패하는 경우 대응) ──
-    # 동시 요청 수를 점점 줄이고, 대기 시간을 늘려가며 최대 3라운드까지 재시도한다.
-    retry_round = 0
-    backoff_seconds = [2, 5, 10]
-    retry_workers = [2, 1, 1]
-    while failed_pages and retry_round < 3:
-        yield f"⚠️ {len(failed_pages)}개 페이지 재시도 중... ({retry_round + 1}/3 라운드, {backoff_seconds[retry_round]}초 대기)", 82 + retry_round * 3
-        time.sleep(backoff_seconds[retry_round])
-        still_failed = []
-        _retry_executor = get_shared_executor()
-        # ⚠️ [버그 수정 2026-08-18] retry_workers([2,1,1])를 선언만 해두고 실제로는
-        # 안 써서, 재시도 라운드마다 failed_pages 전체를 한꺼번에 다시 던졌었다.
-        # 그러면 "네이버 레이트리밋 때문에 실패한 페이지들"을 재시도할 때 똑같이
-        # 동시에 몰아서 요청하게 되어, 레이트리밋을 다시 유발해 재시도가 재시도를
-        # 반복해서 부르는 상황이 나올 수 있었다. 라운드마다 retry_workers[round]개씩
-        # 청크로 나눠서 순차적으로 처리(청크 안에서만 동시 실행)하도록 고쳤다 —
-        # 라운드가 진행될수록(2→1→1) 동시 요청 수가 점점 줄어드는 게 원래 의도였다.
-        _chunk_size = retry_workers[retry_round]
-        _failed_list = list(failed_pages)
-        for _i in range(0, len(_failed_list), _chunk_size):
-            _chunk = _failed_list[_i:_i + _chunk_size]
-            _retry_processed = set()
-            future_to_url = {_retry_executor.submit(fetch_page_data, s, p, headers, cookies): (s, p) for s, p in _chunk}
-            try:
-                for future in concurrent.futures.as_completed(future_to_url, timeout=18):
-                    s, p = future_to_url[future]
-                    _retry_processed.add((s, p))
-                    try:
-                        df = future.result(timeout=8)
-                    except Exception:
-                        df = None
-                    if df is not None and not df.empty:
-                        all_data.append(df)
-                    else:
-                        still_failed.append((s, p))
-            except concurrent.futures.TimeoutError:
-                for s, p in _chunk:
-                    if (s, p) not in _retry_processed:
-                        still_failed.append((s, p))
-            finally:
-                for f in future_to_url:
-                    f.cancel()
-        failed_pages = still_failed
-        retry_round += 1
+        consecutive_failures = 0
+        if not items:
+            break  # 빈 배열 = 더 이상 종목 없음(정상 종료)
 
-    # 범위 초과(존재하지 않는 페이지라 마지막 페이지로 클램프된 경우)로 확인된 건
-    # 진짜 실패가 아니므로 사용자 경고 대상에서 제외한다.
-    _overflow = _DEBUG_STORE.get("_screener_overflow_pages", set())
-    failed_pages = [p for p in failed_pages if p not in _overflow]
+        all_items.extend(items)
+        if len(items) < _STOCK_API_PAGE_SIZE:
+            break  # 요청한 개수보다 적게 옴 = 마지막 페이지
 
-    # ── [세션 프리징 버그 수정] session_state 대신 _DEBUG_STORE에 기록 ──────────
-    # 이 제너레이터는 _unified_scan_worker(오케스트레이션 백그라운드 스레드)에서
-    # 직접 호출된다. 파일 상단에 이미 문서화된 규칙(백그라운드 스레드에서 session_state를
-    # 직접 건드리면 메인 스크립트 실행 스레드가 영원히 멈출 수 있다)을 그대로 어기고
-    # 있던 부분 — 같은 함수의 page_mismatches/fetch_failures는 이미 _DEBUG_STORE를
-    # 쓰고 있었는데 missing_pages만 예외로 session_state를 직접 썼다. 이 불일치가
-    # "새로고침도 재시도도 안 통하고 오직 앱 리붓만 통하는" 세션 프리징의 유력한
-    # 원인이었을 가능성이 높다. 화면 표시는 메인 스레드(run_unified_market_scan_async)가
-    # 완료 시점에 이 값을 읽어서 처리한다.
-    if failed_pages:
-        _DEBUG_STORE["_screener_missing_pages"] = failed_pages
-    else:
-        _DEBUG_STORE["_screener_missing_pages"] = []
+        start_idx += _STOCK_API_PAGE_SIZE
+        time.sleep(0.1)  # 과도한 연속 요청으로 인한 레이트리밋 방지용 짧은 텀
 
-    if not all_data: raise Exception("네이버 금융 데이터를 불러오지 못했습니다. (서버 응답 지연)")
-    yield "데이터 병합 및 재무 지표 자체 계산 중...", 95
-    final_df = pd.concat(all_data, ignore_index=True)
-    
-    def get_col(df, candidates):
-        for c in candidates:
-            if c in df.columns: return c
-        for c in df.columns:
-            for cand in candidates:
-                if cand.lower() in c.lower(): return c
-        return None
-        
-    price_c  = get_col(final_df, ['현재가'])
-    div_c    = get_col(final_df, ['주당배당금', '배당금'])
-    per_c    = get_col(final_df, ['PER', 'PER(배)'])
-    pbr_c    = get_col(final_df, ['PBR', 'PBR(배)'])
-    roe_c    = get_col(final_df, ['ROE', 'ROE(%)'])
-    prop_c   = get_col(final_df, ['자산총계'])
-    debt_c   = get_col(final_df, ['부채총계'])
-    mkt_c    = get_col(final_df, ['시장'])
-    high52_c = get_col(final_df, ['52주최고', '최고가', 'high52', '52주 최고'])
-    
-    final_df['현재가'] = pd.to_numeric(final_df[price_c].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0) if price_c else 0.0
-    final_df['주당배당금'] = pd.to_numeric(final_df[div_c].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0) if div_c else 0.0
-    final_df['자산총계'] = pd.to_numeric(final_df[prop_c].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0) if prop_c else 0.0
-    final_df['부채비율'] = 0.0
-    final_df['부채총계'] = pd.to_numeric(final_df[debt_c].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0) if debt_c else 0.0
-    
-    final_df['배당수익률'] = 0.0
-    mask_div = (final_df['현재가'] > 0) & (final_df['주당배당금'] > 0)
-    final_df.loc[mask_div, '배당수익률'] = (final_df.loc[mask_div, '주당배당금'] / final_df.loc[mask_div, '현재가']) * 100
-    
+    _DEBUG_STORE["_screener_missing_pages"] = failed_start_idxs
+
+    if not all_items:
+        raise Exception("네이버 종목 데이터를 불러오지 못했습니다. (API 응답 없음 — stock.naver.com API 구조가 다시 바뀌었을 수 있습니다)")
+
+    yield "데이터 병합 및 재무 지표 계산 중...", 95
+
+    final_df = pd.DataFrame(all_items)
+
+    def _to_num(series):
+        return pd.to_numeric(series.astype(str).str.replace(',', ''), errors='coerce')
+
+    final_df['종목코드'] = final_df.get('itemcode', pd.Series(dtype=str)).astype(str).str.zfill(6)
+    final_df['종목명'] = final_df.get('itemname', pd.Series(dtype=str))
+    final_df['시장'] = final_df.get('sosok', pd.Series(dtype=str)).astype(str).map(
+        {"0": "코스피", "1": "코스닥"}
+    ).fillna("코스피")
+
+    final_df['현재가'] = _to_num(final_df.get('nowPrice', pd.Series(dtype=str))).fillna(0.0)
+    final_df['PER'] = _to_num(final_df.get('per', pd.Series(dtype=str))).fillna(0.0)
+    final_df['PBR'] = _to_num(final_df.get('pbr', pd.Series(dtype=str))).fillna(0.0)
+    final_df['ROE'] = _to_num(final_df.get('roe', pd.Series(dtype=str))).fillna(0.0)
+    # dividendRate는 API가 이미 (주당배당금 / 현재가 * 100)으로 계산해서 주는
+    # 값이라(실측: 삼성전자 dividendRate 0.664 == dividend 1668 / nowPrice 251250 * 100),
+    # 예전처럼 주당배당금·현재가로 직접 계산할 필요 없이 그대로 쓰면 된다.
+    final_df['배당수익률'] = _to_num(final_df.get('dividendRate', pd.Series(dtype=str))).fillna(0.0)
+
+    final_df['자산총계'] = _to_num(final_df.get('propertyTotal', pd.Series(dtype=str))).fillna(0.0)
+    final_df['부채총계'] = _to_num(final_df.get('debtTotal', pd.Series(dtype=str))).fillna(0.0)
     final_df['자본총계'] = final_df['자산총계'] - final_df['부채총계']
+    final_df['부채비율'] = 0.0
     mask_debt = (final_df['자본총계'] > 0) & (final_df['부채총계'] >= 0)
     final_df.loc[mask_debt, '부채비율'] = (final_df.loc[mask_debt, '부채총계'] / final_df.loc[mask_debt, '자본총계']) * 100
-    
-    final_df['PER'] = pd.to_numeric(final_df[per_c].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0) if per_c else 0.0
-    final_df['PBR'] = pd.to_numeric(final_df[pbr_c].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0) if pbr_c else 0.0
-    final_df['ROE'] = pd.to_numeric(final_df[roe_c].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0) if roe_c else 0.0
-    final_df['시장'] = final_df[mkt_c] if mkt_c else "코스피"
 
-    if high52_c:
-        final_df['52주고점'] = pd.to_numeric(final_df[high52_c].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0)
-        mask_high = (final_df['현재가'] > 0) & (final_df['52주고점'] > 0)
-        # ⚠️ [버그 수정] 예전엔 mask_high에 안 걸리는(52주고점 데이터를 못 구한) 종목도
-        # 고점대비(%)를 0.0으로 채웠다. 그러면 '52주 고점을 모른다'와 '지금 딱 52주
-        # 고점이다(0% 하락)'가 똑같은 0.0으로 뭉개져서, 다음 단계(get_ai_diagnosis_inputs
-        # → calc_risk_score)에서 진짜 데이터를 '데이터 없음'으로 오인하는 원인이 됐다.
-        # 실측: 삼성전자 리스크 점수가 실제 하락폭(-36.5%, 감점 12.6점)이 아니라 데이터
-        # 없음 취급(중립 감점 5.0점)으로 계산돼 -46.7점이어야 할 게 -39.1점으로 나왔다.
-        # NaN으로 남겨서 '모른다'를 명확히 구분한다.
-        final_df['고점대비(%)'] = np.nan
-        final_df.loc[mask_high, '고점대비(%)'] = ((final_df.loc[mask_high, '현재가'] - final_df.loc[mask_high, '52주고점']) / final_df.loc[mask_high, '52주고점']) * 100
-        final_df = final_df[['종목코드', '종목명', '시장', '현재가', '52주고점', '고점대비(%)', 'PER', 'PBR', '배당수익률', 'ROE', '부채비율']]
-    else:
-        final_df = final_df[['종목코드', '종목명', '시장', '현재가', 'PER', 'PBR', '배당수익률', 'ROE', '부채비율']]
+    final_df['52주고점'] = _to_num(final_df.get('week52HighPrice', pd.Series(dtype=str)))
+    final_df['고점대비(%)'] = np.nan
+    mask_high = (final_df['현재가'] > 0) & (final_df['52주고점'] > 0)
+    final_df.loc[mask_high, '고점대비(%)'] = (
+        (final_df.loc[mask_high, '현재가'] - final_df.loc[mask_high, '52주고점']) / final_df.loc[mask_high, '52주고점']
+    ) * 100
 
-    # ── 병합 후 종목코드 중복 검사 ────────────────────────────────────────────
-    # "실패 페이지" 경고에는 안 잡히지만, 레이트리밋/캐시 등으로 엉뚱한 페이지
-    # 내용이 200 OK로 와서 조용히 병합되는 경우 여기서 중복 종목코드로 드러난다.
-    # 이 경우 전에는 아무 경고 없이 중복 행이 그대로 섞여 들어갔다.
-    dup_mask = final_df['종목코드'].duplicated(keep=False)
-    # ── [세션 프리징 버그 수정] 여기도 session_state 대신 _DEBUG_STORE 사용 (위 missing_pages와 동일한 이유) ──
+    final_df = final_df.dropna(subset=['종목코드'])
+    final_df = final_df[final_df['종목코드'] != '000000']
+    final_df = final_df[['종목코드', '종목명', '시장', '현재가', '52주고점', '고점대비(%)', 'PER', 'PBR', '배당수익률', 'ROE', '부채비율']]
+
+    # ── 병합 후 종목코드 중복 검사 (신규 API는 페이지네이션이 어긋나면 같은 종목이
+    # 두 페이지에 겹쳐 나올 수 있으므로 기존과 동일하게 점검한다) ──────────────
+    dup_mask = final_df['종목코드'].duplicated(keep='first')
     if dup_mask.any():
         _DEBUG_STORE["_screener_dup_codes"] = sorted(final_df.loc[dup_mask, '종목코드'].dropna().unique().tolist())
+        final_df = final_df[~dup_mask]  # 중복은 첫 번째 것만 남기고 제거
     else:
         _DEBUG_STORE["_screener_dup_codes"] = []
 
     yield final_df, 100
+
 
 @st.cache_data(ttl=3600*12, show_spinner=False)
 def fetch_and_cache_screener_data():
