@@ -1854,6 +1854,44 @@ def _decode_naver_html(res, fallback_encoding='euc-kr'):
         return raw.decode(fallback_encoding, errors='replace')
 
 
+# ── 네이버금융 페이지에서 실제 종목명을 뽑아내는 헬퍼 ──────────────────────────
+# 문제: <title> 태그 포맷이 "종목명 : 사이트명" 순서라고 가정하고 첫 조각만 잘라 썼는데,
+# 네이버가 브랜드를 'Npay 증권'으로 바꾸면서 일부 페이지의 title 순서가
+# "Npay 증권 : 종목명" 처럼 사이트명이 앞으로 오는 경우가 생겨, 종목명 대신
+# "Npay 증권"이 잘못 저장되는 문제가 있었다(제이브이엠 등). 아래 함수는
+# 1) 페이지 안의 실제 종목명 DOM(class="wrap_company")을 최우선으로 시도하고,
+# 2) 실패하면 title을 구분자로 쪼갠 뒤 "사이트명으로 보이는 키워드"가 없는
+#    조각을 종목명으로 선택해, title 안 종목명/사이트명 순서가 어느 쪽이어도
+#    안전하게 동작하도록 한다.
+_NAVER_SITE_NAME_KEYWORDS = ('네이버페이', '네이버', 'Npay', 'NPay', 'npay', '증권', '금융')
+
+def _extract_stock_name_from_naver_html(html):
+    # 1순위: 실제 종목명이 들어있는 DOM 요소 (title보다 훨씬 안정적)
+    dom_match = re.search(
+        r'class="wrap_company"[^>]*>.*?<h2[^>]*>\s*<a[^>]*>(.*?)</a>',
+        html, re.DOTALL
+    )
+    if dom_match:
+        name = html_lib.unescape(re.sub(r'<[^>]+>', '', dom_match.group(1))).strip()
+        if name:
+            return name
+
+    # 2순위: <title> 텍스트를 구분자(: | - –)로 쪼갠 뒤, 사이트명 키워드가
+    # 없는 조각을 종목명으로 선택 (순서가 앞이든 뒤든 상관없이 안전)
+    title_match = re.search(r'<title>(.*?)</title>', html, re.DOTALL)
+    if not title_match:
+        return None
+    raw_title = html_lib.unescape(title_match.group(1)).strip()
+    parts = [p.strip() for p in re.split(r'\s*[:：|\-–]\s*', raw_title) if p.strip()]
+    if not parts:
+        return None
+    candidates = [p for p in parts if not any(k in p for k in _NAVER_SITE_NAME_KEYWORDS)]
+    if candidates:
+        return candidates[0]
+    # 모든 조각에 사이트명 키워드가 섞여있으면(예외적인 경우) 첫 조각을 그대로 사용
+    return parts[0]
+
+
 # 💡 모바일 페이지 기반 fetch_company_info_fnguide
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_company_info_fnguide(code):
@@ -1882,18 +1920,17 @@ def fetch_company_info_fnguide(code):
         html = _decode_naver_html(res, fallback_encoding='euc-kr')
         name_debug["resp_len"] = len(html)
 
-        # 타이틀 포맷이 "종목명 : 네이버페이 증권" / "종목명 - 네이버 증권" 등으로 바뀔 수 있어
-        # 뒤쪽 사이트명을 유연하게 잘라내는 방식으로 변경
+        # 종목명 추출: title 태그의 "종목명 / 사이트명" 순서가 페이지마다 뒤바뀔 수 있어
+        # (예: 'Npay 증권' 브랜드 개편 이후 일부 페이지는 사이트명이 앞에 옴),
+        # _extract_stock_name_from_naver_html()이 DOM 우선 + 사이트명 키워드 필터링으로
+        # 순서에 관계없이 실제 종목명만 뽑아내도록 처리한다.
         title_match = re.search(r'<title>(.*?)</title>', html, re.DOTALL)
         if title_match:
             name_debug["title_match"] = True
             name_debug["title_raw"] = title_match.group(1)[:100]
-            raw_title = html_lib.unescape(title_match.group(1)).strip()
-            # "종목명 : 네이버/Npay 증권" 등 사이트명이 바뀌어도 안전하도록,
-            # 첫 구분자(:  |  -) 뒤는 사이트명으로 간주하고 통째로 제거
-            raw_title = re.split(r'\s*[:：|\-–]\s*', raw_title)[0].strip()
-            if raw_title:
-                data["name"] = raw_title
+        extracted_name = _extract_stock_name_from_naver_html(html)
+        if extracted_name:
+            data["name"] = extracted_name
 
         summary_match = re.search(r'class="summary_info"[^>]*>(.*?)</p>', html, re.DOTALL)
         if summary_match:
