@@ -3955,6 +3955,23 @@ def run_unified_market_scan_async(job_key="unified_scan", overall_timeout=150):
                 state.get("error")
                 or f"스캔 실패: 시간이 너무 오래 걸려 중단했습니다 (마지막 상태: {_last_text}, {_last_pct}%). 다시 시도해주세요."
             )
+        # ── [진단 추가] 전체 타임아웃/정체로 실패한 경우에도 원인을 볼 수 있게 ──
+        # 기존에는 스캔이 "성공"했을 때만(아래 success 분기) fetch_failures를
+        # 화면에 보여줬다. 그런데 실제로 문제가 생기는 건 대부분 "실패가 너무
+        # 많아서 재시도만 하다가 150초 전체 상한에 걸려 실패로 끝나는" 경우라서,
+        # 정작 원인 파악이 가장 필요한 순간에 아무 정보도 안 보이는 사각지대가
+        # 있었다. _DEBUG_STORE는 백그라운드 스레드가 계속 기록하므로, 여기서도
+        # 동일하게 원인별 집계와 최근 실패 로그를 노출한다.
+        _dbg_fails = _DEBUG_STORE.get("_screener_fetch_failures", [])
+        if _dbg_fails:
+            from collections import Counter
+            _reason_counts = Counter(f.get("원인", "알 수 없음") for f in _dbg_fails)
+            st.warning(
+                f"🔍 [진단] 이번 시도에서 실패로 기록된 개별 요청 {len(_dbg_fails)}건 "
+                f"(타임아웃으로 중단되기 전까지 누적) — 원인별 집계: {dict(_reason_counts)}"
+            )
+            with st.expander("실패 상세 로그 보기 (최근 20건)"):
+                st.write(_dbg_fails[-20:])
         _SCAN_JOB_STATE.pop(job_id, None)
         return
 
