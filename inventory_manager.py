@@ -3211,7 +3211,7 @@ def _extract_screener_current_page(res_text):
 #   페이지)까지 순차 요청한다. 전체 종목 수를 미리 알 방법이 없어서(응답에 총
 #   개수 필드가 없음) "받은 개수 < 요청한 개수"를 종료 조건으로 쓴다.
 _STOCK_API_PAGE_SIZE = 100
-_STOCK_API_MAX_PAGES = 60  # 안전장치: 60 * 100 = 6000종목까지 커버(KRX 전체 상장 종목 수보다 넉넉히 큼). API가 오작동해도 무한루프 방지.
+_STOCK_API_MAX_PAGES = 150  # 안전장치: 서버가 실제로는 요청한 pageSize(100)보다 훨씬 적게(예: 40개씩) 잘라서 주는 것으로 확인됨 — 최악의 경우(페이지당 20개)에도 3,000종목까지 커버되도록 넉넉히 잡음. API가 오작동해도 무한루프는 방지.
 
 def _fetch_stock_default_page(headers, start_idx, page_size=_STOCK_API_PAGE_SIZE):
     """stock.naver.com의 종목 목록 JSON API에서 한 페이지(items)를 가져온다.
@@ -3300,13 +3300,17 @@ def fetch_screener_data_generator():
             continue
 
         if not items:
-            break  # 빈 배열 = 더 이상 종목 없음(정상 종료)
+            break  # 빈 배열 = 더 이상 종목 없음(정상 종료) — 유일한 정상 종료 조건
 
         all_items.extend(items)
-        if len(items) < _STOCK_API_PAGE_SIZE:
-            break  # 요청한 개수보다 적게 옴 = 마지막 페이지
-
-        start_idx += _STOCK_API_PAGE_SIZE
+        # ── [진짜 원인] 서버가 pageSize=100을 요청해도 실제로는 그보다 적게
+        # (예: 40개) 잘라서 내려주는 것으로 확인됐다. 예전 코드는 "요청한 개수
+        # (100)보다 적게 오면 마지막 페이지"로 판단했는데, 그 기준이 서버의
+        # 실제 응답 크기(40)와 안 맞아서 매번 1페이지 만에 "마지막 페이지"로
+        # 오판하고 멈춰버렸다 — 실측으로 확인된 "매번 정확히 40건만 나온다"는
+        # 증상과 정확히 일치한다. 이제는 요청한 개수와 비교하지 않고, "실제로
+        # 받은 개수만큼" start_idx를 전진시키고, 빈 배열이 올 때만 종료한다.
+        start_idx += len(items)
         time.sleep(0.15)  # 과도한 연속 요청으로 인한 레이트리밋 방지용 짧은 텀
 
     # ── 실패했던 구간 재시도 (한 번 더, 각각 조금씩 텀을 두고) ──────────────
