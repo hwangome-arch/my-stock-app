@@ -2008,15 +2008,39 @@ def fetch_company_info_fnguide(code):
         html = _decode_naver_html(res, fallback_encoding='euc-kr')
         name_debug["resp_len"] = len(html)
 
-        # 종목명 추출: title 태그의 "종목명 / 사이트명" 순서가 페이지마다 뒤바뀔 수 있어
-        # (예: 'Npay 증권' 브랜드 개편 이후 일부 페이지는 사이트명이 앞에 옴),
-        # _extract_stock_name_from_naver_html()이 DOM 우선 + 사이트명 키워드 필터링으로
-        # 순서에 관계없이 실제 종목명만 뽑아내도록 처리한다.
+        # 종목명 추출: 2026-09 Npay 증권 개편 이후 finance.naver.com/item/main.naver
+        # 페이지의 <title>이 "Npay 증권" 하나뿐인 껍데기 페이지로 바뀌어(구분자·
+        # 종목명 없음) title 기반 추출이 통째로 실패하는 사례가 있었다. 브라우저
+        # 개발자도구로 실제 Npay 증권 종목 상세 페이지가 쓰는 내부 API를 확인한 결과:
+        #   GET https://polling.finance.naver.com/api/realtime/domestic/v2/stock?itemCodes={code}
+        #   → {"datas":[{"itemCode":"112610","itemName":"씨에스윈드", ...}], ...}
+        # 이 API가 종목명을 JSON으로 직접 내려주므로 HTML/title 파싱보다 훨씬
+        # 안정적이라 1순위로 쓰고, 실패 시에만 기존 title/DOM 기반 추출로 폴백한다.
+        extracted_name = None
+        try:
+            rt_url = f"https://polling.finance.naver.com/api/realtime/domestic/v2/stock?itemCodes={code}"
+            rt_headers = {**naver_headers, 'Referer': 'https://stock.naver.com/', 'Accept': 'application/json, text/plain, */*'}
+            rt_res = requests.get(rt_url, headers=rt_headers, timeout=6)
+            rt_data = rt_res.json()
+            rt_datas = rt_data.get("datas") or []
+            if rt_datas:
+                rt_name = str(rt_datas[0].get("itemName", "")).strip()
+                if rt_name:
+                    extracted_name = rt_name
+            name_debug["polling_api_status"] = rt_res.status_code
+        except Exception as e:
+            name_debug["polling_api_exception"] = f"{type(e).__name__}: {e}"
+
         title_match = re.search(r'<title>(.*?)</title>', html, re.DOTALL)
         if title_match:
             name_debug["title_match"] = True
             name_debug["title_raw"] = title_match.group(1)[:100]
-        extracted_name = _extract_stock_name_from_naver_html(html)
+        if not extracted_name:
+            # 폴백: title 태그의 "종목명 / 사이트명" 순서가 페이지마다 뒤바뀔 수 있어
+            # (예: 'Npay 증권' 브랜드 개편 이후 일부 페이지는 사이트명이 앞에 옴),
+            # _extract_stock_name_from_naver_html()이 DOM 우선 + 사이트명 키워드 필터링으로
+            # 순서에 관계없이 실제 종목명만 뽑아내도록 처리한다.
+            extracted_name = _extract_stock_name_from_naver_html(html)
         if extracted_name:
             data["name"] = extracted_name
 
