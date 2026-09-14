@@ -3262,28 +3262,43 @@ def fetch_screener_data_generator():
     _DEBUG_STORE["_screener_page_mismatches"] = []  # [호환용] 신규 API에는 해당 없음 — 항상 빈 리스트
     _DEBUG_STORE["_screener_overflow_pages"] = set()  # [호환용] 신규 API에는 해당 없음
 
+    # ── [버그 수정: 특정 구간에서 실패하면 전체 스캔이 조기 종료되던 문제] ──────
+    # 예전 버전은 같은 startIdx에서 3번 연속 실패하면 "재시도해도 가망 없다"고
+    # 보고 while 루프 자체를 break해버렸다. 문제는 이 API가 total count를 안
+    # 줘서 "이게 진짜 마지막 페이지라 끝난 건지, 중간에 일시적으로 막힌 건지"를
+    # 코드가 구분할 수 없다는 점 — 그런데 실패를 "끝났다"로 오판해서 예를 들어
+    # startIdx=1500(전체 2,600여개 중 절반 조금 넘는 지점)에서 막히면 그 뒤
+    # 1,000개 넘는 종목을 통째로 못 가져온 채 "정상 종료"처럼 다음 단계로
+    # 넘어가버렸다. 실측으로 확인된 "추천종목이 40개밖에 안 나온다"는 증상이
+    # 정확히 이 패턴과 일치한다(스캔된 전체 종목 수 자체가 확 줄어든 것).
+    # 수정: 같은 구간에서 몇 번 재시도해도 안 되면 그 구간만 "구멍"으로 남겨두고
+    # 다음 구간으로 계속 진행한다. 다 돈 뒤 구멍난 구간만 한 번 더 재시도한다.
     all_items = []
     failed_start_idxs = []
     start_idx = 0
     page_num = 0
-    consecutive_failures = 0
 
     while page_num < _STOCK_API_MAX_PAGES:
         page_num += 1
         progress_pct = 10 + int(min(page_num / 30, 1.0) * 70)  # 정확한 총 페이지 수를 몰라서 30페이지 기준으로 대략 표시
         yield f"⚡ 종목 목록 수집 중... ({len(all_items)}개 종목 확보, {page_num}번째 요청)", progress_pct
 
-        items = _fetch_stock_default_page(headers, start_idx, _STOCK_API_PAGE_SIZE)
-        if items is None:
-            failed_start_idxs.append(start_idx)
-            consecutive_failures += 1
-            if consecutive_failures >= 3:
-                # 같은 지점에서 3연속 실패 → 재시도해도 가망 없다고 보고 중단
+        items = None
+        for _attempt in range(3):
+            items = _fetch_stock_default_page(headers, start_idx, _STOCK_API_PAGE_SIZE)
+            if items is not None:
                 break
             time.sleep(1.5)
+
+        if items is None:
+            # 이 구간은 끝내 실패 — 하지만 여기서 전체를 포기하지 않고, 이
+            # 구간이 "마지막 페이지"인지 "중간에 막힌 것"인지 알 수 없으므로
+            # 일단 다음 구간으로 넘어가서 계속 수집한다(구멍은 아래에서 재시도).
+            failed_start_idxs.append(start_idx)
+            start_idx += _STOCK_API_PAGE_SIZE
+            time.sleep(0.3)
             continue
 
-        consecutive_failures = 0
         if not items:
             break  # 빈 배열 = 더 이상 종목 없음(정상 종료)
 
@@ -3292,7 +3307,20 @@ def fetch_screener_data_generator():
             break  # 요청한 개수보다 적게 옴 = 마지막 페이지
 
         start_idx += _STOCK_API_PAGE_SIZE
-        time.sleep(0.1)  # 과도한 연속 요청으로 인한 레이트리밋 방지용 짧은 텀
+        time.sleep(0.15)  # 과도한 연속 요청으로 인한 레이트리밋 방지용 짧은 텀
+
+    # ── 실패했던 구간 재시도 (한 번 더, 각각 조금씩 텀을 두고) ──────────────
+    if failed_start_idxs:
+        yield f"⚠️ {len(failed_start_idxs)}개 구간 재시도 중...", 85
+        still_failed = []
+        for idx in failed_start_idxs:
+            time.sleep(1.0)
+            items = _fetch_stock_default_page(headers, idx, _STOCK_API_PAGE_SIZE)
+            if items:
+                all_items.extend(items)
+            else:
+                still_failed.append(idx)
+        failed_start_idxs = still_failed
 
     _DEBUG_STORE["_screener_missing_pages"] = failed_start_idxs
 
@@ -3877,7 +3905,19 @@ def run_unified_market_scan_async(job_key="unified_scan", overall_timeout=150):
                     pass
         st.warning(state.get("warning") or "분석 결과 고점 대비 유의미하게 하락한 종목이 없습니다.")
 
-    st.success("✨ 스캔 완료! (스크리너 + 추천 종목 데이터가 함께 갱신되었습니다)")
+    _total_scanned = len(screener_df) if screener_df is not None else 0
+    st.success(
+        f"✨ 스캔 완료! 전체 {_total_scanned}개 종목 데이터를 가져왔습니다. "
+        "(스크리너 + 추천 종목 데이터가 함께 갱신되었습니다)"
+    )
+    if _total_scanned < 2000:
+        # KRX(코스피+코스닥) 상장 종목 수는 대략 2,600~2,800개 수준이다. 그보다
+        # 눈에 띄게 적게 긁혔다면 API 페이지네이션 도중 어딘가에서 조기 종료됐을
+        # 가능성이 높으므로(예: 연속 실패로 중단), 바로 알아챌 수 있게 경고한다.
+        st.warning(
+            f"⚠️ 코스피+코스닥 전체 상장 종목 수는 보통 2,600개 이상인데, 이번엔 {_total_scanned}개만 "
+            "가져왔습니다. 스캔이 중간에 조기 종료됐을 수 있어요 — 위쪽 실패 로그를 확인해보세요."
+        )
     _SCAN_JOB_STATE.pop(job_id, None)
     st.rerun()
 
