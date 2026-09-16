@@ -2207,22 +2207,64 @@ def fetch_investor_trend_by_code(code, days=20):
             return result_df
 
         data = res.json()
-        items = ((data or {}).get("result") or {}).get("items") or []
-        debug["num_items"] = len(items)
+        result = (data or {}).get("result")
 
-        if not items:
+        # [버그 수정 — 2026-09] 같은 엔드포인트인데 종목에 따라 응답 스키마가 다르다.
+        # A형(예: 005930 삼성전자): result가 dict, {"items": [{"localTradedAt": "2026-09-15",
+        #      "krx": {"foreignNetVolume": "-1088039", ...}}]} 형태 — 순수 숫자 문자열.
+        # B형(예: 054950 제이브이엠): result가 dict가 아니라 list 자체, [{"bizdate": "20260915",
+        #      "foreignerPureBuyQuant": "-4,529", "organPureBuyQuant": "+48",
+        #      "individualPureBuyQuant": "+4,304", ...}] 형태 — 콤마/부호가 섞인 문자열.
+        # 네이버 백엔드가 종목군별로 부분적으로만 이관돼서 이렇게 갈라진 것으로 보인다.
+        # 어느 한쪽만 가정하면 다른 쪽 종목에서 AttributeError('list' has no 'get')처럼
+        # 조용히 실패하므로, 아래에서 두 형태를 모두 인식해 같은 컬럼으로 정규화한다.
+        if isinstance(result, dict):
+            raw_items = result.get("items") or []
+        elif isinstance(result, list):
+            raw_items = result
+        else:
+            raw_items = []
+        debug["num_items"] = len(raw_items)
+
+        if not raw_items:
             _DEBUG_STORE[f"_trend_debug_{code}"] = debug
             return result_df
 
+        def _clean_num(v):
+            # "-4,529"/"+48"처럼 콤마·부호가 섞인 문자열도 pd.to_numeric이 처리할 수
+            # 있도록 콤마만 제거한다("+"/"-" 부호는 그대로 둬도 숫자 변환에 문제없음).
+            if v is None:
+                return None
+            return str(v).replace(",", "").strip()
+
+        def _fmt_date(raw):
+            # B형의 "20260915"(YYYYMMDD)를 A형과 동일한 "2026-09-15" 형식으로 통일.
+            s = str(raw or "").strip()
+            if len(s) == 8 and s.isdigit():
+                return f"{s[:4]}-{s[4:6]}-{s[6:]}"
+            return s
+
         rows = []
-        for it in items[:days]:
-            krx = it.get("krx") or {}
-            rows.append({
-                "날짜": it.get("localTradedAt", ""),
-                "외국인순매매": krx.get("foreignNetVolume"),
-                "기관순매매": krx.get("organizationNetVolume"),
-                "개인순매매": krx.get("individualNetVolume"),
-            })
+        for it in raw_items[:days]:
+            if not isinstance(it, dict):
+                continue
+            krx = it.get("krx")
+            if isinstance(krx, dict):
+                # A형
+                rows.append({
+                    "날짜": it.get("localTradedAt", ""),
+                    "외국인순매매": _clean_num(krx.get("foreignNetVolume")),
+                    "기관순매매": _clean_num(krx.get("organizationNetVolume")),
+                    "개인순매매": _clean_num(krx.get("individualNetVolume")),
+                })
+            else:
+                # B형
+                rows.append({
+                    "날짜": _fmt_date(it.get("bizdate")),
+                    "외국인순매매": _clean_num(it.get("foreignerPureBuyQuant")),
+                    "기관순매매": _clean_num(it.get("organPureBuyQuant")),
+                    "개인순매매": _clean_num(it.get("individualPureBuyQuant")),
+                })
 
         out = pd.DataFrame(rows)
         for col in ("외국인순매매", "기관순매매", "개인순매매"):
