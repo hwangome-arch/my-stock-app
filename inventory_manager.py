@@ -2147,109 +2147,86 @@ def fetch_company_info_fnguide(code):
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_investor_trend_by_code(code, days=20):
     """
-    네이버금융 frgn.naver 페이지(외국인·기관 순매매 거래량, 정적 HTML 표)에서
-    최근 N영업일의 일별 순매매 수량(주)을 가져온다.
+    stock.naver.com(Npay 증권) 신규 JSON API에서 최근 N영업일의 일별
+    외국인·기관·개인 순매매 수량(주)을 가져온다.
 
-    주의: 네이버는 '개인' 순매매를 별도로 제공하지 않으므로,
-    개인 순매매는 (외국인 + 기관)의 반대 부호로 추정한 값이다(코스피/코스닥 시장
-    전체 수급이 대략 상쇄된다는 근사 가정). UI에는 반드시 '추정'임을 표기할 것.
+    ── [2026-09 API 전환] ────────────────────────────────────────────
+    기존에는 finance.naver.com/item/frgn.naver 페이지(정적 HTML 표)를
+    pd.read_html()로 스크래핑했는데, 네이버가 이 페이지를 Next.js
+    기반 CSR(클라이언트사이드 렌더링)로 개편하면서 서버가 내려주는
+    원본 HTML에는 더 이상 <table>이 없어(자바스크립트 실행 후에만
+    데이터가 채워짐) 파싱이 항상 "No tables found"로 실패하는 문제가
+    있었다. 브라우저 개발자도구(Network 탭)로 실제 새 서비스가 쓰는
+    내부 API를 직접 확인한 결과 아래 형태의 JSON API로 완전히
+    대체 가능했다:
+        GET https://m.stock.naver.com/front-api/stock/domestic/trend
+            ?code={종목코드}&exchangeType=KRX&size={개수}
+        → {"isSuccess": true, "result": {"items": [
+              {"localTradedAt": "2026-09-15",
+               "krx": {"foreignNetVolume": "-1088039",
+                       "organizationNetVolume": "-2321959",
+                       "individualNetVolume": "1379866", ...}}, ...]}}
+
+    [기존 로직과의 차이] 예전 frgn.naver 방식은 네이버가 '개인' 순매매를
+    따로 안 줘서 (외국인+기관)의 반대 부호로 '추정'해 썼는데, 이 신규 API는
+    'individualNetVolume' 필드로 개인 순매매 실측치를 직접 제공한다.
+    그래서 더 이상 추정할 필요가 없어졌고, 호출부(카드/캡션 등)의
+    "추정치" 관련 문구도 함께 제거했다. 컬럼명은 하위 호환을 위해
+    '외국인순매매'/'기관순매매'는 그대로 두고, '개인순매매(추정)'는
+    실측치로 바뀌었으므로 '개인순매매'로 이름을 변경했다(호출부도 함께 수정).
     """
     code = normalize_kr_code(code)
     result_df = pd.DataFrame()
 
     # 디버그 정보 (실패 원인 진단용). 성공/실패와 무관하게 마지막 시도 결과를 세션에 남긴다.
     debug = {
-        "code": code, "days": days, "pages_tried": 0,
-        "last_status": None, "last_url": None, "exception": None,
-        "resp_len": None, "resp_snippet": None, "found_table": False,
-        "num_tables": None, "tables_columns": None,
+        "code": code, "days": days,
+        "url": None, "status": None, "resp_len": None,
+        "exception": None, "num_items": None,
     }
 
     naver_headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://finance.naver.com/',
+        'Referer': f'https://m.stock.naver.com/domestic/stock/{code}/total',
+        'Accept': 'application/json, text/plain, */*',
     }
 
-    def _find_col(columns, keyword):
-        for c in columns:
-            if keyword in str(c):
-                return c
-        return None
-
-    def _find_investor_col(columns, top_kw, sub_kw):
-        """네이버 표 헤더가 ('기관', '순매매량') 처럼 2단(멀티인덱스)으로 바뀐 경우와
-        예전처럼 '기관순매매' 단일 문자열인 경우를 모두 지원.
-        top_kw(예: '기관','외국인')와 sub_kw(예: '순매매')가 각각 상/하위 레벨에
-        모두 있는 컬럼만 매칭해서 '보유주수'/'보유율' 같은 다른 외국인 컬럼과 헷갈리지 않게 한다."""
-        for c in columns:
-            if isinstance(c, tuple):
-                top = str(c[0])
-                sub = str(c[-1])
-            else:
-                top = sub = str(c)
-            if top_kw in top and sub_kw in sub:
-                return c
-        return None
-
     try:
-        collected = []
-        pages_needed = max(1, (days // 10) + 2)  # 페이지당 10행 기준, 여유분 확보
-        for page in range(1, pages_needed + 1):
-            url = f"https://finance.naver.com/item/frgn.naver?code={code}&page={page}"
-            debug["pages_tried"] = page
-            debug["last_url"] = url
-            res = requests.get(url, headers=naver_headers, timeout=8)
-            debug["last_status"] = res.status_code
-            res.encoding = 'euc-kr'  # 네이버금융(finance.naver.com)은 euc-kr 고정 — apparent_encoding 추측에 의존하면 특정 종목명 바이트 패턴에서 오탐(예: 키릴 계열로 오판)해 파싱이 깨진다
-            debug["resp_len"] = len(res.text)
-            debug["resp_snippet"] = res.text[:300]
+        # size는 넉넉히 요청(최소 10, 필요 일수+여유분)해서 휴장일/데이터 누락에 대비한다.
+        url = (
+            "https://m.stock.naver.com/front-api/stock/domestic/trend"
+            f"?code={code}&exchangeType=KRX&size={max(days + 5, 10)}"
+        )
+        debug["url"] = url
+        res = requests.get(url, headers=naver_headers, timeout=8)
+        debug["status"] = res.status_code
+        debug["resp_len"] = len(res.text)
 
-            if res.status_code != 200:
-                break
-
-            dfs = pd.read_html(io.StringIO(res.text))
-            debug["num_tables"] = len(dfs)
-            debug["tables_columns"] = [
-                [str(c) for c in d.columns][:12] for d in dfs
-            ][:10]
-            target_df = next(
-                (d for d in dfs if _find_investor_col(d.columns, '기관', '순매매') is not None),
-                None,
-            )
-            if target_df is None:
-                break
-            debug["found_table"] = True
-
-            col_date = _find_col(target_df.columns, '날짜')
-            if col_date is None:
-                break
-            target_df = target_df.dropna(subset=[col_date])
-            if target_df.empty:
-                break
-
-            collected.append(target_df)
-            if sum(len(d) for d in collected) >= days:
-                break
-
-        if not collected:
+        if res.status_code != 200:
             _DEBUG_STORE[f"_trend_debug_{code}"] = debug
             return result_df
 
-        merged = pd.concat(collected, ignore_index=True)
-        col_date = _find_col(merged.columns, '날짜')
-        col_inst = _find_investor_col(merged.columns, '기관', '순매매')
-        col_frgn = _find_investor_col(merged.columns, '외국인', '순매매')
-        if not (col_date is not None and col_inst is not None and col_frgn is not None):
+        data = res.json()
+        items = ((data or {}).get("result") or {}).get("items") or []
+        debug["num_items"] = len(items)
+
+        if not items:
             _DEBUG_STORE[f"_trend_debug_{code}"] = debug
             return result_df
 
-        merged = merged.drop_duplicates(subset=[col_date]).head(days)
+        rows = []
+        for it in items[:days]:
+            krx = it.get("krx") or {}
+            rows.append({
+                "날짜": it.get("localTradedAt", ""),
+                "외국인순매매": krx.get("foreignNetVolume"),
+                "기관순매매": krx.get("organizationNetVolume"),
+                "개인순매매": krx.get("individualNetVolume"),
+            })
 
-        out = pd.DataFrame()
-        out['날짜'] = merged[col_date].astype(str)
-        out['외국인순매매'] = pd.to_numeric(merged[col_frgn].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
-        out['기관순매매'] = pd.to_numeric(merged[col_inst].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
-        out['개인순매매(추정)'] = -(out['기관순매매'] + out['외국인순매매'])
+        out = pd.DataFrame(rows)
+        for col in ("외국인순매매", "기관순매매", "개인순매매"):
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0)
         result_df = out.reset_index(drop=True)
     except Exception as e:
         debug["exception"] = f"{type(e).__name__}: {e}"
@@ -4679,12 +4656,11 @@ def draw_fnguide_details(code):
         else:
             st.caption("📉 주가 추이 데이터를 불러올 수 없습니다.")
 
-        # ── 최근 수급 동향 (외국인 / 기관 / 개인 추정 순매매) ────────────────────
+        # ── 최근 수급 동향 (외국인 / 기관 / 개인 순매매, stock.naver.com API 실측치) ────────
         st.markdown("<h4 style='font-size:16px; margin:20px 0 4px 0;'>📊 최근 수급 동향</h4>", unsafe_allow_html=True)
         st.markdown(
             "<p style='font-size:12px; color:#64748B; margin-bottom:10px;'>"
-            "외국인·기관이 동반 순매수로 돌아서는 구간은 통상 긍정적인 수급 신호로 해석됩니다. "
-            "단, <b>개인 순매매는 네이버가 별도 제공하지 않아 (외국인+기관)의 반대부호로 추정한 값</b>입니다."
+            "외국인·기관이 동반 순매수로 돌아서는 구간은 통상 긍정적인 수급 신호로 해석됩니다."
             "</p>",
             unsafe_allow_html=True,
         )
@@ -4708,7 +4684,7 @@ def draw_fnguide_details(code):
         if not df_trend.empty:
             sum_inst  = int(df_trend['기관순매매'].sum())
             sum_frgn  = int(df_trend['외국인순매매'].sum())
-            sum_indiv = int(df_trend['개인순매매(추정)'].sum())
+            sum_indiv = int(df_trend['개인순매매'].sum())
 
             def _trend_card(title, value, note=""):
                 color = "#10B981" if value > 0 else ("#EF4444" if value < 0 else "#64748B")
@@ -4727,7 +4703,7 @@ def draw_fnguide_details(code):
                 '<div style="display:flex; gap:10px; margin-bottom:12px;">'
                 + _trend_card("🌍 외국인 누적 순매매", sum_frgn)
                 + _trend_card("🏦 기관 누적 순매매", sum_inst)
-                + _trend_card("👤 개인 누적 순매매", sum_indiv, "추정치 (외국인+기관의 반대부호)")
+                + _trend_card("👤 개인 누적 순매매", sum_indiv)
                 + '</div>',
                 unsafe_allow_html=True,
             )
@@ -4763,7 +4739,7 @@ def draw_fnguide_details(code):
                 return 'color: #111827;'
 
             display_trend = df_trend.copy()
-            _num_cols = ['외국인순매매', '기관순매매', '개인순매매(추정)']
+            _num_cols = ['외국인순매매', '기관순매매', '개인순매매']
             for col in _num_cols:
                 display_trend[col] = display_trend[col].apply(_fmt_shares)
 
