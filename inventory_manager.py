@@ -153,6 +153,47 @@ def _get_screener_df_cache():
 
 _SCREENER_DF_CACHE = _get_screener_df_cache()
 
+# ── [문제 기록 자동 수집] 스캔/AI 점수/데이터 조회 등 여기저기서 터지는 오류를
+# 한곳에 모아두는 통합 로그 ────────────────────────────────────────────────
+# 배경: 스크리너 스캔 실패, AI 점수 배치 계산 실패, 배당·뉴스·재무 데이터 조회
+# 실패 등이 각자 다른 곳에서 try/except로 조용히 삼켜지거나 _DEBUG_STORE의
+# 서로 다른 키에 흩어져 저장돼 있어서, "요즘 이런 오류가 많다"는 걸 한눈에
+# 보기 어렵고 AI에게 물어보려 해도 여러 곳을 일일이 펼쳐서 긁어모아야 했다.
+# 해결: log_problem()을 호출하면 카테고리/종목코드/메시지/상세를 시각과 함께
+# 하나의 리스트에 쌓는다. _DEBUG_STORE와 동일하게 @st.cache_resource로 감싸서
+# rerun마다 새로 초기화되지 않고, 백그라운드 스레드에서도 안전하게(GIL 보장)
+# 쓸 수 있다. MY PAGE > 문제 기록 탭에서 시간 역순으로 보여주고, AI에게
+# 물어보기 편한 평문 텍스트로도 바로 복사할 수 있게 한다.
+@st.cache_resource(show_spinner=False)
+def _get_problem_log_store():
+    return {"entries": []}
+
+_PROBLEM_LOG_STORE = _get_problem_log_store()
+_PROBLEM_LOG_MAX = 300  # 너무 오래 쌓이면 MY PAGE에서 보기 힘드니 최근 N건만 유지
+
+
+def log_problem(category, message, code=None, detail=None):
+    """앱 어디서든 오류/이상 상황이 생기면 호출해 통합 로그에 남긴다.
+    - category: "종목 스크리너 스캔", "AI 점수 스캔" 등 문제가 발생한 영역
+    - message: 사람이 읽을 한 줄 요약
+    - code: 관련 종목코드(있으면)
+    - detail: 예외 메시지 등 상세 정보(있으면)
+    로깅 자체가 실패해도 앱 동작에는 절대 영향을 주지 않도록 통째로 try/except로
+    감싼다 — 로그 남기다가 앱이 죽으면 본말전도이기 때문."""
+    try:
+        entries = _PROBLEM_LOG_STORE["entries"]
+        entries.append({
+            "ts": datetime.datetime.now(),
+            "category": str(category),
+            "code": str(code) if code else "",
+            "message": str(message),
+            "detail": str(detail) if detail else "",
+        })
+        if len(entries) > _PROBLEM_LOG_MAX:
+            del entries[: len(entries) - _PROBLEM_LOG_MAX]
+    except Exception:
+        pass
+
 # =========================
 # ⚙️ 페이지 설정
 # =========================
@@ -1049,6 +1090,9 @@ def fetch_market_news_naver(limit=15):
 
     debug["items_found"] = len(items)
     _DEBUG_STORE["_market_news_debug"] = debug
+    if not items:
+        log_problem("오늘의 마켓 브리핑(국내 뉴스)", "네이버 금융 뉴스 조회 결과 0건",
+                    detail=debug.get("exception", ""))
     return items
 
 
@@ -1265,6 +1309,8 @@ def generate_ai_market_briefing(headlines, global_snapshot, us_headlines=None):
         # ⚠️ 여기서 str(e)를 그대로 노출한다 — 401 ACCESS_TOKEN_TYPE_UNSUPPORTED처럼
         # 구글 쪽 에러 코드/메시지를 사용자가 직접 봐야 "내 키 문제인지 구글 버그인지"
         # 구분해서 포럼에 신고하거나 다음 조치를 판단할 수 있다.
+        log_problem("오늘의 마켓 브리핑(Gemini)", "Gemini 브리핑 생성 실패",
+                    detail=f"{type(e).__name__}: {e}")
         return None, f"{type(e).__name__}: {e}"
 
 
@@ -1746,6 +1792,7 @@ def fetch_dividend_ranking():
 
         _dbg(f"병렬 조회 종료, {len(all_pages)}개 페이지 확보, concat 시작")
         if not all_pages:
+            log_problem("실시간 배당 순위 스캔", "모든 페이지 조회 실패 (0개 페이지 확보)")
             return pd.DataFrame()
         result = pd.concat(all_pages, ignore_index=True)
         result = result.drop_duplicates()
@@ -1753,6 +1800,7 @@ def fetch_dividend_ranking():
         return result
     except Exception as e:
         _dbg(f"함수 종료 (예외): {e}")
+        log_problem("실시간 배당 순위 스캔", "배당 순위 조회 함수 전체 실패", detail=f"{type(e).__name__}: {e}")
         return pd.DataFrame()
 
 # =========================
@@ -2717,6 +2765,8 @@ def fetch_fnguide_data(code):
     except Exception as e:
         debug["exception"] = f"{type(e).__name__}: {e}"
         _DEBUG_STORE[f"_fnguide_debug_{code}"] = debug
+        log_problem("기업 재무 분석(FnGuide)", f"{code} 종목 FnGuide 재무 데이터 조회 실패", code=code,
+                    detail=f"{type(e).__name__}: {e}")
 
     return df_annual, df_quarter, df_dividend
 
@@ -2969,6 +3019,8 @@ def fetch_naver_wisereport_data(code):
     except Exception as e:
         debug["exception"] = f"{type(e).__name__}: {e}"
         _DEBUG_STORE[f"_naver_wise_debug_{code}"] = debug
+        log_problem("기업 재무 분석(네이버)", f"{code} 종목 네이버 재무 데이터 조회 실패", code=code,
+                    detail=f"{type(e).__name__}: {e}")
 
     return df_annual, df_quarter, df_dividend
 
@@ -3202,6 +3254,8 @@ def fetch_dart_corp_code_map():
         debug_info["step"] = "exception"
         debug_info["exception"] = f"{type(e).__name__}: {e}"
         _DEBUG_STORE["_dart_corpmap_debug"] = debug_info
+        log_problem("DART 공시 조회", "DART 기업코드 매핑(corpCode) 조회 실패",
+                    detail=f"{type(e).__name__}: {e}")
         return {}
 
 
@@ -3284,6 +3338,8 @@ def fetch_disclosure_list(code, days=90, page_count=30):
         debug_info["step"] = "exception"
         debug_info["exception"] = f"{type(e).__name__}: {e}"
         _DEBUG_STORE[f"_dart_disclosure_debug_{code}"] = debug_info
+        log_problem("DART 공시 조회", f"{code} 종목 공시 목록 조회 실패", code=code,
+                    detail=f"{type(e).__name__}: {e}")
         return []
 
 
@@ -3439,12 +3495,15 @@ def _fetch_stock_default_page(headers, start_idx, page_size=_STOCK_API_PAGE_SIZE
             "요청": ("stock_api", start_idx), "원인": "타임아웃(10초)",
             "시각": datetime.datetime.now().strftime("%H:%M:%S"),
         })
+        log_problem("종목 스크리너 스캔", f"start_idx={start_idx} 페이지 조회 타임아웃(10초)")
         return None
     except Exception as e:
         _DEBUG_STORE.setdefault("_screener_fetch_failures", []).append({
             "요청": ("stock_api", start_idx), "원인": f"예외: {type(e).__name__}: {e}",
             "시각": datetime.datetime.now().strftime("%H:%M:%S"),
         })
+        log_problem("종목 스크리너 스캔", f"start_idx={start_idx} 페이지 조회 예외",
+                    detail=f"{type(e).__name__}: {e}")
         return None
 
 def fetch_screener_data_generator():
@@ -3866,6 +3925,7 @@ def _unified_scan_worker(job_id):
         state["done"] = True
         state["success"] = False
         state["error"] = f"스캔 실패: {e}"
+        log_problem("종목 스크리너 스캔", "스크리너 스캔 전체 실패", detail=f"{type(e).__name__}: {e}")
         return
 
     # 2단계: 52주 고점 매칭 → 추천 종목 후보 산출
@@ -3931,6 +3991,22 @@ def _unified_scan_worker(job_id):
     # 지연 계산 방식으로 옮겼었다. 지금은 그 최소 거래대금 필터 기능 자체를 완전히
     # 제거했다(장 시작 직후엔 모든 종목의 누적 거래대금이 낮게 나와 판단 근거로
     # 부적절했고, 종목마다 API 호출이 추가로 붙어 스캔 체감 속도에도 부담이었다).
+
+    # ── [진단 정보 추가 — "결과 건수가 왜 들쭉날쭉한가" 확인용] ──────────────────
+    # "추천 종목 제어판"의 '전체보기' 결과 건수는 사실상 이 2단계(52주 고점 매칭)를
+    # 25초 안에 통과한 종목 수와 거의 같다(등급 조건이 1단계 필터와 사실상 동일).
+    # 그런데 예전엔 몇 개가 타임아웃으로 아예 처리를 못 했는지, 몇 개가 처리는
+    # 됐지만 52주 고점 조건(하락 중 아님)에 걸려 탈락했는지 구분할 방법이 없어서
+    # "300건 vs 139건" 같은 편차가 생겨도 원인(네트워크 지연으로 인한 타임아웃 누락
+    # vs 정상적인 시황 필터링)을 알 수 없었다. 여기서 세 숫자를 구분해 기록해둔다.
+    _stage2_timed_out = total - completed  # 25초 안에 아예 응답을 못 받은 후보 수
+    _stage2_passed = len(rows)             # 응답은 받았고 52주 고점 조건까지 통과한 수
+    state["stage2_diag"] = {
+        "candidates_total": total,          # 1단계 통과 후 2단계로 넘어간 후보 수(최대 300)
+        "stage2_completed": completed,      # 25초 안에 응답을 받은 후보 수
+        "stage2_timed_out": _stage2_timed_out,  # 25초 초과로 못 받은 후보 수
+        "stage2_passed": _stage2_passed,    # 최종적으로 52주 고점 조건까지 통과한 수 (≈ 결과 건수)
+    }
 
     set_progress("✨ 스캔 완료! (스크리너 + 추천 종목 데이터가 함께 갱신되었습니다)", 100)
     state["done"] = True
@@ -4076,6 +4152,18 @@ def run_unified_market_scan_async(job_key="unified_scan", overall_timeout=150):
             st.write(state["fetch_failures"])
 
     reco_df = state.get("reco_df")
+    # ── [진단 정보 세션 반영] 위 _unified_scan_worker에서 기록한 2단계 처리
+    # 현황(후보 수/타임아웃 수/통과 수)을 세션에 저장해, "추천 종목" 탭의
+    # "결과 보기 (N건)" 바로 위에서 계속 확인할 수 있게 한다(1122줄 근처 사용부 참고).
+    _stage2_diag = state.get("stage2_diag")
+    if _stage2_diag:
+        st.session_state['_reco_stage2_diag'] = {**_stage2_diag, "ts": time.time()}
+        if _stage2_diag.get("stage2_timed_out", 0) > 0:
+            st.warning(
+                f"⏱️ [진단] 2단계(52주 고점 매칭) 중 후보 {_stage2_diag['candidates_total']}개 가운데 "
+                f"{_stage2_diag['stage2_timed_out']}개가 25초 제한 안에 응답을 못 받아 이번 스캔에서 "
+                f"제외됐습니다. 네트워크가 원활한 시간대에 다시 스캔하면 더 많은 종목이 반영될 수 있어요."
+            )
     if reco_df is not None and not reco_df.empty:
         st.session_state['reco_raw_data'] = reco_df
         try:
@@ -6788,6 +6876,69 @@ def render_login_page():
                         st.session_state["signup_success_msg"] = f"회원가입이 완료되었습니다! 아이디 '{su_id_clean}'로 로그인해주세요."
                         st.rerun()
 
+def render_problem_log():
+    st.header(
+        "문제 기록",
+        help="""💡 **[문제 기록 안내]**\n\n종목 스크리너 스캔, AI 점수 계산, 배당·뉴스·재무 데이터 조회 등에서 발생한 오류를 앱이 자동으로 모아둔 화면입니다.\n\n최근 300건까지 보관되며, 앱을 재시작하면(서버 재배포 등) 초기화됩니다.\n\n하단의 'AI에게 물어보기용 텍스트'를 복사해서 그대로 붙여넣으면, 문제 상황을 설명하기 편합니다."""
+    )
+    st.markdown("<hr style='margin: 10px 0 25px 0; border-color: #E5E7EB;'>", unsafe_allow_html=True)
+
+    entries = list(_PROBLEM_LOG_STORE.get("entries") or [])
+
+    if not entries:
+        st.success("✅ 최근 기록된 오류가 없습니다.")
+        return
+
+    entries = sorted(entries, key=lambda x: x.get("ts") or datetime.datetime.min, reverse=True)
+    all_categories = sorted({e.get("category", "") for e in entries if e.get("category")})
+
+    col_filter, col_clear = st.columns([5, 1.3])
+    with col_filter:
+        picked_categories = st.multiselect(
+            "카테고리 필터", all_categories, default=all_categories,
+            placeholder="전체 카테고리", key="problem_log_category_filter",
+        )
+    with col_clear:
+        st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
+        if st.button("🗑️ 로그 비우기", key="problem_log_clear_btn", use_container_width=True):
+            _PROBLEM_LOG_STORE["entries"] = []
+            st.rerun()
+
+    filtered = [e for e in entries if not picked_categories or e.get("category") in picked_categories]
+    st.caption(f"ℹ️ 전체 {len(entries)}건 중 {len(filtered)}건 표시 중 (최신순)")
+
+    for e in filtered:
+        ts = e.get("ts")
+        ts_str = ts.strftime("%Y-%m-%d %H:%M:%S") if ts else "-"
+        code_badge = f" · `{e.get('code')}`" if e.get("code") else ""
+        with st.expander(f"[{ts_str}] {e.get('category', '-')}{code_badge} — {e.get('message', '')}"):
+            st.write(f"**시각:** {ts_str}")
+            st.write(f"**카테고리:** {e.get('category', '-')}")
+            if e.get("code"):
+                st.write(f"**종목코드:** {e.get('code')}")
+            st.write(f"**메시지:** {e.get('message', '')}")
+            if e.get("detail"):
+                st.code(e.get("detail"), language=None)
+
+    # ── AI에게 물어보기용 평문 텍스트 ────────────────────────────────────
+    # 위의 카드 UI를 일일이 캡처/타이핑하지 않고, 필터링된 로그를 그대로
+    # 복사해서 AI 챗봇에 붙여넣을 수 있도록 평문 블록으로도 제공한다.
+    st.markdown("<div style='margin-top:20px;'></div>", unsafe_allow_html=True)
+    st.subheader("🤖 AI에게 물어보기용 텍스트")
+    st.caption("아래 블록 우측 상단의 복사 아이콘을 눌러 그대로 AI에게 붙여넣으세요.")
+    lines = []
+    for e in filtered:
+        ts = e.get("ts")
+        ts_str = ts.strftime("%Y-%m-%d %H:%M:%S") if ts else "-"
+        line = f"[{ts_str}] ({e.get('category', '-')}) {e.get('message', '')}"
+        if e.get("code"):
+            line += f" [종목코드: {e.get('code')}]"
+        if e.get("detail"):
+            line += f"\n    └ {e.get('detail')}"
+        lines.append(line)
+    st.code("\n".join(lines) if lines else "(표시할 로그가 없습니다)", language=None)
+
+
 def render_change_password():
     st.header(
         "비밀번호 변경",
@@ -7107,6 +7258,7 @@ def _main_impl():
         ]),
         ("MY PAGE", [
             ("관심종목", ":material/bookmark:"),
+            ("문제 기록", ":material/bug_report:"),
             ("비밀번호 변경", ":material/lock:"),
         ]),
     ]
@@ -7239,6 +7391,7 @@ def _main_impl():
     elif selected == "실시간 배당 순위": render_dividend()
     elif selected == "오늘의 마켓 브리핑": render_market_pulse()
     elif selected == "관심종목":         render_watchlist()
+    elif selected == "문제 기록":         render_problem_log()
     elif selected == "비밀번호 변경":     render_change_password()
 
     print(f"[DEBUG {datetime.datetime.now().strftime('%H:%M:%S')}] 페이지 렌더링 완료: {selected}", file=sys.stderr, flush=True)
@@ -9302,7 +9455,9 @@ def _score_one_for_ai_batch(code, per, pbr, roe, debt, drop_pct, div):
     전체가 죽지 않도록 예외를 삼키고 None을 반환한다."""
     try:
         return calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div)["total"]
-    except Exception:
+    except Exception as e:
+        log_problem("AI 점수 스캔", f"{code} 종목 AI 점수 계산 실패", code=code,
+                    detail=f"{type(e).__name__}: {e}")
         return None
 
 
@@ -10394,6 +10549,28 @@ def render_recommendations():
             if st.session_state.get('_reco_filter_sig') != _reco_filter_sig:
                 st.session_state['_reco_filter_sig'] = _reco_filter_sig
                 st.session_state['_reco_shown'] = False
+
+            # ── [진단 캡션] "결과 건수가 스캔마다 왜 다른가"를 바로 확인할 수 있도록,
+            # 가장 최근 스캔에서 2단계(52주 고점 매칭)가 몇 개 후보 중 몇 개를 25초
+            # 안에 처리했는지 보여준다. 전체보기 상태의 결과 건수는 이 '통과' 수와
+            # 거의 같으므로, 타임아웃 수가 0이 아니면 "결과 건수가 적은 건 필터가
+            # 빡빡해서가 아니라 스캔이 시간 안에 다 못 끝났기 때문"임을 바로 알 수 있다.
+            _s2 = st.session_state.get('_reco_stage2_diag')
+            if _s2:
+                _s2_mins_ago = int((time.time() - _s2.get('ts', 0)) / 60)
+                _s2_time_str = "방금 전" if _s2_mins_ago < 1 else f"{_s2_mins_ago}분 전"
+                if _s2.get('stage2_timed_out', 0) > 0:
+                    st.caption(
+                        f"🔍 최근 스캔 진단 ({_s2_time_str}): 후보 {_s2['candidates_total']}개 중 "
+                        f"{_s2['stage2_completed']}개 처리 완료, **{_s2['stage2_timed_out']}개는 25초 "
+                        f"제한으로 타임아웃**(→ 결과 건수가 상한(300건)보다 적게 나온 주된 이유일 수 있어요) · "
+                        f"52주 고점 조건까지 통과: {_s2['stage2_passed']}개"
+                    )
+                else:
+                    st.caption(
+                        f"🔍 최근 스캔 진단 ({_s2_time_str}): 후보 {_s2['candidates_total']}개 전부 25초 "
+                        f"안에 처리 완료(타임아웃 없음) · 52주 고점 조건까지 통과: {_s2['stage2_passed']}개"
+                    )
 
             if not st.session_state.get('_reco_shown', False):
                 # [클릭 게이트] 탭 진입/필터 변경 즉시 종목 카드를 전부 그리면(많을 때는
