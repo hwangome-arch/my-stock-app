@@ -1972,6 +1972,16 @@ def _decode_naver_html(res, fallback_encoding='euc-kr'):
 #    안전하게 동작하도록 한다.
 _NAVER_SITE_NAME_KEYWORDS = ('네이버페이', '네이버', 'Npay', 'NPay', 'npay', '증권', '금융')
 
+def _is_naver_site_name_only(name):
+    """title 조각이 실제 종목명이 아니라 'Npay 증권' 같은 사이트명 그 자체인지 판별.
+    모든 사이트명 키워드를 제거하고 남는 글자가 없으면(공백 제외) 사이트명으로 간주한다."""
+    if not name:
+        return True
+    stripped = name
+    for kw in _NAVER_SITE_NAME_KEYWORDS:
+        stripped = stripped.replace(kw, '')
+    return stripped.strip() == ''
+
 def _extract_stock_name_from_naver_html(html):
     # 1순위: 실제 종목명이 들어있는 DOM 요소 (title보다 훨씬 안정적)
     dom_match = re.search(
@@ -1995,7 +2005,13 @@ def _extract_stock_name_from_naver_html(html):
     candidates = [p for p in parts if not any(k in p for k in _NAVER_SITE_NAME_KEYWORDS)]
     if candidates:
         return candidates[0]
-    # 모든 조각에 사이트명 키워드가 섞여있으면(예외적인 경우) 첫 조각을 그대로 사용
+    # [버그 수정] 모든 조각에 사이트명 키워드가 섞여있는 경우(예: title이 통째로
+    # "Npay 증권" 한 조각뿐인 페이지) 예전엔 그냥 parts[0]을 종목명으로 반환해서
+    # "Npay 증권"이 종목명 자리에 그대로 노출되는 버그가 있었다(제이브이엠, 삼성전자 등).
+    # parts[0]이 사이트명 키워드만으로 이루어진(=실제 종목명이 아닌) 경우라면
+    # 호출부가 다른 방법(스크리너 매핑)으로 보정할 수 있도록 None을 반환한다.
+    if _is_naver_site_name_only(parts[0]):
+        return None
     return parts[0]
 
 
@@ -2038,6 +2054,24 @@ def fetch_company_info_fnguide(code):
         extracted_name = _extract_stock_name_from_naver_html(html)
         if extracted_name:
             data["name"] = extracted_name
+        else:
+            # [버그 수정] 네이버 페이지에서 종목명 추출이 실패한 경우(예: title이
+            # "Npay 증권" 사이트명뿐이거나 DOM 구조가 바뀐 경우), 이름 없이
+            # "알 수 없음"으로 방치하지 않고 이미 앱에 로드된 스크리너 데이터
+            # (종목코드→종목명 매핑)로 한 번 더 보정을 시도한다. HTML 스크래핑보다
+            # 훨씬 안정적인 소스이며, 스크리너가 아직 스캔되지 않은 경우엔 빈
+            # DataFrame이라 자연스럽게 스킵되고 기존 기본값("알 수 없음")이 유지된다.
+            try:
+                _screener_df_for_name = load_screener_df()
+                if not _screener_df_for_name.empty and '종목코드' in _screener_df_for_name.columns:
+                    _name_match = _screener_df_for_name.loc[
+                        _screener_df_for_name['종목코드'].astype(str) == str(code), '종목명'
+                    ]
+                    if not _name_match.empty:
+                        data["name"] = _name_match.iloc[0]
+            except Exception:
+                pass
+            name_debug["extracted_name_fallback_failed"] = (data["name"] == "알 수 없음")
 
         summary_match = re.search(r'class="summary_info"[^>]*>(.*?)</p>', html, re.DOTALL)
         if summary_match:

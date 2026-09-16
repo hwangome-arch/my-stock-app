@@ -8,3 +8,5 @@ gspread
 google-auth
 psutil
 google-genai
+lxml
+html5lib
