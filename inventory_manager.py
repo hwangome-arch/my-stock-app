@@ -2241,16 +2241,41 @@ def fetch_investor_trend_by_code(code, days=20):
 
     try:
         # size는 넉넉히 요청(최소 10, 필요 일수+여유분)해서 휴장일/데이터 누락에 대비한다.
-        url = (
-            "https://m.stock.naver.com/front-api/stock/domestic/trend"
-            f"?code={code}&exchangeType=KRX&size={max(days + 5, 10)}"
-        )
-        debug["url"] = url
-        res = requests.get(url, headers=naver_headers, timeout=8)
-        debug["status"] = res.status_code
-        debug["resp_len"] = len(res.text)
+        requested_size = max(days + 5, 10)
 
-        if res.status_code != 200:
+        # ── [버그 수정 2026-09] size가 너무 크면(예: 24주=120거래일 → size=125) 이
+        # 비공개 API가 400을 던진다. 상한값이 정확히 공개돼 있지 않아서(관찰상
+        # 100 부근으로 추정), size를 아예 고정 상한으로 자르는 대신 요청한
+        # size부터 시작해 400이 나올 때마다 점점 작은 size로 자동 재시도한다.
+        # 이러면 실제 상한이 얼마든(바뀌어도) 그 안에서 받아올 수 있는 만큼은
+        # 최대한 받아오고, 2주/4주처럼 원래 되던 작은 size는 첫 시도에서 그대로
+        # 성공해 동작이 달라지지 않는다.
+        _step_sizes = [100, 80, 60, 40, 20, 10]
+        candidate_sizes = [requested_size] + [s for s in _step_sizes if s < requested_size]
+        debug["tried_sizes"] = []
+
+        res = None
+        for size in candidate_sizes:
+            url = (
+                "https://m.stock.naver.com/front-api/stock/domestic/trend"
+                f"?code={code}&exchangeType=KRX&size={size}"
+            )
+            res = requests.get(url, headers=naver_headers, timeout=8)
+            debug["tried_sizes"].append({"size": size, "status": res.status_code})
+            if res.status_code == 200:
+                debug["url"] = url
+                debug["status"] = res.status_code
+                debug["resp_len"] = len(res.text)
+                debug["size_used"] = size
+                if size < requested_size:
+                    debug["size_downgraded_from"] = requested_size
+                break
+        else:
+            # 모든 후보 size가 실패한 경우
+            _DEBUG_STORE[f"_trend_debug_{code}"] = debug
+            return result_df
+
+        if res is None or res.status_code != 200:
             _DEBUG_STORE[f"_trend_debug_{code}"] = debug
             return result_df
 
@@ -4810,6 +4835,12 @@ def draw_fnguide_details(code):
         st.caption(f"📅 조회 기간: {_period_label}")
 
         df_trend = fetch_investor_trend_by_code(code, days=_period_days)
+
+        # [2026-09] size 상한에 걸려 자동으로 더 작은 size로 재시도한 경우,
+        # 요청한 거래일수보다 실제로 받아온 행이 적을 수 있다. 이때는 캡션에
+        # 그대로 "24주"라고 두면 오해할 수 있으니, 실제 받아온 일수를 덧붙여준다.
+        if not df_trend.empty and len(df_trend) < _period_days:
+            st.caption(f"ℹ️ 네이버 API 제한으로 최근 {len(df_trend)}거래일만 조회됐습니다.")
 
         if not df_trend.empty:
             sum_inst  = int(df_trend['기관순매매'].sum())
