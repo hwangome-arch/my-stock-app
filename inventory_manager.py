@@ -8597,6 +8597,7 @@ def calc_financial_score_detailed(df_annual, roe, debt=None, return_breakdown=Fa
 
     return_breakdown=True로 호출하면 총점 대신 하위 카테고리 점수까지 담은 dict를
     반환한다 (UI에서 '재무 몇 점 중 성장성이 특히 약하다' 같은 설명에 사용)."""
+    df_annual = _confirmed_annual_df(df_annual)  # [2026-10] 추정(E) 연도 제외, 확정 연도 기준으로 채점
     try:
         # ── 수익성 (0~60) ──
         if roe is None or roe == -999:
@@ -11018,10 +11019,47 @@ def _to_float_safe(val):
     except Exception:
         return 0.0
 
+# ── [2026-10 추가] AI 점수 입력에서 '추정치(E) 연도'를 제외하기 ─────────────────
+# 문제: AI 점수(재무·밸류)는 df_annual의 맨 마지막 행을 "최신 값"으로 썼다. 그런데
+# 올해처럼 아직 결산이 끝나지 않은 마지막 행(예: 2026/12(E))은 증권사 컨센서스라
+# 편차가 매우 크고(솔루스첨단소재: 지배주주순이익 전망이 -180억~+2,160억), 같은
+# 행 안에서도 항목(순이익 vs ROE/PER)마다 집계 기준이 달라 서로 안 맞을 수 있다.
+# 그 결과 2년 연속 영업적자인 종목이 ROE 15.1%/PER 6.61배로 계산돼 재무·밸류
+# 점수를 후하게 받았다.
+# 해결: 점수 계산에 쓰는 df_annual에서는 추정(E)/미결산 기간을 빼고, 마지막으로
+# '확정된' 연도를 최신 값으로 쓴다(성장률도 확정 연도끼리 비교). 화면의 연간 실적
+# 표는 그대로 추정치까지 보여주며, 이 함수들은 점수 계산용 복사본에만 적용된다.
+def _is_estimate_period(label, today=None):
+    """'2026/12(E)'처럼 (E)가 붙었거나, 결산월이 아직 안 끝난(이번 달 이후) 기간이면 True.
+    FnGuide 경로는 라벨에서 (E)를 지워버리므로 날짜 기준도 함께 본다."""
+    s = str(label)
+    if '(E)' in s:
+        return True
+    m = re.match(r'^\s*(\d{4})/(\d{1,2})', s)
+    if not m:
+        return False
+    today = today or datetime.date.today()
+    return (int(m.group(1)), int(m.group(2))) >= (today.year, today.month)
+
+
+def _confirmed_annual_df(df_annual):
+    """추정/미결산 기간 행을 제외한 df_annual을 반환. 확정 행이 하나도 없으면
+    (신규상장 등) 원본을 그대로 돌려줘서 기존 동작을 유지한다."""
+    try:
+        if df_annual is None or df_annual.empty or '연도/분기' not in df_annual.columns:
+            return df_annual
+        mask = df_annual['연도/분기'].apply(_is_estimate_period)
+        confirmed = df_annual[~mask]
+        return confirmed if not confirmed.empty else df_annual
+    except Exception:
+        return df_annual
+
+
 def get_ai_diagnosis_inputs(code, df_annual, screener_df=None):
     code = normalize_kr_code(code)
     per, pbr, roe, debt, div, drop_pct = 0.0, 0.0, -999.0, -1.0, 0.0, 0.0
 
+    df_annual = _confirmed_annual_df(df_annual)  # [2026-10] 추정(E) 연도 제외
     if df_annual is not None and not df_annual.empty:
         latest = df_annual.iloc[-1]
         if 'PER' in df_annual.columns:
