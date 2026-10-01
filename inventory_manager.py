@@ -8597,7 +8597,9 @@ def calc_financial_score_detailed(df_annual, roe, debt=None, return_breakdown=Fa
 
     return_breakdown=True로 호출하면 총점 대신 하위 카테고리 점수까지 담은 dict를
     반환한다 (UI에서 '재무 몇 점 중 성장성이 특히 약하다' 같은 설명에 사용)."""
-    df_annual = _confirmed_annual_df(df_annual)  # [2026-10] 추정(E) 연도 제외, 확정 연도 기준으로 채점
+    # [2026-10] 영업이익률·순이익률은 확정+추정 평균, 성장률(매출·영업이익·EPS)은 확정 연도끼리 비교
+    _blend = _blend_with_estimate(df_annual, ('영업이익률', '순이익률'))
+    df_annual = _confirmed_annual_df(df_annual)
     try:
         # ── 수익성 (0~60) ──
         if roe is None or roe == -999:
@@ -8613,6 +8615,11 @@ def calc_financial_score_detailed(df_annual, roe, debt=None, return_breakdown=Fa
                 op_margin = _to_float_safe(df_annual.iloc[-1]['영업이익률'])
             if '순이익률' in df_annual.columns:
                 ni_margin = _to_float_safe(df_annual.iloc[-1]['순이익률'])
+
+        if _blend.get('영업이익률') is not None:
+            op_margin = _blend['영업이익률']
+        if _blend.get('순이익률') is not None:
+            ni_margin = _blend['순이익률']
 
         if op_margin is not None:
             s_op_margin = _lerp_score(op_margin, [(-10, 0), (0, 3), (5, 8), (10, 12), (15, 15), (25, 15)])
@@ -11055,22 +11062,84 @@ def _confirmed_annual_df(df_annual):
         return df_annual
 
 
+def _num_or_none(v):
+    """숫자로 바꿀 수 있으면 float, 결측('-', NaN, 빈 값 등)이면 None."""
+    try:
+        f = float(str(v).replace(',', '').strip())
+        return None if f != f else f
+    except Exception:
+        return None
+
+
+# ── [2026-10 추가] 확정 연도 + 추정 연도 평균(블렌드) ─────────────────────────
+# 확정 연도만 쓰면 이익이 급증하는 종목(삼성전자)이 현재보다 낮게, 추정치만 쓰면
+# 컨센서스가 흔들리는 종목(솔루스첨단소재)이 부풀려진다. 그래서 ROE·PER·PBR·
+# 영업이익률·순이익률은 "마지막 확정 연도"와 "그 직후 추정 연도"의 평균을 쓴다.
+# 단, 아래 경우에는 평균을 내지 않고 확정 연도 값만 쓴다(추정치가 뒤집어 놓는 것 방지):
+#  - 확정 연도 값이 결측(예: 적자라 PER이 '-')이면 그대로 결측으로 둔다.
+#  - 추정 값이 결측이면 확정 값만 쓴다.
+#  - 확정과 추정의 부호가 다르면(ROE·PER·마진: 적자↔흑자 충돌) 확정 값만 쓴다.
+# 추정 행이 없으면 빈 dict를 반환해 기존 동작(확정 최신 행)을 그대로 쓴다.
+_BLEND_SIGNED_COLS = ('ROE', 'PER', '영업이익률', '순이익률')
+
+
+def _blend_with_estimate(df_annual, cols):
+    out = {}
+    try:
+        if df_annual is None or df_annual.empty or '연도/분기' not in df_annual.columns:
+            return out
+        flags = df_annual['연도/분기'].apply(_is_estimate_period)
+        confirmed = df_annual[~flags]
+        estimates = df_annual[flags]
+        if confirmed.empty or estimates.empty:
+            return out
+        c_row = confirmed.iloc[-1]
+        e_row = estimates.iloc[0]  # 마지막 확정 연도 직후의 가장 가까운 추정 연도
+        for col in cols:
+            if col not in df_annual.columns:
+                continue
+            c = _num_or_none(c_row[col])
+            e = _num_or_none(e_row[col])
+            if c is None:
+                out[col] = None
+            elif e is None:
+                out[col] = c
+            elif col in _BLEND_SIGNED_COLS and ((c < 0) != (e < 0)):
+                out[col] = c
+            else:
+                out[col] = (c + e) / 2.0
+    except Exception:
+        return {}
+    return out
+
+
 def get_ai_diagnosis_inputs(code, df_annual, screener_df=None):
     code = normalize_kr_code(code)
     per, pbr, roe, debt, div, drop_pct = 0.0, 0.0, -999.0, -1.0, 0.0, 0.0
 
-    df_annual = _confirmed_annual_df(df_annual)  # [2026-10] 추정(E) 연도 제외
+    # [2026-10] 최신 값 = 마지막 확정 연도와 직후 추정 연도의 평균(규칙은 _blend_with_estimate 참고)
+    _blend = _blend_with_estimate(df_annual, ('PER', 'PBR', 'ROE'))
+    df_annual = _confirmed_annual_df(df_annual)
     if df_annual is not None and not df_annual.empty:
         latest = df_annual.iloc[-1]
         if 'PER' in df_annual.columns:
-            v = _to_float_safe(latest['PER'])
-            per = v  
+            if 'PER' in _blend:
+                per = _blend['PER'] if _blend['PER'] is not None else 0.0
+            else:
+                per = _to_float_safe(latest['PER'])
         if 'PBR' in df_annual.columns:
-            pbr = _to_float_safe(latest['PBR'])
+            if 'PBR' in _blend:
+                pbr = _blend['PBR'] if _blend['PBR'] is not None else 0.0
+            else:
+                pbr = _to_float_safe(latest['PBR'])
         if 'ROE' in df_annual.columns:
-            raw = latest['ROE']
-            if pd.notna(raw) and str(raw).strip() not in ('', '-', 'nan'):
-                roe = _to_float_safe(raw)   
+            if 'ROE' in _blend:
+                if _blend['ROE'] is not None:
+                    roe = _blend['ROE']
+            else:
+                raw = latest['ROE']
+                if pd.notna(raw) and str(raw).strip() not in ('', '-', 'nan'):
+                    roe = _to_float_safe(raw)   
         if '부채비율' in df_annual.columns:
             raw = latest['부채비율']
             if pd.notna(raw) and str(raw).strip() not in ('', '-', 'nan'):
