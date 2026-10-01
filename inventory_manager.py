@@ -153,6 +153,17 @@ def _get_screener_df_cache():
 
 _SCREENER_DF_CACHE = _get_screener_df_cache()
 
+# ── [2026-10 추가] 기업체력/모멘텀(1000점 환산) 보조 점수 저장소 ──────────────
+# AI 배치(_score_one_for_ai_batch)는 기존대로 총점(숫자 하나)만 반환한다. 그 반환
+# 형식을 바꾸면 이를 쓰는 곳(score_map, 세션 캐시, 하이라이트 등)이 전부 영향을
+# 받으므로, 기업체력/모멘텀 점수는 여기에 종목코드별로 따로 넣어두고 디스크 캐시
+# 저장(_flush_ai_score_partial) 시점에 함께 기록한다.
+@st.cache_resource(show_spinner=False)
+def _get_ai_subscore_store():
+    return {}
+
+_AI_SUBSCORE_STORE = _get_ai_subscore_store()
+
 # ── [문제 기록 자동 수집] 스캔/AI 점수/데이터 조회 등 여기저기서 터지는 오류를
 # 한곳에 모아두는 통합 로그 ────────────────────────────────────────────────
 # 배경: 스크리너 스캔 실패, AI 점수 배치 계산 실패, 배당·뉴스·재무 데이터 조회
@@ -9140,6 +9151,14 @@ def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=
     momentum_combined = max(0.0, min(momentum_combined_max, momentum_combined_raw))
     momentum_combined_100 = round(momentum_combined / momentum_combined_max * 100, 1)
 
+    # ── [2026-10 추가] 기업체력/모멘텀을 각각 1000점 만점으로 환산 ─────────────
+    # 기존 total(1000점)·fundamental_100·momentum_100은 그대로 두고, 추천종목 탭의
+    # 점수 구간 필터(400~499 ~ 800~1000)에 쓸 수 있도록 같은 눈금(1000점)으로 맞춘
+    # 별도 값을 추가한다. 기업체력은 300점 만점 → ×(1000/300), 모멘텀은 클램핑된
+    # 0~700점 → ×(1000/700).
+    fundamental_1000 = round(max(0.0, min(1000.0, fundamental / fundamental_max * 1000)), 1)
+    momentum_1000 = round(max(0.0, min(1000.0, momentum_combined / momentum_combined_max * 1000)), 1)
+
     # ⚠️ [2026-09 추가] OOS 검증된 리스크 가중 강화 점수 (60~120일 관점 참고용).
     # 자세한 배경은 calc_risk_weighted_momentum_100() docstring 참고. 기존 momentum_100/
     # total은 그대로 유지되며 이 값은 별도 참고 지표로만 추가된다.
@@ -9160,6 +9179,9 @@ def calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div, df_annual=
         "fundamental_score": fundamental, "fundamental_max": fundamental_max, "fundamental_100": fundamental_100,
         "momentum_score": momentum_combined, "momentum_score_max": momentum_combined_max, "momentum_100": momentum_combined_100,
         "momentum_score_raw": momentum_combined_raw,  # 클램핑 전 원본값 (0 미만/700 초과 여부 점검용)
+        # ── 1000점 만점 환산값 (추천종목 점수 구간 필터용) ──
+        "fundamental_1000": fundamental_1000,
+        "momentum_1000": momentum_1000,
         "debug": _ai_score_debug_info(df_price, kospi_closes, debt, drop_pct),
     }
 
@@ -9465,7 +9487,12 @@ def _score_one_for_ai_batch(code, per, pbr, roe, debt, drop_pct, div):
     """AI 종합점수(1000점 만점 중 total)만 뽑아내는 배치 계산용 래퍼. 실패해도 배치
     전체가 죽지 않도록 예외를 삼키고 None을 반환한다."""
     try:
-        return calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div)["total"]
+        _res = calc_ai_scores_detailed(code, per, pbr, roe, debt, drop_pct, div)
+        _AI_SUBSCORE_STORE[str(code).zfill(6)] = {
+            "fund": _res.get("fundamental_1000"),
+            "mom": _res.get("momentum_1000"),
+        }
+        return _res["total"]
     except Exception as e:
         log_problem("AI 점수 스캔", f"{code} 종목 AI 점수 계산 실패", code=code,
                     detail=f"{type(e).__name__}: {e}")
@@ -9619,7 +9646,12 @@ def _flush_ai_score_partial(scores):
         existing = _load_ai_score_disk_cache()
         now = time.time()
         for code, score in scores.items():
-            existing[code] = {"score": score, "ts": now}
+            _entry = {"score": score, "ts": now}
+            _sub = _AI_SUBSCORE_STORE.get(str(code).zfill(6))
+            if score is not None and _sub:
+                _entry["fund"] = _sub.get("fund")
+                _entry["mom"] = _sub.get("mom")
+            existing[code] = _entry
         _save_ai_score_disk_cache(existing)
     except Exception:
         pass
@@ -9802,7 +9834,10 @@ def _render_ai_grade_filter_and_score(display_df, source_df):
     for _, row in display_df.iterrows():
         c = str(row['종목코드']).zfill(6)
         entry = disk_cache.get(c)
-        if _ai_cache_entry_fresh(entry):
+        # [2026-10] 기업체력/모멘텀 점수가 없는 예전 캐시 항목(이 기능 추가 전에
+        # 계산된 것)은 필터에 쓸 수 없으므로 한 번 다시 계산한다. 계산 실패(None)로
+        # 캐시된 항목은 기존처럼 TTL 동안 그대로 둔다(매번 재시도 방지).
+        if _ai_cache_entry_fresh(entry) and (entry.get("score") is None or entry.get("fund") is not None):
             score_map[c] = entry["score"]
         else:
             stale_rows.append(row)
@@ -9832,6 +9867,26 @@ def _render_ai_grade_filter_and_score(display_df, source_df):
           f"ready={ready} stalled={job_stalled}", file=sys.stderr, flush=True)
 
     return score_map, still_loading, done_count, total_count, job_stalled
+
+
+def get_ai_subscore_maps(codes):
+    """[2026-10 추가] 기업체력/모멘텀(각 1000점 환산) 점수 맵을 반환한다.
+    ({종목코드: 기업체력점수}, {종목코드: 모멘텀점수}) — 신선한 디스크 캐시 +
+    방금 계산된 보조 저장소 기준이며, 아직 없는 종목은 키 자체가 없다."""
+    fund_map, mom_map = {}, {}
+    disk_cache = _load_ai_score_disk_cache()
+    for c in codes:
+        c = str(c).zfill(6)
+        entry = disk_cache.get(c)
+        if _ai_cache_entry_fresh(entry) and entry.get("fund") is not None:
+            fund_map[c] = entry["fund"]
+            mom_map[c] = entry.get("mom")
+            continue
+        sub = _AI_SUBSCORE_STORE.get(c)
+        if sub and sub.get("fund") is not None:
+            fund_map[c] = sub["fund"]
+            mom_map[c] = sub.get("mom")
+    return fund_map, mom_map
 
 
 def render_ai_diagnosis(name, code, per, pbr, roe, debt, drop_pct, div, grade_label):
@@ -10337,6 +10392,35 @@ def render_recommendations():
         if ai_grade_filter is None:
             ai_grade_filter = "전체보기"
 
+        # ── [2026-10 추가] 기업체력 / 모멘텀 점수 필터 ──────────────────────────
+        # AI 종합점수(통합)는 그대로 두고, 같은 1000점 눈금으로 환산한 기업체력
+        # (재무+밸류)·모멘텀(추세+수급+거래량+모멘텀+패턴+리스크) 점수를 각각 따로
+        # 거를 수 있다. 세 필터(AI 종합/기업체력/모멘텀)는 서로 AND로 적용된다.
+        _SCORE_PILL_OPTIONS = ["전체보기", "🚀 800~1000", "🔥 700~799", "⭐ 600~699", "✨ 500~599", "🌱 400~499"]
+        st.markdown("<div style='font-size:13px; font-weight:600; color:#475569; margin:14px 0 6px;'>🏢 기업체력 점수 필터</div>", unsafe_allow_html=True)
+        fund_grade_filter = st.pills(
+            "기업체력 점수 필터",
+            _SCORE_PILL_OPTIONS,
+            default="전체보기",
+            label_visibility="collapsed",
+            key="reco_fund_grade_pills",
+            help="기업체력(재무+밸류, 원래 300점 만점)을 1000점 만점으로 환산한 점수로 필터링합니다. AI 종합점수·모멘텀 필터와 동시에 적용됩니다.",
+        )
+        if fund_grade_filter is None:
+            fund_grade_filter = "전체보기"
+
+        st.markdown("<div style='font-size:13px; font-weight:600; color:#475569; margin:14px 0 6px;'>🚀 모멘텀 점수 필터</div>", unsafe_allow_html=True)
+        mom_grade_filter = st.pills(
+            "모멘텀 점수 필터",
+            _SCORE_PILL_OPTIONS,
+            default="전체보기",
+            label_visibility="collapsed",
+            key="reco_mom_grade_pills",
+            help="모멘텀(추세·수급·거래량·모멘텀·AI패턴·리스크, 원래 700점 만점)을 1000점 만점으로 환산한 점수로 필터링합니다. AI 종합점수·기업체력 필터와 동시에 적용됩니다.",
+        )
+        if mom_grade_filter is None:
+            mom_grade_filter = "전체보기"
+
         # ── [추가 옵션] 등급 필터·AI 필터처럼 후보를 고르는 축이 아니라, 채점
         # 기준 자체를 조정하는 온오프 토글류라서 따로 묶었다.
         st.markdown("<div style='font-size:13px; font-weight:600; color:#475569; margin:14px 0 6px;'>⚙️ 추가 옵션</div>", unsafe_allow_html=True)
@@ -10390,7 +10474,9 @@ def render_recommendations():
         # (8339줄에서 .copy()로 파생됨), 이렇게 넓혀서 계산해둔 캐시는 이후
         # 어떤 등급/시장/점수 필터 조합을 눌러도 그대로 재사용된다.
         _bulk_scan_active = st.session_state.get('_reco_ai_bulk_scan', False)
-        _need_ai_calc = (ai_grade_filter != "전체보기") or _bulk_scan_active
+        _any_score_filter = (ai_grade_filter != "전체보기") or (fund_grade_filter != "전체보기") or (mom_grade_filter != "전체보기")
+        _need_ai_calc = _any_score_filter or _bulk_scan_active
+        _fund_map, _mom_map = {}, {}
         # ⚠️ [버그 수정] display_df가 이미 0행일 때 그 위에 .apply() 기반 필터를
         # 또 적용하면, pandas가 빈 Series의 dtype을 제대로 추론하지 못해 boolean
         # 마스크가 아닌 이상한 타입이 되고, 그걸로 인덱싱하면 행뿐 아니라 컬럼까지
@@ -10412,6 +10498,7 @@ def render_recommendations():
             # 채워서 다음 rerun부터 정상적으로 "이미 계산됨"을 인식하게 한다.
             # (점수 계산이 실패(None)한 종목도 fetch_financial_data 자체는 이미
             # 시도된 것이므로 함께 반영한다.)
+            _fund_map, _mom_map = get_ai_subscore_maps(_ai_calc_target_df['종목코드'])
             _existing_reco_cache = st.session_state.get('_reco_ai_score_cache', {})
             _existing_reco_cache.update(_ai_score_map)
             st.session_state['_reco_ai_score_cache'] = _existing_reco_cache
@@ -10446,6 +10533,22 @@ def render_recommendations():
                 )
             ]
 
+        # ── [2026-10 추가] 기업체력 / 모멘텀 점수 구간 필터 (AI 종합 필터와 동일한 구간) ──
+        _score_bands_common = {
+            "🌱 400~499": (400, 499), "✨ 500~599": (500, 599), "⭐ 600~699": (600, 699),
+            "🔥 700~799": (700, 799), "🚀 800~1000": (800, 1000),
+        }
+        for _flt_value, _flt_map in ((fund_grade_filter, _fund_map), (mom_grade_filter, _mom_map)):
+            if _flt_value != "전체보기" and not display_df.empty:
+                _lo, _hi = _score_bands_common[_flt_value]
+                display_df = display_df[
+                    display_df['종목코드'].apply(
+                        lambda c, _m=_flt_map, _lo=_lo, _hi=_hi: (
+                            lambda v: v is not None and _lo <= v <= _hi
+                        )(_m.get(str(c).zfill(6)))
+                    )
+                ]
+
         username = st.session_state.get("auth_user")
 
         # ⚠️ [버그 수정: 계산 도중 결과가 나왔다 사라졌다 하는 현상] 예전엔
@@ -10457,7 +10560,7 @@ def render_recommendations():
         # 안 나왔다, 다른 종목으로 바뀌었다" 하는 것처럼 보여 혼란을 줬다.
         # 계산이 완전히 끝나기 전까지는 목록 자체를 그리지 않고, 다 끝난 뒤
         # "한 번에 정리된" 결과만 보여주도록 바꾼다.
-        if _ai_still_loading and ai_grade_filter != "전체보기":
+        if _ai_still_loading and _any_score_filter:
             # 사용자가 실제로 점수 구간(예: 700~799)을 골라서 그 결과를 봐야
             # 하는 상황이라, 계산이 안 끝나면 목록을 보여줄 수 없다 → 기존처럼
             # 화면을 막고 진행률만 보여준다.
@@ -10523,7 +10626,7 @@ def render_recommendations():
         # 부르기 전에 반드시 empty 여부부터 확인한다 — 근본 원인이 또 있더라도
         # 화면이 통째로 죽는 것만은 막기 위함.
         if display_df.empty:
-            st.info(f"현재 설정된 필터({market_filter}, {selected_grade}, AI {ai_grade_filter})에 부합하는 종목이 없습니다. 조건을 완화해보세요.")
+            st.info(f"현재 설정된 필터({market_filter}, {selected_grade}, AI {ai_grade_filter}, 기업체력 {fund_grade_filter}, 모멘텀 {mom_grade_filter})에 부합하는 종목이 없습니다. 조건을 완화해보세요.")
         else:
             # ── [정렬 기준: AI 점수 구간 선택 시 점수 내림차순] ──────────────────
             # 기존에는 AI 점수 구간(예: 700~799)을 골라도 항상 '고점 / 하락률' 오름차순
@@ -10532,9 +10635,15 @@ def render_recommendations():
             # 상태라 여기서는 추가 API 호출·재계산 없이 그 값으로 정렬만 바꾸면 되므로
             # 속도에는 영향이 없다. 점수 구간을 고르지 않은 '전체보기'일 때는 기존과
             # 동일하게 하락률 기준 정렬을 유지한다(원래 화면 흐름 유지).
-            if ai_grade_filter != "전체보기":
+            if _any_score_filter:
+                if ai_grade_filter != "전체보기":
+                    _sort_map = _ai_score_map
+                elif fund_grade_filter != "전체보기":
+                    _sort_map = _fund_map
+                else:
+                    _sort_map = _mom_map
                 display_df['_ai_score_sort'] = display_df['종목코드'].apply(
-                    lambda c: _ai_score_map.get(str(c).zfill(6), -1)
+                    lambda c: (_sort_map.get(str(c).zfill(6)) if _sort_map.get(str(c).zfill(6)) is not None else -1)
                 )
                 display_df = display_df.sort_values('_ai_score_sort', ascending=False).drop(columns=['_ai_score_sort']).reset_index(drop=True)
             else:
@@ -10556,7 +10665,7 @@ def render_recommendations():
             # "결과 보기"가 리셋돼 화면이 계속 접혔다 펼쳐지는 부작용이 생긴다. 대신
             # len(_reco_df)(원본 후보 개수, 새 스캔이 돌기 전까진 불변)로 "새 스캔이
             # 돌았는지"만 판단한다.
-            _reco_filter_sig = (market_filter, strict_debt, selected_grade, ai_grade_filter, len(_reco_df))
+            _reco_filter_sig = (market_filter, strict_debt, selected_grade, ai_grade_filter, fund_grade_filter, mom_grade_filter, len(_reco_df))
             if st.session_state.get('_reco_filter_sig') != _reco_filter_sig:
                 st.session_state['_reco_filter_sig'] = _reco_filter_sig
                 st.session_state['_reco_shown'] = False
