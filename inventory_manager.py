@@ -11446,6 +11446,19 @@ def render_martingale_simulator(code, current_price):
         else:
             _fmt_mg_amount()
 
+    # [수정] 체크박스를 st.form 밖으로 이동. 폼 안에 있으면 체크를 바꿔도
+    # 제출 전까지 rerun이 일어나지 않아, 체크를 풀어도 1회차 매수금액 입력란이
+    # 계속 disabled로 남아 수정이 안 되는 문제가 있었다.
+    st.checkbox(
+        "💡 예산에 맞춰 1회차 매수금액 자동 계산 "
+        "(체크하고 예산을 입력하면 1회차 매수금액 입력은 무시되고, 예산·배율·최대회차 기준으로 역산됩니다)",
+        key=_mg_auto_key
+    )
+    # 자동계산이 실제로 적용되는 경우(체크 + 예산 입력됨)에만 입력란을 잠근다.
+    # 예산이 비어 있으면 자동계산은 아무 동작도 하지 않으므로 직접 수정 가능.
+    _mg_budget_filled = bool(re.sub(r"[^\d]", "", str(st.session_state.get(_mg_budget_key, ""))))
+    _mg_amount_locked = bool(st.session_state.get(_mg_auto_key, False)) and _mg_budget_filled
+
     with st.form(f"martingale_form_{code}", border=False):
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -11460,7 +11473,7 @@ def render_martingale_simulator(code, current_price):
                 "1회차 매수금액 (원)",
                 key=_mg_amount_key,
                 placeholder="기본값: 현재가 1주 기준",
-                disabled=st.session_state.get(_mg_auto_key, False),
+                disabled=_mg_amount_locked,
             )
         with c2:
             multiplier = st.number_input(
@@ -11490,11 +11503,6 @@ def render_martingale_simulator(code, current_price):
                 key=_mg_budget_key,
                 placeholder="예: 5,000,000"
             )
-        st.checkbox(
-            "💡 예산에 맞춰 1회차 매수금액 자동 계산 "
-            "(체크하면 위 1회차 매수금액 입력은 무시되고, 예산·배율·최대회차 기준으로 역산됩니다)",
-            key=_mg_auto_key
-        )
         # ⚠️ [버그 수정: StreamlitInvalidFormCallbackError]
         # st.form 안에서 콜백(on_change/on_click)이 허용되는 위젯은
         # st.form_submit_button 뿐이다. 예전에는 위 text_input에
@@ -11515,7 +11523,7 @@ def render_martingale_simulator(code, current_price):
         initial_amount = int(re.sub(r"[^\d]", "", st.session_state.get(_mg_amount_key, "")))
     except Exception:
         initial_amount = 0
-    if initial_amount < 10000:
+    if initial_amount < 1:
         initial_amount = 100000
 
     # [신규] 예산 한도 파싱. 선택 입력이라 비어있으면 None(제한 없음)으로 처리.
