@@ -6748,13 +6748,18 @@ def render_login_page():
                 margin: 0 !important;
             }
 
-            /* 입력창: 연한 인디고 배경 + 테두리 없음 + 넉넉한 여백 */
+            /* 입력창: 흰 배경 + 연한 회색 테두리 + 넉넉한 여백 */
             section[data-testid="stMain"] .stTextInput input,
             section[data-testid="stMain"] div[data-baseweb="input"],
             section[data-testid="stMain"] div[data-baseweb="base-input"] {
-                background-color: #EEF2FF !important;
-                border: 1px solid transparent !important;
+                background-color: #FFFFFF !important;
+                border: 1px solid #D1D5DB !important;
                 border-radius: 10px !important;
+            }
+            /* 클릭(포커스)했을 때는 보라색 테두리 */
+            section[data-testid="stMain"] div[data-baseweb="input"]:focus-within,
+            section[data-testid="stMain"] div[data-baseweb="base-input"]:focus-within {
+                border-color: #5A4EE5 !important;
             }
             section[data-testid="stMain"] .stTextInput input {
                 color: #111827 !important;
