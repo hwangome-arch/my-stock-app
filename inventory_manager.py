@@ -111,7 +111,7 @@ try:
 base="light"
 primaryColor="#5A4EE5"
 backgroundColor="#F8FAFC"
-secondaryBackgroundColor="#0F141F"
+secondaryBackgroundColor="#F1F5F9"
 textColor="#111827"
 dataframeHeaderBackgroundColor="#F1F5F9"
 """
