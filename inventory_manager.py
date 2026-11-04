@@ -6762,27 +6762,24 @@ def render_login_page():
                 border-color: #5A4EE5 !important;
             }
 
-            /* [입력창 테두리 - Streamlit 버전과 무관하게 적용되도록 .st-key-auth_box 기준으로 지정]
-               바깥 래퍼에만 회색 테두리를 주고, 안쪽 요소는 테두리를 없애 이중선을 방지 */
+            /* [입력창 테두리] 최신 Streamlit은 data-baseweb 대신 data-testid를 쓰므로 둘 다 지정.
+               바깥 래퍼에만 회색 테두리를 주고 안쪽 입력 요소는 테두리를 없애 이중선을 방지 */
+            .st-key-auth_box [data-testid="stTextInputRootElement"],
             .st-key-auth_box div[data-baseweb="input"] {
                 background-color: #FFFFFF !important;
                 border: 1px solid #D1D5DB !important;
                 border-radius: 8px !important;
+                box-shadow: none !important;
             }
-            .st-key-auth_box div[data-baseweb="base-input"],
-            .st-key-auth_box div[data-baseweb="input"] input {
-                border: none !important;
-                background-color: transparent !important;
-            }
+            .st-key-auth_box [data-testid="stTextInputRootElement"]:focus-within,
             .st-key-auth_box div[data-baseweb="input"]:focus-within {
                 border-color: #5A4EE5 !important;
             }
-            section[data-testid="stMain"] .stTextInput input {
-                color: #111827 !important;
-                padding: 10px 14px !important;
-            }
-            section[data-testid="stMain"] .stTextInput input::placeholder {
-                color: #9CA3AF !important;
+            .st-key-auth_box [data-testid="stTextInputField"],
+            .st-key-auth_box div[data-baseweb="base-input"] {
+                border: none !important;
+                box-shadow: none !important;
+                background-color: transparent !important;
             }
             /* 비밀번호 표시/숨기기(눈 모양) 아이콘 버튼 완전히 숨김 */
             section[data-testid="stMain"] .stTextInput button[aria-label="Show password"],
